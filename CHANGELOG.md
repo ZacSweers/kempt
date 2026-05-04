@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.0.4]
+
+_2026-05-04_
+
 - Always run `git add` on previously staged files after running formatting.
 
 ## [0.0.3]
