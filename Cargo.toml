@@ -1,5 +1,8 @@
 [package]
-name = "kempt"
+# Crate name is `kempt-fmt` because the short `kempt` is already taken on
+# crates.io by an unrelated sorted-collection library. The installed
+# binary is still `kempt` (see [[bin]] below).
+name = "kempt-fmt"
 version = "0.0.2"
 edition = "2021"
 license = "Apache-2.0"

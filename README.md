@@ -8,22 +8,27 @@ license headers, and normalizes trailing whitespace. Configured per repo via
 
 ## Install
 
+> The binary is named `kempt` everywhere. The crate is published as
+> `kempt-fmt` because the shorter `kempt` name is already taken on
+> crates.io by an unrelated project; that suffix shows up in the install
+> URLs and the homebrew formula filename below.
+
 ### Homebrew (macOS, Linux)
 
 ```sh
-brew install ZacSweers/tap/kempt
+brew install ZacSweers/tap/kempt-fmt
 ```
 
 ### Shell installer
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ZacSweers/kempt/releases/latest/download/kempt-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ZacSweers/kempt/releases/latest/download/kempt-fmt-installer.sh | sh
 ```
 
 ### Cargo
 
 ```sh
-cargo install kempt
+cargo install kempt-fmt
 ```
 
 ### Notes
@@ -355,7 +360,7 @@ jobs:
       - name: Install kempt
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf \
-            https://github.com/ZacSweers/kempt/releases/latest/download/kempt-installer.sh | sh
+            https://github.com/ZacSweers/kempt/releases/latest/download/kempt-fmt-installer.sh | sh
       - name: Pre-warm cache
         run: kempt update
       - name: Check formatting

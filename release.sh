@@ -114,4 +114,4 @@ fi
 echo
 echo "Done. Released ${TAG}"
 echo "  GitHub Release: https://github.com/${REPO}/releases/tag/${TAG}"
-echo "  crates.io:      https://crates.io/crates/kempt/${VERSION}"
+echo "  crates.io:      https://crates.io/crates/kempt-fmt/${VERSION}"
