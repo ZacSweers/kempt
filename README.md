@@ -142,11 +142,11 @@ only when you genuinely want the formatter to run but the header to stay off
 Each tool has its own `paths.include` / `paths.exclude` with language
 defaults so you only configure these when you need to narrow further:
 
-| Tool                | Default include                       | Default exclude |
-|---------------------|---------------------------------------|-----------------|
-| `[ktfmt.paths]`     | `["**/*.kt", "**/*.kts"]`             | `[]`            |
-| `[gjf.paths]`       | `["**/*.java"]`                       | `[]`            |
-| `[whitespace.paths]`| `["**/*.kt", "**/*.kts", "**/*.java"]`| `[]`            |
+| Tool                 | Default include                        | Default exclude |
+|----------------------|----------------------------------------|-----------------|
+| `[ktfmt.paths]`      | `["**/*.kt", "**/*.kts"]`              | `[]`            |
+| `[gjf.paths]`        | `["**/*.java"]`                        | `[]`            |
+| `[whitespace.paths]` | `["**/*.kt", "**/*.kts", "**/*.java"]` | `[]`            |
 
 The global `[paths].exclude` is applied first as a universal filter; each
 tool's own `include` / `exclude` then narrows further. A file is processed

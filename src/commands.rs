@@ -99,9 +99,23 @@ pub fn run_hook(
         &mut outcome,
     )?;
 
-    if !check_mode && !outcome.changed.is_empty() {
-        let to_add: Vec<PathBuf> = outcome.changed.iter().cloned().collect();
-        git.add(&to_add).context("git add post-format")?;
+    if !check_mode {
+        // ktfmt and gjf rewrite files in place via subprocess, so kempt
+        // can't tell from outcome.changed alone which files they touched.
+        // Re-stage every staged candidate that was in a JVM formatter's
+        // scope (no-op for files the formatter didn't actually rewrite),
+        // plus anything the in-process pipeline already flagged.
+        let scopes = ToolScopes::build(config, git.root())?;
+        let mut to_add: BTreeSet<PathBuf> = outcome.changed.iter().cloned().collect();
+        for p in &candidates {
+            if scopes.matches_ktfmt(p) || scopes.matches_gjf(p) {
+                to_add.insert(p.clone());
+            }
+        }
+        if !to_add.is_empty() {
+            let to_add: Vec<PathBuf> = to_add.into_iter().collect();
+            git.add(&to_add).context("git add post-format")?;
+        }
     }
     Ok(outcome)
 }
@@ -861,6 +875,80 @@ mod tests {
         assert_eq!(out.changed.len(), 1);
         let added = git.added.borrow();
         assert_eq!(*added, vec![PathBuf::from("src/Foo.kt")]);
+    }
+
+    // Regression test for the hook silently dropping ktfmt/gjf re-stages.
+    // Uses gjf's `path = "..."` with a non-`.jar` extension so kempt picks
+    // `Invoker::Native` and runs the binary directly. The fake shell script
+    // mimics `gjf --replace @argfile` by mutating each listed file in place.
+    #[cfg(unix)]
+    #[test]
+    fn run_hook_restages_jvm_formatter_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/Foo.java", "public class Foo {}\n");
+
+        let fake_gjf = root.join("fake-gjf");
+        std::fs::write(
+            &fake_gjf,
+            "#!/bin/sh\n\
+             for arg in \"$@\"; do\n\
+               case \"$arg\" in\n\
+                 @*)\n\
+                   argfile=\"${arg#@}\"\n\
+                   while IFS= read -r f; do\n\
+                     [ -n \"$f\" ] || continue\n\
+                     printf 'reformatted\\n' >> \"$f\"\n\
+                   done < \"$argfile\"\n\
+                   ;;\n\
+               esac\n\
+             done\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_gjf).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gjf, perms).unwrap();
+
+        let cfg = Config {
+            ktfmt: None,
+            gjf: Some(crate::config::Gjf {
+                version: None,
+                path: Some(fake_gjf),
+                style: Default::default(),
+                license_header: None,
+                native: Default::default(),
+                paths: None,
+            }),
+            license_header: None,
+            paths: Paths {
+                exclude: crate::config::GlobList::Inline(vec![]),
+            },
+            whitespace: Whitespace::default(),
+            hook: Default::default(),
+        };
+
+        let git = FakeGit::new(root)
+            .with_tracked(vec!["src/Foo.java"])
+            .with_staged(vec!["src/Foo.java"]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        run_hook(&cfg, &git, &cache, &dl, 2026).unwrap();
+
+        let added = git.added.borrow();
+        assert!(
+            added.contains(&PathBuf::from("src/Foo.java")),
+            "expected hook to git-add the gjf-modified file, got {:?}",
+            *added
+        );
+
+        let body = std::fs::read_to_string(root.join("src/Foo.java")).unwrap();
+        assert!(
+            body.contains("reformatted"),
+            "fake gjf did not run; file body: {body:?}"
+        );
     }
 
     #[test]
