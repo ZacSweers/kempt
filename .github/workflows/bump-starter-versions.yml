@@ -1,0 +1,99 @@
+name: Bump starter versions
+
+# Runs weekly. Scrapes the latest ktfmt and gjf releases, edits the version
+# constants in `src/commands.rs`, runs the test suite, and opens a PR if
+# anything changed. The constants kempt init writes into a fresh
+# .kempt.toml track upstream this way without making init a network call.
+
+on:
+  schedule:
+    - cron: '17 13 * * 1'  # Mondays at 13:17 UTC, off the top of the hour
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve latest releases
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          KTFMT=$(gh release view --repo facebook/ktfmt --json tagName --jq '.tagName' | sed 's/^v//')
+          GJF=$(gh release view --repo google/google-java-format --json tagName --jq '.tagName' | sed 's/^v//')
+          echo "ktfmt=$KTFMT" >> "$GITHUB_OUTPUT"
+          echo "gjf=$GJF" >> "$GITHUB_OUTPUT"
+          echo "Latest ktfmt: $KTFMT"
+          echo "Latest gjf:   $GJF"
+
+      - name: Read current values
+        id: current
+        run: |
+          set -euo pipefail
+          KTFMT=$(grep -oE 'STARTER_KTFMT_VERSION: &str = "[0-9.]+"' src/commands.rs | grep -oE '[0-9.]+')
+          GJF=$(grep -oE 'STARTER_GJF_VERSION: &str = "[0-9.]+"' src/commands.rs | grep -oE '[0-9.]+')
+          echo "ktfmt=$KTFMT" >> "$GITHUB_OUTPUT"
+          echo "gjf=$GJF" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to bump
+        id: decide
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.current.outputs.ktfmt }}" = "${{ steps.latest.outputs.ktfmt }}" ] \
+             && [ "${{ steps.current.outputs.gjf }}" = "${{ steps.latest.outputs.gjf }}" ]; then
+            echo "Already current."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Edit constants
+        if: steps.decide.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          sed -i -E "s/(STARTER_KTFMT_VERSION: &str = \")[0-9.]+(\")/\\1${{ steps.latest.outputs.ktfmt }}\\2/" src/commands.rs
+          sed -i -E "s/(STARTER_GJF_VERSION: &str = \")[0-9.]+(\")/\\1${{ steps.latest.outputs.gjf }}\\2/" src/commands.rs
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.decide.outputs.changed == 'true'
+
+      - name: Verify
+        if: steps.decide.outputs.changed == 'true'
+        run: |
+          cargo build
+          cargo test
+
+      - name: Open PR
+        if: steps.decide.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: bump-starter-versions
+          base: main
+          title: "Bump starter versions: ktfmt ${{ steps.latest.outputs.ktfmt }}, gjf ${{ steps.latest.outputs.gjf }}"
+          commit-message: |
+            Bump starter versions
+
+            ktfmt: ${{ steps.current.outputs.ktfmt }} -> ${{ steps.latest.outputs.ktfmt }}
+            gjf:   ${{ steps.current.outputs.gjf }} -> ${{ steps.latest.outputs.gjf }}
+          body: |
+            Automated bump of the versions kempt init writes into a fresh
+            `.kempt.toml`.
+
+            - ktfmt: `${{ steps.current.outputs.ktfmt }}` -> `${{ steps.latest.outputs.ktfmt }}`
+              <https://github.com/facebook/ktfmt/releases>
+            - gjf: `${{ steps.current.outputs.gjf }}` -> `${{ steps.latest.outputs.gjf }}`
+              <https://github.com/google/google-java-format/releases>
+
+            Existing repos with pinned versions are unaffected; this only
+            changes the values written by `kempt init`.
+          labels: |
+            automated
+            dependencies
