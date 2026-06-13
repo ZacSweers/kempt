@@ -63,13 +63,14 @@ impl HeaderSpec {
     }
 }
 
-/// Headers resolved per-language. `kotlin` covers `.kt` and `.kts`; `java`
-/// covers `.java`. Either may be `None` if the config doesn't define a header
-/// file for that language.
+/// Headers resolved per-language. `kotlin` covers `.kt` and `.kts`, `java`
+/// covers `.java`, and `rust` covers `.rs`. Any may be `None` if the config
+/// doesn't define a header file for that language.
 #[derive(Default)]
 pub struct Headers {
     pub kotlin: Option<HeaderSpec>,
     pub java: Option<HeaderSpec>,
+    pub rust: Option<HeaderSpec>,
 }
 
 impl Headers {
@@ -82,13 +83,18 @@ impl Headers {
             Some(r) => Some(HeaderSpec::load(&r, repo_root, year)?),
             None => None,
         };
-        Ok(Self { kotlin, java })
+        let rust = match config.rustfmt_header() {
+            Some(r) => Some(HeaderSpec::load(&r, repo_root, year)?),
+            None => None,
+        };
+        Ok(Self { kotlin, java, rust })
     }
 
     pub fn for_kind(&self, kind: SourceKind) -> Option<&HeaderSpec> {
         match kind {
             SourceKind::Kotlin | SourceKind::Kts => self.kotlin.as_ref(),
             SourceKind::Java => self.java.as_ref(),
+            SourceKind::Rust => self.rust.as_ref(),
         }
     }
 }

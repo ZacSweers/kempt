@@ -13,6 +13,7 @@ use globset::GlobSet;
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 const EXPERIMENTAL_PARTIAL_GJF_ENV: &str = "KEMPT_EXPERIMENTAL_PARTIAL_GJF";
 
@@ -63,6 +64,7 @@ pub fn run_format(
         check,
         &mut outcome,
     )?;
+    apply_rustfmt(config, git.root(), &candidates, check, &mut outcome)?;
     Ok(outcome)
 }
 
@@ -139,6 +141,13 @@ fn run_hook_inner(
         check_mode,
         &mut outcome,
     )?;
+    apply_rustfmt(
+        config,
+        git.root(),
+        &normal_candidates,
+        check_mode,
+        &mut outcome,
+    )?;
     let partial_gjf_changed = if !check_mode && !partial_gjf_files.is_empty() {
         apply_partial_gjf_to_index(config, git, cache, downloader, &partial_gjf_files)?
     } else {
@@ -200,17 +209,18 @@ pub fn run_init(target_dir: &Path) -> Result<Vec<PathBuf>> {
 pub struct DetectedLanguages {
     pub kotlin: bool,
     pub java: bool,
+    pub rust: bool,
 }
 
 impl DetectedLanguages {
     fn complete(self) -> bool {
-        self.kotlin && self.java
+        self.kotlin && self.java && self.rust
     }
 }
 
-/// Walk `target_dir` looking for `.kt`/`.kts` and `.java` files. Skips
-/// `.git/`, `build/`, `target/`, and `node_modules/` to keep this snappy on
-/// large repos. Stops scanning once both languages have been seen.
+/// Walk `target_dir` looking for `.kt`/`.kts`, `.java`, and `.rs` files.
+/// Skips `.git/`, `build/`, `target/`, and `node_modules/` to keep this
+/// snappy on large repos. Stops scanning once every language has been seen.
 pub fn detect_languages(target_dir: &Path) -> DetectedLanguages {
     let mut found = DetectedLanguages::default();
     let walker = walkdir::WalkDir::new(target_dir)
@@ -232,6 +242,7 @@ pub fn detect_languages(target_dir: &Path) -> DetectedLanguages {
         match entry.path().extension().and_then(|e| e.to_str()) {
             Some("kt" | "kts") => found.kotlin = true,
             Some("java") => found.java = true,
+            Some("rs") => found.rust = true,
             _ => {}
         }
         if found.complete() {
@@ -242,11 +253,12 @@ pub fn detect_languages(target_dir: &Path) -> DetectedLanguages {
 }
 
 fn build_starter_config(langs: DetectedLanguages) -> String {
-    // No detected languages → write both so the config is complete; user
-    // can trim what they don't need.
-    let neither = !langs.kotlin && !langs.java;
+    // No detected languages → write all formatter sections so the config is
+    // complete; user can trim what they don't need.
+    let neither = !langs.kotlin && !langs.java && !langs.rust;
     let want_ktfmt = langs.kotlin || neither;
     let want_gjf = langs.java || neither;
+    let want_rustfmt = langs.rust || neither;
 
     let mut out = String::from(
         "# kempt configuration: https://github.com/ZacSweers/kempt\n# Run `kempt --help` to see all options.\n\n",
@@ -258,6 +270,9 @@ fn build_starter_config(langs: DetectedLanguages) -> String {
     }
     if want_gjf {
         out.push_str(&format!("[gjf]\nversion = \"{STARTER_GJF_VERSION}\"\n\n"));
+    }
+    if want_rustfmt {
+        out.push_str("[rustfmt]\n\n");
     }
     out.push_str("[license-header]\nfile = \"config/license-header.txt\"\n\n");
     out.push_str("[hook]\nmode = \"format\"   # format | check\n");
@@ -490,6 +505,7 @@ fn collect_candidates(
 struct ToolScopes {
     ktfmt: Option<(GlobSet, GlobSet)>,
     gjf: Option<(GlobSet, GlobSet)>,
+    rustfmt: Option<(GlobSet, GlobSet)>,
     whitespace: (GlobSet, GlobSet),
 }
 
@@ -509,10 +525,18 @@ impl ToolScopes {
             }
             None => None,
         };
+        let rustfmt = match &config.rustfmt {
+            Some(r) => {
+                let rp = r.resolve_paths(repo_root)?;
+                Some(paths::tool_globset(&rp)?)
+            }
+            None => None,
+        };
         let whitespace = paths::tool_globset(&config.whitespace.resolve_paths(repo_root)?)?;
         Ok(Self {
             ktfmt,
             gjf,
+            rustfmt,
             whitespace,
         })
     }
@@ -526,6 +550,13 @@ impl ToolScopes {
 
     fn matches_gjf(&self, path: &Path) -> bool {
         match &self.gjf {
+            Some((inc, exc)) => inc.is_match(path) && !exc.is_match(path),
+            None => false,
+        }
+    }
+
+    fn matches_rustfmt(&self, path: &Path) -> bool {
+        match &self.rustfmt {
             Some((inc, exc)) => inc.is_match(path) && !exc.is_match(path),
             None => false,
         }
@@ -649,7 +680,7 @@ fn apply_jvm_formatters(
                     &kt_files,
                     formatters::MAX_ARG_BYTES,
                 )?;
-                merge_jvm_format_changes(outcome, repo_root, before)?;
+                merge_format_changes(outcome, repo_root, before)?;
             }
         }
     }
@@ -664,12 +695,97 @@ fn apply_jvm_formatters(
             } else {
                 let before = snapshot_files(&java_files)?;
                 formatters::run_argfile("gjf", &invoker, base, &java_files)?;
-                merge_jvm_format_changes(outcome, repo_root, before)?;
+                merge_format_changes(outcome, repo_root, before)?;
             }
         }
     }
 
     Ok(())
+}
+
+fn apply_rustfmt(
+    config: &Config,
+    repo_root: &Path,
+    files: &[PathBuf],
+    check: bool,
+    outcome: &mut FormatOutcome,
+) -> Result<()> {
+    if config.rustfmt.is_none() {
+        return Ok(());
+    }
+    let scopes = ToolScopes::build(config, repo_root)?;
+    let rust_files: Vec<PathBuf> = files
+        .iter()
+        .filter(|p| scopes.matches_rustfmt(p))
+        .cloned()
+        .collect();
+    if rust_files.is_empty() {
+        return Ok(());
+    }
+
+    if check {
+        for rel in rust_files {
+            let output = cargo_fmt(repo_root, check, &[rel.clone()])?;
+            if !output.status.success() {
+                outcome.check_failed = true;
+                outcome.changed.insert(rel);
+                append_rustfmt_stderr(outcome, &output.stderr);
+            }
+        }
+    } else {
+        let abs_files: Vec<PathBuf> = rust_files.iter().map(|p| repo_root.join(p)).collect();
+        let before = snapshot_files(&abs_files)?;
+        let output = cargo_fmt(repo_root, check, &rust_files)?;
+        if !output.status.success() {
+            return Err(formatter_failure("cargo fmt", output));
+        }
+        merge_format_changes(outcome, repo_root, before)?;
+    }
+    Ok(())
+}
+
+fn cargo_fmt(repo_root: &Path, check: bool, files: &[PathBuf]) -> Result<std::process::Output> {
+    let mut cmd = Command::new("cargo");
+    cmd.arg("fmt");
+    if check {
+        cmd.arg("--check");
+    }
+    cmd.arg("--").current_dir(repo_root);
+    for file in files {
+        cmd.arg(file);
+    }
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("spawn cargo fmt failed")
+}
+
+fn append_rustfmt_stderr(outcome: &mut FormatOutcome, stderr: &[u8]) {
+    let stderr = String::from_utf8_lossy(stderr);
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !outcome.parse_errors.is_empty() {
+        outcome.parse_errors.push('\n');
+    }
+    outcome.parse_errors.push_str(trimmed);
+}
+
+fn formatter_failure(tool: &str, output: std::process::Output) -> anyhow::Error {
+    let code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let details = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if details.is_empty() {
+        anyhow!("{tool} failed (exit {code})")
+    } else {
+        anyhow!("{tool} failed (exit {code}):\n{details}")
+    }
 }
 
 fn partial_gjf_candidates(
@@ -889,7 +1005,7 @@ fn snapshot_files(files: &[PathBuf]) -> Result<Vec<(PathBuf, Vec<u8>)>> {
     Ok(before)
 }
 
-fn merge_jvm_format_changes(
+fn merge_format_changes(
     outcome: &mut FormatOutcome,
     repo_root: &Path,
     before: Vec<(PathBuf, Vec<u8>)>,
@@ -946,6 +1062,7 @@ mod tests {
         Config {
             ktfmt: None,
             gjf: None,
+            rustfmt: None,
             license_header: Some(LicenseHeader {
                 file: PathBuf::from("config/header.txt"),
             }),
@@ -996,12 +1113,23 @@ mod tests {
                 native: Default::default(),
                 paths: None,
             }),
+            rustfmt: None,
             license_header: None,
             paths: Paths {
                 exclude: crate::config::GlobList::Inline(vec![]),
             },
             whitespace: Whitespace::default(),
             hook: Default::default(),
+        }
+    }
+
+    fn config_rustfmt_only() -> Config {
+        Config {
+            rustfmt: Some(crate::config::Rustfmt::default()),
+            paths: Paths {
+                exclude: crate::config::GlobList::Inline(vec![]),
+            },
+            ..Default::default()
         }
     }
 
@@ -1125,6 +1253,80 @@ diff --git a/Foo.java b/Foo.java\n\
 
         let body = std::fs::read_to_string(root.join("src/Foo.java")).unwrap();
         assert!(body.contains("reformatted"));
+    }
+
+    #[test]
+    fn run_format_runs_cargo_fmt_for_rust_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"kempt-rust-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(root, "src/lib.rs", "pub fn answer()->i32{1}\n");
+        let cfg = config_rustfmt_only();
+        let git = FakeGit::new(root).with_tracked(vec!["src/lib.rs"]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_format(&cfg, &git, &cache, &dl, Scope::All, false, 2026).unwrap();
+        assert_eq!(out.changed, BTreeSet::from([PathBuf::from("src/lib.rs")]));
+
+        let body = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert_eq!(body, "pub fn answer() -> i32 {\n    1\n}\n");
+    }
+
+    #[test]
+    fn run_format_inserts_rust_header_and_runs_cargo_fmt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"kempt-rust-header-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(root, "config/header.txt", "// (c) ${YEAR} test\n");
+        write(root, "src/lib.rs", "pub fn answer()->i32{1}\n");
+        let mut cfg = config_rustfmt_only();
+        cfg.license_header = Some(LicenseHeader {
+            file: PathBuf::from("config/header.txt"),
+        });
+        let git = FakeGit::new(root).with_tracked(vec!["src/lib.rs"]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_format(&cfg, &git, &cache, &dl, Scope::All, false, 2026).unwrap();
+        assert_eq!(out.changed, BTreeSet::from([PathBuf::from("src/lib.rs")]));
+
+        let body = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert_eq!(
+            body,
+            "// (c) 2026 test\npub fn answer() -> i32 {\n    1\n}\n"
+        );
+    }
+
+    #[test]
+    fn run_format_check_mode_reports_rustfmt_changes_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"kempt-rust-check-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(root, "src/lib.rs", "pub fn answer()->i32{1}\n");
+        let cfg = config_rustfmt_only();
+        let git = FakeGit::new(root).with_tracked(vec!["src/lib.rs"]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_format(&cfg, &git, &cache, &dl, Scope::All, true, 2026).unwrap();
+        assert_eq!(out.changed, BTreeSet::from([PathBuf::from("src/lib.rs")]));
+        assert!(out.check_failed);
+
+        let body = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert_eq!(body, "pub fn answer()->i32{1}\n");
     }
 
     #[test]
@@ -1298,7 +1500,7 @@ diff --git a/Foo.java b/Foo.java\n\
         let dir = tempfile::tempdir().unwrap();
         write_blank(dir.path(), "src/Foo.kt");
         let langs = detect_languages(dir.path());
-        assert!(langs.kotlin && !langs.java);
+        assert!(langs.kotlin && !langs.java && !langs.rust);
     }
 
     #[test]
@@ -1306,7 +1508,15 @@ diff --git a/Foo.java b/Foo.java\n\
         let dir = tempfile::tempdir().unwrap();
         write_blank(dir.path(), "src/Bar.java");
         let langs = detect_languages(dir.path());
-        assert!(langs.java && !langs.kotlin);
+        assert!(langs.java && !langs.kotlin && !langs.rust);
+    }
+
+    #[test]
+    fn detect_languages_finds_rust() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blank(dir.path(), "src/lib.rs");
+        let langs = detect_languages(dir.path());
+        assert!(langs.rust && !langs.kotlin && !langs.java);
     }
 
     #[test]
@@ -1322,8 +1532,9 @@ diff --git a/Foo.java b/Foo.java\n\
         let dir = tempfile::tempdir().unwrap();
         write_blank(dir.path(), "src/Foo.kt");
         write_blank(dir.path(), "src/Bar.java");
+        write_blank(dir.path(), "src/lib.rs");
         let langs = detect_languages(dir.path());
-        assert!(langs.kotlin && langs.java);
+        assert!(langs.kotlin && langs.java && langs.rust);
     }
 
     #[test]
@@ -1331,8 +1542,9 @@ diff --git a/Foo.java b/Foo.java\n\
         let dir = tempfile::tempdir().unwrap();
         write_blank(dir.path(), "build/Generated.kt");
         write_blank(dir.path(), ".git/hooks/script.java");
+        write_blank(dir.path(), "target/generated.rs");
         let langs = detect_languages(dir.path());
-        assert!(!langs.kotlin && !langs.java);
+        assert!(!langs.kotlin && !langs.java && !langs.rust);
     }
 
     #[test]
@@ -1343,6 +1555,7 @@ diff --git a/Foo.java b/Foo.java\n\
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         assert!(body.contains("[ktfmt]"));
         assert!(!body.contains("[gjf]"));
+        assert!(!body.contains("[rustfmt]"));
     }
 
     #[test]
@@ -1353,6 +1566,18 @@ diff --git a/Foo.java b/Foo.java\n\
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         assert!(body.contains("[gjf]"));
         assert!(!body.contains("[ktfmt]"));
+        assert!(!body.contains("[rustfmt]"));
+    }
+
+    #[test]
+    fn run_init_rust_only_omits_ktfmt_and_gjf() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blank(dir.path(), "src/lib.rs");
+        run_init(dir.path()).unwrap();
+        let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
+        assert!(body.contains("[rustfmt]"));
+        assert!(!body.contains("[ktfmt]"));
+        assert!(!body.contains("[gjf]"));
     }
 
     #[test]
@@ -1362,6 +1587,7 @@ diff --git a/Foo.java b/Foo.java\n\
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         assert!(body.contains("[ktfmt]"));
         assert!(body.contains("[gjf]"));
+        assert!(body.contains("[rustfmt]"));
     }
 
     #[test]
@@ -1371,6 +1597,7 @@ diff --git a/Foo.java b/Foo.java\n\
         let dir = tempfile::tempdir().unwrap();
         write_blank(dir.path(), "src/Foo.kt");
         write_blank(dir.path(), "src/Bar.java");
+        write_blank(dir.path(), "src/lib.rs");
         run_init(dir.path()).unwrap();
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         assert!(
@@ -1384,12 +1611,14 @@ diff --git a/Foo.java b/Foo.java\n\
         let dir = tempfile::tempdir().unwrap();
         write_blank(dir.path(), "src/Foo.kt");
         write_blank(dir.path(), "src/Bar.java");
+        write_blank(dir.path(), "src/lib.rs");
         run_init(dir.path()).unwrap();
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         // Must be a valid kempt config end-to-end.
         let cfg = Config::parse(&body).expect("starter parses");
         assert!(cfg.ktfmt.is_some());
         assert!(cfg.gjf.is_some());
+        assert!(cfg.rustfmt.is_some());
         assert_eq!(cfg.ktfmt.unwrap().style, crate::config::KtfmtStyle::Google);
         assert_eq!(cfg.gjf.unwrap().style, crate::config::GjfStyle::Google);
     }
