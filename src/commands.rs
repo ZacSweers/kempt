@@ -11,7 +11,10 @@ use crate::pipeline::{self, Headers, PipelineReport};
 use anyhow::{anyhow, Context, Result};
 use globset::GlobSet;
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+const EXPERIMENTAL_PARTIAL_GJF_ENV: &str = "KEMPT_EXPERIMENTAL_PARTIAL_GJF";
 
 /// Outcome of a format/check run.
 #[derive(Debug, Default)]
@@ -72,38 +75,98 @@ pub fn run_hook(
     downloader: &dyn Downloader,
     year: u32,
 ) -> Result<FormatOutcome> {
+    run_hook_inner(
+        config,
+        git,
+        cache,
+        downloader,
+        year,
+        experimental_partial_gjf_enabled(),
+    )
+}
+
+fn run_hook_inner(
+    config: &Config,
+    git: &dyn GitContext,
+    cache: &Cache,
+    downloader: &dyn Downloader,
+    year: u32,
+    allow_partial_gjf: bool,
+) -> Result<FormatOutcome> {
     let candidates = collect_candidates(git, &Scope::Staged, config)?;
     if candidates.is_empty() {
         return Ok(FormatOutcome::default());
     }
     let check_mode = matches!(config.hook.mode, HookMode::Check);
+    let mut normal_candidates = candidates.clone();
+    let mut partial_gjf_files = Vec::new();
 
     if !check_mode {
         match hook::check_partial_staging(git, &candidates)? {
             StagingCheck::Safe => {}
             StagingCheck::PartialStage { files } => {
-                eprint!("{}", hook::format_partial_stage_error(&files));
-                return Err(anyhow!("partial staging detected"));
+                if allow_partial_gjf {
+                    partial_gjf_files = partial_gjf_candidates(config, git.root(), &files)?;
+                    let handled: BTreeSet<PathBuf> = partial_gjf_files.iter().cloned().collect();
+                    let unhandled: Vec<PathBuf> = files
+                        .iter()
+                        .filter(|p| !handled.contains(*p))
+                        .cloned()
+                        .collect();
+                    if unhandled.is_empty() {
+                        normal_candidates.retain(|p| !handled.contains(p));
+                    } else {
+                        eprint!("{}", hook::format_partial_stage_error(&unhandled));
+                        return Err(anyhow!(
+                            "partial staging detected; {EXPERIMENTAL_PARTIAL_GJF_ENV} only supports GJF-managed Java files"
+                        ));
+                    }
+                } else {
+                    eprint!("{}", hook::format_partial_stage_error(&files));
+                    return Err(anyhow!("partial staging detected"));
+                }
             }
         }
     }
 
-    let mut outcome = apply_pipeline(config, git.root(), &candidates, check_mode, year)?;
+    let mut outcome = apply_pipeline(config, git.root(), &normal_candidates, check_mode, year)?;
     apply_jvm_formatters(
         config,
         cache,
         downloader,
         git.root(),
-        &candidates,
+        &normal_candidates,
         check_mode,
         &mut outcome,
     )?;
+    let partial_gjf_changed = if !check_mode && !partial_gjf_files.is_empty() {
+        apply_partial_gjf_to_index(config, git, cache, downloader, &partial_gjf_files)?
+    } else {
+        BTreeSet::new()
+    };
+    outcome.changed.extend(partial_gjf_changed.iter().cloned());
 
     if !check_mode && !outcome.changed.is_empty() {
-        let to_add: Vec<PathBuf> = outcome.changed.iter().cloned().collect();
+        let to_add: Vec<PathBuf> = outcome
+            .changed
+            .iter()
+            .filter(|p| !partial_gjf_changed.contains(*p))
+            .cloned()
+            .collect();
         git.add(&to_add).context("git add post-format")?;
     }
     Ok(outcome)
+}
+
+fn experimental_partial_gjf_enabled() -> bool {
+    std::env::var(EXPERIMENTAL_PARTIAL_GJF_ENV)
+        .map(|v| {
+            matches!(
+                v.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// Write a starter config + license header template to `target_dir`. The
@@ -609,6 +672,95 @@ fn apply_jvm_formatters(
     Ok(())
 }
 
+fn partial_gjf_candidates(
+    config: &Config,
+    repo_root: &Path,
+    files: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    if config.gjf.is_none() {
+        return Ok(Vec::new());
+    }
+    let scopes = ToolScopes::build(config, repo_root)?;
+    Ok(files
+        .iter()
+        .filter(|p| SourceKind::from_path(p) == Some(SourceKind::Java) && scopes.matches_gjf(p))
+        .cloned()
+        .collect())
+}
+
+fn apply_partial_gjf_to_index(
+    config: &Config,
+    git: &dyn GitContext,
+    cache: &Cache,
+    downloader: &dyn Downloader,
+    files: &[PathBuf],
+) -> Result<BTreeSet<PathBuf>> {
+    let Some(g) = &config.gjf else {
+        return Ok(BTreeSet::new());
+    };
+    let invoker = resolve_gjf_invoker(g, git.root(), cache, downloader)?;
+    let mut changed = BTreeSet::new();
+    for rel in files {
+        let diff = git.staged_diff(rel, 0)?;
+        let line_ranges = parse_added_line_ranges(&diff);
+        if line_ranges.is_empty() {
+            continue;
+        }
+
+        let staged_contents = git.read_staged_file(rel)?;
+        let mut tmp = tempfile::Builder::new()
+            .prefix("kempt-partial-gjf-")
+            .suffix(".java")
+            .tempfile()
+            .context("create partial gjf tempfile")?;
+        tmp.write_all(&staged_contents)
+            .with_context(|| format!("write staged contents for {}", rel.display()))?;
+        tmp.flush()
+            .with_context(|| format!("flush staged contents for {}", rel.display()))?;
+
+        let mut args = formatters::gjf_args(g.style, false);
+        for (start, end) in line_ranges {
+            args.push("--lines".into());
+            args.push(format!("{start}:{end}").into());
+        }
+        args.push(tmp.path().into());
+        formatters::run("gjf", &invoker, args)
+            .with_context(|| format!("partial gjf failed for {}", rel.display()))?;
+
+        let formatted = std::fs::read(tmp.path())
+            .with_context(|| format!("read partial gjf output for {}", rel.display()))?;
+        if formatted != staged_contents {
+            git.update_staged_file(rel, &formatted)?;
+            changed.insert(rel.clone());
+        }
+    }
+    Ok(changed)
+}
+
+fn parse_added_line_ranges(diff: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for line in diff.lines().filter(|line| line.starts_with("@@")) {
+        let Some(spec) = line
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix('+'))
+        else {
+            continue;
+        };
+        let mut parts = spec.splitn(2, ',');
+        let Some(start) = parts.next().and_then(|s| s.parse::<usize>().ok()) else {
+            continue;
+        };
+        let count = parts
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1);
+        if count > 0 {
+            ranges.push((start, start + count - 1));
+        }
+    }
+    ranges
+}
+
 /// Where the user invoked kempt from, used to tailor the "run X to fix"
 /// suggestion in the check summary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -778,7 +930,7 @@ mod tests {
     use super::*;
     use crate::cache::testing::FakeDownloader;
     use crate::config::{LicenseHeader, Paths, Whitespace};
-    use crate::git::testing::FakeGit;
+    use crate::git::{testing::FakeGit, RealGit};
 
     fn write(root: &Path, rel: &str, body: &str) {
         let p = root.join(rel);
@@ -851,6 +1003,57 @@ mod tests {
             whitespace: Whitespace::default(),
             hook: Default::default(),
         }
+    }
+
+    #[cfg(unix)]
+    fn fake_gjf_marking_new_line(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake_gjf = root.join("fake-partial-gjf");
+        std::fs::write(
+            &fake_gjf,
+            "#!/bin/sh\n\
+             file=\"\"\n\
+             for arg in \"$@\"; do\n\
+               case \"$arg\" in\n\
+                 *.java) file=\"$arg\" ;;\n\
+               esac\n\
+             done\n\
+             [ -n \"$file\" ] || exit 2\n\
+             awk '{ if ($0 ~ /new staged/) print $0 \" // formatted\"; else print }' \"$file\" > \"$file.out\"\n\
+             mv \"$file.out\" \"$file\"\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_gjf).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gjf, perms).unwrap();
+        fake_gjf
+    }
+
+    #[cfg(unix)]
+    fn git_cmd(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[test]
+    fn parse_added_line_ranges_reads_cached_diff_hunks() {
+        let diff = "\
+diff --git a/Foo.java b/Foo.java\n\
+@@ -1 +1,2 @@\n\
+@@ -8,0 +10,3 @@\n\
+@@ -20,2 +24,0 @@\n";
+        assert_eq!(parse_added_line_ranges(diff), vec![(1, 2), (10, 12)]);
     }
 
     #[test]
@@ -937,11 +1140,80 @@ mod tests {
         let cache = Cache::new(root.join(".cache"));
         let dl = FakeDownloader::new(b"".to_vec());
 
-        let err = run_hook(&cfg, &git, &cache, &dl, 2026).unwrap_err();
+        let err = run_hook_inner(&cfg, &git, &cache, &dl, 2026, false).unwrap_err();
         assert!(format!("{err:#}").contains("partial staging"));
         // file should not have been modified
         let body = std::fs::read_to_string(root.join("src/Foo.kt")).unwrap();
         assert_eq!(body, "package foo   \n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_hook_partial_gjf_updates_index_without_staging_unstaged_hunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_cmd(root, &["init"]);
+        git_cmd(root, &["config", "user.email", "test@example.com"]);
+        git_cmd(root, &["config", "user.name", "Test User"]);
+
+        write(
+            root,
+            "src/Foo.java",
+            "public class Foo {\n\
+             void staged() {\n\
+               System.out.println(\"old staged\");\n\
+             }\n\
+             void unstaged() {\n\
+               System.out.println(\"old unstaged\");\n\
+             }\n\
+             }\n",
+        );
+        git_cmd(root, &["add", "src/Foo.java"]);
+        git_cmd(root, &["commit", "-m", "initial"]);
+
+        write(
+            root,
+            "src/Foo.java",
+            "public class Foo {\n\
+             void staged() {\n\
+               System.out.println(\"new staged\");\n\
+             }\n\
+             void unstaged() {\n\
+               System.out.println(\"old unstaged\");\n\
+             }\n\
+             }\n",
+        );
+        git_cmd(root, &["add", "src/Foo.java"]);
+        write(
+            root,
+            "src/Foo.java",
+            "public class Foo {\n\
+             void staged() {\n\
+               System.out.println(\"new staged\");\n\
+             }\n\
+             void unstaged() {\n\
+               System.out.println(\"worktree unstaged\");\n\
+             }\n\
+             }\n",
+        );
+
+        let cfg = config_gjf_only(fake_gjf_marking_new_line(root));
+        let git = RealGit::discover(root).unwrap();
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_hook_inner(&cfg, &git, &cache, &dl, 2026, true).unwrap();
+        assert_eq!(out.changed, BTreeSet::from([PathBuf::from("src/Foo.java")]));
+
+        let staged = git_cmd(root, &["show", ":src/Foo.java"]);
+        assert!(staged.contains("new staged\"); // formatted"));
+        assert!(staged.contains("old unstaged"));
+        assert!(!staged.contains("worktree unstaged"));
+
+        let worktree = std::fs::read_to_string(root.join("src/Foo.java")).unwrap();
+        assert!(worktree.contains("new staged\");"));
+        assert!(worktree.contains("worktree unstaged"));
+        assert!(!worktree.contains("// formatted"));
     }
 
     #[test]

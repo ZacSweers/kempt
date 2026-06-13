@@ -320,14 +320,19 @@ The hook does, in order:
 1. Collect staged files matching the config's path globs.
 2. Refuse to run if any of those files have unstaged modifications. This is
    the "partial staging" case where formatting and re-staging would silently pull
-   unstaged hunks into the commit. kempt doesn't pretend that this is a 
-   desirable situation, instead refusing to proceed and asking you to pick one 
+   unstaged hunks into the commit. kempt doesn't pretend that this is a
+   desirable situation, instead refusing to proceed and asking you to pick one
    of three escape hatches:
    1. Stage the rest
    2. `git stash --keep-index`
    3. Commit with `--no-verify`.
 3. Run the full pipeline (license headers, whitespace, ktfmt, gjf).
 4. `git add` the formatted files back to the index.
+
+Experimental: set `KEMPT_EXPERIMENTAL_PARTIAL_GJF=1` to allow partially
+staged GJF-managed Java files. kempt formats the staged Java hunks through GJF
+and updates the index directly, without staging unrelated worktree hunks. Other
+partially staged files still use the refusal path above.
 
 Set `[hook] mode = "check"` to make the hook fail on any required change
 instead of formatting in place.
