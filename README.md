@@ -1,10 +1,16 @@
 # kempt
 
-A pre-commit-friendly multi-language source formatter. Wraps
-[ktfmt](https://github.com/facebook/ktfmt) and
-[google-java-format](https://github.com/google/google-java-format), inserts
-license headers, and normalizes trailing whitespace. Configured per repo via
-`.kempt.toml`.
+A pre-commit-friendly multi-language source formatting pipeline. It runs
+language formatters, inserts license headers, and normalizes trailing
+whitespace. Configured per repo via `.kempt.toml`.
+
+Supported targets:
+
+| Language | Extensions    | Formatter                                                          | Config section |
+|----------|---------------|--------------------------------------------------------------------|----------------|
+| Kotlin   | `.kt`, `.kts` | [ktfmt](https://github.com/facebook/ktfmt)                         | `[ktfmt]`      |
+| Java     | `.java`       | [google-java-format](https://github.com/google/google-java-format) | `[gjf]`        |
+| Rust     | `.rs`         | `cargo fmt`                                                        | `[rustfmt]`    |
 
 ## Install
 
@@ -34,6 +40,7 @@ cargo install kempt-fmt
 ### Notes
 
 A working `java` (JDK 17+) on `PATH` is required to run ktfmt and gjf (unless using `native`).
+A working `cargo fmt` on `PATH` is required when `[rustfmt]` is enabled.
 
 ## Quick start
 
@@ -47,9 +54,10 @@ kempt format           # format everything once
 
 `kempt init` scans the repo and tailors the starter config: `[ktfmt]` is
 emitted only when `.kt`/`.kts` files exist, `[gjf]` only when `.java` files
-exist. An empty repo gets both. The versions written into the starter are
-the latest available at the time kempt was built; an automated workflow
-keeps them current.
+exist, and `[rustfmt]` only when `.rs` files exist. An empty repo gets all
+formatter sections. The versions written into the starter are the latest
+available at the time kempt was built; an automated workflow keeps them
+current.
 
 `kempt check` is the read-only variant. It exits non-zero if any file would
 change. That's what you want in CI formatting checks.
@@ -69,6 +77,8 @@ version = "1.35.0"
 style = "google"           # google | aosp
 native = "auto"            # auto | always | never
 
+[rustfmt]
+
 [license-header]
 file = "config/license-header.txt"             # supports ${YEAR}
 
@@ -80,6 +90,10 @@ excludes = "config/license-excludes-kt.txt"
 [gjf.license-header]
 file = "config/license-header-java.txt"        # overrides global for .java
 excludes = "config/license-excludes-java.txt"
+
+[rustfmt.license-header]
+file = "config/license-header-rust.txt"        # overrides global for .rs
+excludes = "config/license-excludes-rs.txt"
 
 [paths]
 # Universal exclude applied before any tool's own filter. Inline array OR
@@ -97,8 +111,11 @@ exclude = "config/ktfmt-skip.txt"   # polymorphic: array or file path
 # defaults: include = ["**/*.java"], exclude = []
 exclude = ["**/*Generated.java"]
 
+[rustfmt.paths]
+# defaults: include = ["**/*.rs"], exclude = []
+
 [whitespace.paths]
-# defaults: include = ["**/*.kt", "**/*.kts", "**/*.java"], exclude = []
+# defaults: include = ["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"], exclude = []
 
 [whitespace]
 strip-trailing = true   # strip trailing space/tab/CR from every line
@@ -111,9 +128,10 @@ mode = "format"            # format | check
 The license header file is a literal template. `${YEAR}` is expanded at write-time.
 
 `[license-header]` sets the default template used by every language.
-`[ktfmt.license-header]` and `[gjf.license-header]` override per tool: `file`
-swaps in a different template for that tool's languages, and `excludes`
-points at an exclude-list specific to that tool. Either field is optional.
+`[ktfmt.license-header]`, `[gjf.license-header]`, and
+`[rustfmt.license-header]` override per tool: `file` swaps in a different
+template for that tool's languages, and `excludes` points at an exclude-list
+specific to that tool. Either field is optional.
 If neither the global section nor the tool override supplies a `file`, no
 header is inserted for that language.
 
@@ -123,14 +141,14 @@ The exclude files are plain text, one glob per line, `#` comments allowed.
 
 kempt has two exclude mechanisms because they answer different questions:
 
-| Where                                                                              | Question it answers                          | Example use                                                          |
-|------------------------------------------------------------------------------------|----------------------------------------------|----------------------------------------------------------------------|
-| `[paths].exclude` (inline list)                                                    | "Should kempt touch this file at all?"       | Build output, test fixtures, generated code, vendored upstream files |
-| `[ktfmt.license-header].excludes` / `[gjf.license-header].excludes` (file pointer) | "Should kempt insert a header in this file?" | Files with their own license header that should still be formatted   |
+| Where                                      | Question it answers                          | Example use                                                          |
+|--------------------------------------------|----------------------------------------------|----------------------------------------------------------------------|
+| `[paths].exclude` (inline list)            | "Should kempt touch this file at all?"       | Build output, test fixtures, generated code, vendored upstream files |
+| `[<tool>.license-header].excludes` (file pointer) | "Should kempt insert a header in this file?" | Files with their own license header that should still be formatted   |
 
 If a file matches `[paths].exclude`, kempt skips it completely, no formatter and
 no header. If a file is in a license-header excludes file but not in
-`[paths].exclude`, kempt still formats it (ktfmt or gjf), it just won't
+`[paths].exclude`, kempt still formats it with its configured tool; it just won't
 prepend a header.
 
 When in doubt, prefer `[paths].exclude`. Reach for the license-header excludes
@@ -142,11 +160,12 @@ only when you genuinely want the formatter to run but the header to stay off
 Each tool has its own `paths.include` / `paths.exclude` with language
 defaults so you only configure these when you need to narrow further:
 
-| Tool                 | Default include                        | Default exclude |
-|----------------------|----------------------------------------|-----------------|
-| `[ktfmt.paths]`      | `["**/*.kt", "**/*.kts"]`              | `[]`            |
-| `[gjf.paths]`        | `["**/*.java"]`                        | `[]`            |
-| `[whitespace.paths]` | `["**/*.kt", "**/*.kts", "**/*.java"]` | `[]`            |
+| Tool                 | Default include                                   | Default exclude |
+|----------------------|---------------------------------------------------|-----------------|
+| `[ktfmt.paths]`      | `["**/*.kt", "**/*.kts"]`                         | `[]`            |
+| `[gjf.paths]`        | `["**/*.java"]`                                   | `[]`            |
+| `[rustfmt.paths]`    | `["**/*.rs"]`                                     | `[]`            |
+| `[whitespace.paths]` | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | `[]`            |
 
 The global `[paths].exclude` is applied first as a universal filter; each
 tool's own `include` / `exclude` then narrows further. A file is processed
@@ -157,10 +176,10 @@ by a given tool iff:
 - It is not matched by that tool's `paths.exclude`.
 
 License-header insertion is determined by file extension (`.kt`/`.kts`
-get the kt header, `.java` gets the java header) plus the per-tool
-`license-header.excludes` list. It is intentionally NOT gated on tool path
-scope so you can configure `[license-header]` without configuring
-`[ktfmt]` and still get headers on kt files.
+get the kt header, `.java` gets the java header, `.rs` gets the rust header)
+plus the per-tool `license-header.excludes` list. It is intentionally NOT
+gated on tool path scope so you can configure `[license-header]` without
+configuring `[ktfmt]` and still get headers on kt files.
 
 ### Polymorphic include / exclude
 
@@ -222,35 +241,40 @@ like (the defaults already cover `**/build/**` and `**/target/**`). The
 Every option, with default. A `-` in the default column means "no built-in
 default; the section that contains it is what enables the feature."
 
-| Key                               | Default                                | Notes                                                                                                                    |
-|-----------------------------------|----------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
-| `[ktfmt].version`                 | -                                      | Maven Central version. Either a literal `"0.62"` or a catalog reference `{ file, key }`. Mutually exclusive with `path`. |
-| `[ktfmt].path`                    | -                                      | Path to a checked-in jar. Mutually exclusive with `version`.                                                             |
-| `[ktfmt].style`                   | `"google"`                             | `google` / `kotlinlang` / `meta`                                                                                         |
-| `[ktfmt.paths].include`           | `["**/*.kt", "**/*.kts"]`              | Inline array or path to a glob-list file.                                                                                |
-| `[ktfmt.paths].exclude`           | `[]`                                   | Inline array or path to a glob-list file.                                                                                |
-| `[ktfmt.license-header].file`     | inherits `[license-header].file`       | Per-tool template override.                                                                                              |
-| `[ktfmt.license-header].excludes` | none                                   | Path to a glob list (one per line, `#` comments).                                                                        |
-| `[gjf].version`                   | -                                      | GitHub release version. Either a literal or a catalog reference `{ file, key }`. Mutually exclusive with `path`.         |
-| `[gjf].path`                      | -                                      | Path to a checked-in jar or native binary. Mutually exclusive with `version`.                                            |
-| `[gjf].style`                     | `"google"`                             | `google` / `aosp`                                                                                                        |
-| `[gjf].native`                    | `"auto"`                               | `auto` / `always` / `never`. See "Native gjf".                                                                           |
-| `[gjf.paths].include`             | `["**/*.java"]`                        | Inline array or path to a glob-list file.                                                                                |
-| `[gjf.paths].exclude`             | `[]`                                   | Inline array or path to a glob-list file.                                                                                |
-| `[gjf.license-header].file`       | inherits `[license-header].file`       | Per-tool template override.                                                                                              |
-| `[gjf.license-header].excludes`   | none                                   | Path to a glob list.                                                                                                     |
-| `[license-header].file`           | -                                      | Default license header template, `${YEAR}` expanded at write time. Section absence = no header insertion.                |
-| `[paths].exclude`                 | `["**/build/**", "**/target/**"]`      | Universal exclude, applied before any tool's filter. Inline array or path to a glob-list file.                           |
-| `[whitespace].strip-trailing`     | `true`                                 | Strip trailing space/tab/CR on every line.                                                                               |
-| `[whitespace].final-newline`      | `true`                                 | Ensure files end with exactly one `\n`.                                                                                  |
-| `[whitespace.paths].include`      | `["**/*.kt", "**/*.kts", "**/*.java"]` | Inline array or path to a glob-list file.                                                                                |
-| `[whitespace.paths].exclude`      | `[]`                                   | Inline array or path to a glob-list file.                                                                                |
-| `[hook].mode`                     | `"format"`                             | `format` formats and re-stages. `check` fails the commit if changes are needed.                                          |
+| Key                                 | Default                                           | Notes                                                                                                                    |
+|-------------------------------------|---------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| `[ktfmt].version`                   | -                                                 | Maven Central version. Either a literal `"0.62"` or a catalog reference `{ file, key }`. Mutually exclusive with `path`. |
+| `[ktfmt].path`                      | -                                                 | Path to a checked-in jar. Mutually exclusive with `version`.                                                             |
+| `[ktfmt].style`                     | `"google"`                                        | `google` / `kotlinlang` / `meta`                                                                                         |
+| `[ktfmt.paths].include`             | `["**/*.kt", "**/*.kts"]`                         | Inline array or path to a glob-list file.                                                                                |
+| `[ktfmt.paths].exclude`             | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
+| `[ktfmt.license-header].file`       | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
+| `[ktfmt.license-header].excludes`   | none                                              | Path to a glob list (one per line, `#` comments).                                                                        |
+| `[gjf].version`                     | -                                                 | GitHub release version. Either a literal or a catalog reference `{ file, key }`. Mutually exclusive with `path`.         |
+| `[gjf].path`                        | -                                                 | Path to a checked-in jar or native binary. Mutually exclusive with `version`.                                            |
+| `[gjf].style`                       | `"google"`                                        | `google` / `aosp`                                                                                                        |
+| `[gjf].native`                      | `"auto"`                                          | `auto` / `always` / `never`. See "Native gjf".                                                                           |
+| `[gjf.paths].include`               | `["**/*.java"]`                                   | Inline array or path to a glob-list file.                                                                                |
+| `[gjf.paths].exclude`               | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
+| `[gjf.license-header].file`         | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
+| `[gjf.license-header].excludes`     | none                                              | Path to a glob list.                                                                                                     |
+| `[rustfmt.paths].include`           | `["**/*.rs"]`                                     | Inline array or path to a glob-list file.                                                                                |
+| `[rustfmt.paths].exclude`           | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
+| `[rustfmt.license-header].file`     | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
+| `[rustfmt.license-header].excludes` | none                                              | Path to a glob list.                                                                                                     |
+| `[license-header].file`             | -                                                 | Default license header template, `${YEAR}` expanded at write time. Section absence = no header insertion.                |
+| `[paths].exclude`                   | `["**/build/**", "**/target/**"]`                 | Universal exclude, applied before any tool's filter. Inline array or path to a glob-list file.                           |
+| `[whitespace].strip-trailing`       | `true`                                            | Strip trailing space/tab/CR on every line.                                                                               |
+| `[whitespace].final-newline`        | `true`                                            | Ensure files end with exactly one `\n`.                                                                                  |
+| `[whitespace.paths].include`        | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | Inline array or path to a glob-list file.                                                                                |
+| `[whitespace.paths].exclude`        | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
+| `[hook].mode`                       | `"format"`                                        | `format` formats and re-stages. `check` fails the commit if changes are needed.                                          |
 
-Sections that are entirely optional: `[ktfmt]`, `[gjf]`, `[license-header]`,
-`[ktfmt.license-header]`, `[gjf.license-header]`. Omitting a section
-disables that step. `[paths]`, `[whitespace]`, and `[hook]` are always
-present (with the defaults above).
+Sections that are entirely optional: `[ktfmt]`, `[gjf]`, `[rustfmt]`,
+`[license-header]`, `[ktfmt.license-header]`, `[gjf.license-header]`,
+`[rustfmt.license-header]`.
+Omitting a section disables that step. `[paths]`, `[whitespace]`, and
+`[hook]` are always present (with the defaults above).
 
 ## Subcommands
 
@@ -258,7 +282,7 @@ present (with the defaults above).
 |----------------------|------------------------------------------------------------------------------------------------------------------------------------------|
 | `kempt format`       | Format files in place.                                                                                                                   |
 | `kempt check`        | Dry-run; exits non-zero if changes are needed. Suitable for CI.                                                                          |
-| `kempt init`         | Scaffold `.kempt.toml` plus a starter `config/license-header.txt`. Detects `.kt`/`.java` to decide which sections to write.              |
+| `kempt init`         | Scaffold `.kempt.toml` plus a starter `config/license-header.txt`. Detects `.kt`/`.java`/`.rs` to decide which sections to write.        |
 | `kempt install-hook` | Write a `.git/hooks/pre-commit` that calls `kempt hook`.                                                                                 |
 | `kempt hook`         | Run as the pre-commit hook. Not normally invoked manually.                                                                               |
 | `kempt update`       | Download formatter jars/binaries per config. Pre-warms the cache.                                                                        |
@@ -326,7 +350,7 @@ The hook does, in order:
    1. Stage the rest
    2. `git stash --keep-index`
    3. Commit with `--no-verify`.
-3. Run the full pipeline (license headers, whitespace, ktfmt, gjf).
+3. Run the full pipeline (license headers, whitespace, ktfmt, gjf, cargo fmt).
 4. `git add` the formatted files back to the index.
 
 Experimental: set `KEMPT_EXPERIMENTAL_PARTIAL_GJF=1` to allow partially

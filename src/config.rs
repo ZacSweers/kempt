@@ -131,6 +131,7 @@ impl VersionSpec {
 pub struct Config {
     pub ktfmt: Option<Ktfmt>,
     pub gjf: Option<Gjf>,
+    pub rustfmt: Option<Rustfmt>,
     pub license_header: Option<LicenseHeader>,
     #[serde(default)]
     pub paths: Paths,
@@ -206,6 +207,21 @@ impl Gjf {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Rustfmt {
+    pub license_header: Option<ToolLicenseHeader>,
+    /// Tool-specific path scope. Defaults to `**/*.rs`.
+    pub paths: Option<ToolPaths>,
+}
+
+impl Rustfmt {
+    pub fn resolve_paths(&self, repo_root: &Path) -> Result<ResolvedPaths> {
+        let p = self.paths.clone().unwrap_or_default();
+        p.resolve_with_defaults(repo_root, &["**/*.rs"], &[])
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum GjfStyle {
@@ -250,7 +266,8 @@ pub struct ResolvedHeader {
 
 /// Universal path filter applied before any tool-specific scope. Currently
 /// only excludes are configurable here; per-language inclusion lives in
-/// `[ktfmt.paths]`, `[gjf.paths]`, and `[whitespace.paths]`.
+/// `[ktfmt.paths]`, `[gjf.paths]`, `[rustfmt.paths]`, and
+/// `[whitespace.paths]`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Paths {
@@ -297,7 +314,11 @@ impl Default for Whitespace {
 impl Whitespace {
     pub fn resolve_paths(&self, repo_root: &Path) -> Result<ResolvedPaths> {
         let p = self.paths.clone().unwrap_or_default();
-        p.resolve_with_defaults(repo_root, &["**/*.kt", "**/*.kts", "**/*.java"], &[])
+        p.resolve_with_defaults(
+            repo_root,
+            &["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"],
+            &[],
+        )
     }
 }
 
@@ -353,6 +374,15 @@ impl Config {
     /// Resolve the header settings for gjf-managed languages (`.java`).
     pub fn gjf_header(&self) -> Option<ResolvedHeader> {
         let tool = self.gjf.as_ref().and_then(|g| g.license_header.as_ref());
+        resolve_header(self.license_header.as_ref(), tool)
+    }
+
+    /// Resolve the header settings for rustfmt-managed languages (`.rs`).
+    pub fn rustfmt_header(&self) -> Option<ResolvedHeader> {
+        let tool = self
+            .rustfmt
+            .as_ref()
+            .and_then(|r| r.license_header.as_ref());
         resolve_header(self.license_header.as_ref(), tool)
     }
 
@@ -525,6 +555,7 @@ mod tests {
         let c = Config::parse("").unwrap();
         assert!(c.ktfmt.is_none());
         assert!(c.gjf.is_none());
+        assert!(c.rustfmt.is_none());
         assert!(c.license_header.is_none());
         assert!(c.whitespace.strip_trailing);
         assert!(c.whitespace.final_newline);
@@ -593,6 +624,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.gjf.unwrap().style, GjfStyle::Aosp);
+    }
+
+    #[test]
+    fn rustfmt_section_is_supported() {
+        let c = Config::parse(
+            r#"
+            [rustfmt]
+        "#,
+        )
+        .unwrap();
+        assert!(c.rustfmt.is_some());
+    }
+
+    #[test]
+    fn rustfmt_license_header_uses_global_when_only_excludes_set() {
+        let c = Config::parse(
+            r#"
+            [license-header]
+            file = "config/global.txt"
+
+            [rustfmt]
+
+            [rustfmt.license-header]
+            excludes = "config/excludes-rs.txt"
+        "#,
+        )
+        .unwrap();
+        let resolved = c.rustfmt_header().unwrap();
+        assert_eq!(resolved.file, PathBuf::from("config/global.txt"));
+        assert_eq!(
+            resolved.excludes,
+            Some(PathBuf::from("config/excludes-rs.txt"))
+        );
+    }
+
+    #[test]
+    fn rustfmt_license_header_file_overrides_global() {
+        let c = Config::parse(
+            r#"
+            [license-header]
+            file = "config/global.txt"
+
+            [rustfmt]
+
+            [rustfmt.license-header]
+            file = "config/rust.txt"
+        "#,
+        )
+        .unwrap();
+        let resolved = c.rustfmt_header().unwrap();
+        assert_eq!(resolved.file, PathBuf::from("config/rust.txt"));
+        assert!(resolved.excludes.is_none());
     }
 
     #[test]
@@ -715,6 +798,7 @@ mod tests {
         let c = Config::parse("").unwrap();
         assert!(c.ktfmt_header().is_none());
         assert!(c.gjf_header().is_none());
+        assert!(c.rustfmt_header().is_none());
     }
 
     #[test]
@@ -792,10 +876,27 @@ mod tests {
     }
 
     #[test]
+    fn rustfmt_paths_default_to_rs_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Config::parse(
+            r#"
+            [rustfmt]
+        "#,
+        )
+        .unwrap();
+        let r = c.rustfmt.unwrap();
+        let resolved = r.resolve_paths(dir.path()).unwrap();
+        assert_eq!(resolved.include, vec!["**/*.rs"]);
+    }
+
+    #[test]
     fn whitespace_paths_default_to_all_known_languages() {
         let dir = tempfile::tempdir().unwrap();
         let resolved = Whitespace::default().resolve_paths(dir.path()).unwrap();
-        assert_eq!(resolved.include, vec!["**/*.kt", "**/*.kts", "**/*.java"]);
+        assert_eq!(
+            resolved.include,
+            vec!["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]
+        );
     }
 
     #[test]

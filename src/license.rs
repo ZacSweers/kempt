@@ -1,7 +1,7 @@
 //! License header insertion.
 //!
 //! Replaces ${YEAR} in the template, detects the language-specific insertion
-//! point (first `package`/`@file:`/`import`/etc. line), and prepends the
+//! point (first `package`/`@file:`/`use`/etc. line), and prepends the
 //! rendered header. Anything in the file before the insertion point is
 //! discarded, matching the behavior of the original format.sh.
 
@@ -14,6 +14,7 @@ pub enum SourceKind {
     Kotlin,
     Kts,
     Java,
+    Rust,
 }
 
 impl SourceKind {
@@ -23,6 +24,7 @@ impl SourceKind {
             "kt" => Some(Self::Kotlin),
             "kts" => Some(Self::Kts),
             "java" => Some(Self::Java),
+            "rs" => Some(Self::Rust),
             _ => None,
         }
     }
@@ -42,6 +44,22 @@ impl SourceKind {
                 "dependencyResolutionManagement",
             ],
             Self::Java => &["package "],
+            Self::Rust => &[
+                "#![",
+                "//!",
+                "use ",
+                "mod ",
+                "pub ",
+                "fn ",
+                "impl ",
+                "struct ",
+                "enum ",
+                "trait ",
+                "const ",
+                "static ",
+                "type ",
+                "macro_rules!",
+            ],
         }
     }
 }
@@ -139,6 +157,10 @@ mod tests {
         assert_eq!(
             SourceKind::from_path(&PathBuf::from("Foo.java")),
             Some(SourceKind::Java)
+        );
+        assert_eq!(
+            SourceKind::from_path(&PathBuf::from("src/lib.rs")),
+            Some(SourceKind::Rust)
         );
         assert_eq!(SourceKind::from_path(&PathBuf::from("README.md")), None);
     }
@@ -246,6 +268,24 @@ mod tests {
         let out = insert_header(content, &header, SourceKind::Java);
         assert!(out.starts_with("// Copyright (C) 2026"));
         assert!(out.contains("package com.example;"));
+    }
+
+    #[test]
+    fn insert_header_rust_with_inner_attribute() {
+        let content = "#![allow(dead_code)]\n\npub fn answer() -> i32 {\n    1\n}\n";
+        let header = render_header(&template(), 2026);
+        let out = insert_header(content, &header, SourceKind::Rust);
+        assert!(out.starts_with("// Copyright (C) 2026"));
+        assert!(out.contains("#![allow(dead_code)]"));
+    }
+
+    #[test]
+    fn insert_header_rust_with_use_statement() {
+        let content = "use std::path::Path;\n\nfn main() {}\n";
+        let header = render_header(&template(), 2026);
+        let out = insert_header(content, &header, SourceKind::Rust);
+        assert!(out.starts_with("// Copyright (C) 2026"));
+        assert!(out.contains("use std::path::Path;"));
     }
 
     #[test]
