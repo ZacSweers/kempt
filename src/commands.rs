@@ -725,7 +725,7 @@ fn apply_rustfmt(
 
     if check {
         for rel in rust_files {
-            let output = cargo_fmt(repo_root, check, &[rel.clone()])?;
+            let output = cargo_fmt(repo_root, check, std::slice::from_ref(&rel))?;
             if !output.status.success() {
                 outcome.check_failed = true;
                 outcome.changed.insert(rel);
