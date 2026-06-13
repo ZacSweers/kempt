@@ -99,23 +99,9 @@ pub fn run_hook(
         &mut outcome,
     )?;
 
-    if !check_mode {
-        // ktfmt and gjf rewrite files in place via subprocess, so kempt
-        // can't tell from outcome.changed alone which files they touched.
-        // Re-stage every staged candidate that was in a JVM formatter's
-        // scope (no-op for files the formatter didn't actually rewrite),
-        // plus anything the in-process pipeline already flagged.
-        let scopes = ToolScopes::build(config, git.root())?;
-        let mut to_add: BTreeSet<PathBuf> = outcome.changed.iter().cloned().collect();
-        for p in &candidates {
-            if scopes.matches_ktfmt(p) || scopes.matches_gjf(p) {
-                to_add.insert(p.clone());
-            }
-        }
-        if !to_add.is_empty() {
-            let to_add: Vec<PathBuf> = to_add.into_iter().collect();
-            git.add(&to_add).context("git add post-format")?;
-        }
+    if !check_mode && !outcome.changed.is_empty() {
+        let to_add: Vec<PathBuf> = outcome.changed.iter().cloned().collect();
+        git.add(&to_add).context("git add post-format")?;
     }
     Ok(outcome)
 }
@@ -592,6 +578,7 @@ fn apply_jvm_formatters(
                 )?;
                 merge_jvm_check_run(outcome, repo_root, run);
             } else {
+                let before = snapshot_files(&kt_files)?;
                 formatters::run_batched(
                     "ktfmt",
                     &invoker,
@@ -599,6 +586,7 @@ fn apply_jvm_formatters(
                     &kt_files,
                     formatters::MAX_ARG_BYTES,
                 )?;
+                merge_jvm_format_changes(outcome, repo_root, before)?;
             }
         }
     }
@@ -611,7 +599,9 @@ fn apply_jvm_formatters(
                 let run = formatters::run_argfile_check("gjf", &invoker, base, &java_files)?;
                 merge_jvm_check_run(outcome, repo_root, run);
             } else {
+                let before = snapshot_files(&java_files)?;
                 formatters::run_argfile("gjf", &invoker, base, &java_files)?;
+                merge_jvm_format_changes(outcome, repo_root, before)?;
             }
         }
     }
@@ -738,6 +728,34 @@ fn merge_jvm_check_run(outcome: &mut FormatOutcome, repo_root: &Path, run: forma
     }
 }
 
+fn snapshot_files(files: &[PathBuf]) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    let mut before = Vec::with_capacity(files.len());
+    for file in files {
+        let contents = std::fs::read(file).with_context(|| format!("read {}", file.display()))?;
+        before.push((file.clone(), contents));
+    }
+    Ok(before)
+}
+
+fn merge_jvm_format_changes(
+    outcome: &mut FormatOutcome,
+    repo_root: &Path,
+    before: Vec<(PathBuf, Vec<u8>)>,
+) -> Result<()> {
+    for (abs, old_contents) in before {
+        let new_contents =
+            std::fs::read(&abs).with_context(|| format!("read {}", abs.display()))?;
+        if new_contents != old_contents {
+            let rel = abs
+                .strip_prefix(repo_root)
+                .with_context(|| format!("strip repo root from {}", abs.display()))?
+                .to_path_buf();
+            outcome.changed.insert(rel);
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a [`ToolSource`] to a concrete jar path. `Cached` delegates to the
 /// download/cache helper; `Local` checks that the jar exists.
 fn resolve_jar(
@@ -779,6 +797,54 @@ mod tests {
             license_header: Some(LicenseHeader {
                 file: PathBuf::from("config/header.txt"),
             }),
+            paths: Paths {
+                exclude: crate::config::GlobList::Inline(vec![]),
+            },
+            whitespace: Whitespace::default(),
+            hook: Default::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_gjf_appending_reformatted(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake_gjf = root.join("fake-gjf");
+        std::fs::write(
+            &fake_gjf,
+            "#!/bin/sh\n\
+             for arg in \"$@\"; do\n\
+               case \"$arg\" in\n\
+                 @*)\n\
+                   argfile=\"${arg#@}\"\n\
+                   while IFS= read -r f; do\n\
+                     [ -n \"$f\" ] || continue\n\
+                     printf 'reformatted\\n' >> \"$f\"\n\
+                   done < \"$argfile\"\n\
+                   ;;\n\
+               esac\n\
+             done\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_gjf).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_gjf, perms).unwrap();
+        fake_gjf
+    }
+
+    #[cfg(unix)]
+    fn config_gjf_only(fake_gjf: PathBuf) -> Config {
+        Config {
+            ktfmt: None,
+            gjf: Some(crate::config::Gjf {
+                version: None,
+                path: Some(fake_gjf),
+                style: Default::default(),
+                license_header: None,
+                native: Default::default(),
+                paths: None,
+            }),
+            license_header: None,
             paths: Paths {
                 exclude: crate::config::GlobList::Inline(vec![]),
             },
@@ -839,6 +905,25 @@ mod tests {
         assert!(!out.check_failed);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn run_format_reports_jvm_formatter_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "src/Foo.java", "public class Foo {}\n");
+        let cfg = config_gjf_only(fake_gjf_appending_reformatted(root));
+        let git = FakeGit::new(root).with_tracked(vec!["src/Foo.java"]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_format(&cfg, &git, &cache, &dl, Scope::All, false, 2026).unwrap();
+        assert_eq!(out.changed, BTreeSet::from([PathBuf::from("src/Foo.java")]));
+        assert!(!out.check_failed);
+
+        let body = std::fs::read_to_string(root.join("src/Foo.java")).unwrap();
+        assert!(body.contains("reformatted"));
+    }
+
     #[test]
     fn run_hook_aborts_on_partial_stage() {
         let dir = tempfile::tempdir().unwrap();
@@ -884,50 +969,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_hook_restages_jvm_formatter_changes() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write(root, "src/Foo.java", "public class Foo {}\n");
-
-        let fake_gjf = root.join("fake-gjf");
-        std::fs::write(
-            &fake_gjf,
-            "#!/bin/sh\n\
-             for arg in \"$@\"; do\n\
-               case \"$arg\" in\n\
-                 @*)\n\
-                   argfile=\"${arg#@}\"\n\
-                   while IFS= read -r f; do\n\
-                     [ -n \"$f\" ] || continue\n\
-                     printf 'reformatted\\n' >> \"$f\"\n\
-                   done < \"$argfile\"\n\
-                   ;;\n\
-               esac\n\
-             done\n",
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&fake_gjf).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&fake_gjf, perms).unwrap();
-
-        let cfg = Config {
-            ktfmt: None,
-            gjf: Some(crate::config::Gjf {
-                version: None,
-                path: Some(fake_gjf),
-                style: Default::default(),
-                license_header: None,
-                native: Default::default(),
-                paths: None,
-            }),
-            license_header: None,
-            paths: Paths {
-                exclude: crate::config::GlobList::Inline(vec![]),
-            },
-            whitespace: Whitespace::default(),
-            hook: Default::default(),
-        };
+        let cfg = config_gjf_only(fake_gjf_appending_reformatted(root));
 
         let git = FakeGit::new(root)
             .with_tracked(vec!["src/Foo.java"])

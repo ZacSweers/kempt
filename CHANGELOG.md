@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fix "Nothing to do" always being printed.
+
 ## [0.0.4]
 
 _2026-05-04_
