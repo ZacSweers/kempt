@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.1.0]
+
+_2026-06-12_
+
 - Fix "Nothing to do" always being printed.
 - Add experimental partial-staging support for GJF-managed Java files behind `KEMPT_EXPERIMENTAL_PARTIAL_GJF`.
 - Add Rust formatting and license-header support through `cargo fmt`.
