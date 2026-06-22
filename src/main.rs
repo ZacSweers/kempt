@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Zac Sweers
+// SPDX-License-Identifier: Apache-2.0
 mod cache;
 mod cli;
 mod commands;
@@ -32,9 +34,9 @@ fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
 
     match cli.command {
-        Cmd::Init => {
+        Cmd::Init(args) => {
             let cwd = std::env::current_dir().context("read current dir")?;
-            let written = commands::run_init(&cwd)?;
+            let written = commands::run_init(&cwd, args.license_header)?;
             if written.is_empty() {
                 println!("kempt: nothing to do (config already exists)");
             } else {
@@ -96,7 +98,7 @@ fn run_vendor_subcommand(config_path: Option<PathBuf>, dir: PathBuf) -> Result<E
         return Ok(ExitCode::SUCCESS);
     }
 
-    println!("vendored {} jar(s):", outcome.entries.len());
+    println!("vendored {} artifact(s):", outcome.entries.len());
     for e in &outcome.entries {
         println!("  {} {} -> {}", e.tool, e.version, e.dest.display());
     }

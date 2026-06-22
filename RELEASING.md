@@ -3,23 +3,40 @@
 ## Regular release
 
 ```sh
+./release.sh --patch
+./release.sh --minor
+./release.sh --major
+```
+
+The bump flags read the latest released version from `CHANGELOG.md`, using the
+first version heading after `[Unreleased]`. For example, if the latest release
+is `0.1.1`, `--patch` releases `0.1.2`, `--minor` releases `0.2.0`, and
+`--major` releases `1.0.0`.
+
+You can also pass a specific stable version:
+
+```sh
 ./release.sh 0.2.0
+./release.sh v0.2.0
 ```
 
 The script handles the full process:
 
-1. Bumps the version in `Cargo.toml`.
-2. Promotes the `[Unreleased]` section in `CHANGELOG.md` to a dated version
+1. Resolves the target version from the argument or `CHANGELOG.md` bump flag.
+2. Bumps the version in `Cargo.toml`.
+3. Promotes the `[Unreleased]` section in `CHANGELOG.md` to a dated version
    heading.
-3. Builds to refresh `Cargo.lock`.
-4. Commits and pushes to `main`.
-5. Tags and pushes the version tag, which triggers the release workflow.
-6. Watches the release workflow until it finishes.
-7. Prompts to publish to crates.io.
+4. Builds to refresh `Cargo.lock`.
+5. Commits and pushes to `main`.
+6. Tags and pushes the version tag, which triggers the release workflow.
+7. Watches the release workflow until it finishes.
+8. Prompts to publish to crates.io.
 
 ### Prerequisites
 
 - Clean working tree.
+- `CHANGELOG.md` has an `[Unreleased]` section and, when using a bump flag, at
+  least one stable `## [x.y.z]` release heading after it.
 - `gh` CLI installed and authenticated.
 - `cargo login` already run, if you want to publish to crates.io.
 

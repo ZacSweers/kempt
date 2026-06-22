@@ -1,0 +1,10 @@
+# kempt configuration: https://github.com/ZacSweers/kempt
+# Run `kempt --help` to see all options.
+
+[rustfmt]
+
+[license-header]
+file = "config/license-header.txt"
+
+[hook]
+mode = "format"   # format | check

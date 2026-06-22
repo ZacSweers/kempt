@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Zac Sweers
+// SPDX-License-Identifier: Apache-2.0
 //! Subcommand implementations. Glue between the lower-level modules.
 
 use crate::cache::{Cache, Downloader, GjfFlavor};
@@ -178,28 +180,30 @@ fn experimental_partial_gjf_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Write a starter config + license header template to `target_dir`. The
-/// config is tailored to what kempt finds in the repo: `[ktfmt]` is included
-/// only when `.kt`/`.kts` files exist, `[gjf]` only when `.java` files
-/// exist. An empty repo gets both (the user can trim later).
+/// Write a starter config to `target_dir`. The config is tailored to what
+/// kempt finds in the repo: `[ktfmt]` is included only when `.kt`/`.kts`
+/// files exist, `[gjf]` only when `.java` files exist, and `[rustfmt]` only
+/// when `.rs` files exist. An empty repo gets all formatter sections.
 /// Idempotent.
-pub fn run_init(target_dir: &Path) -> Result<Vec<PathBuf>> {
+pub fn run_init(target_dir: &Path, include_license_header: bool) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
     let cfg = target_dir.join(crate::config::CONFIG_FILE);
     if !cfg.exists() {
         let langs = detect_languages(target_dir);
-        let body = build_starter_config(langs);
+        let body = build_starter_config(langs, include_license_header);
         std::fs::write(&cfg, body).with_context(|| format!("write {}", cfg.display()))?;
         written.push(cfg);
     }
-    let header_dir = target_dir.join("config");
-    let header = header_dir.join("license-header.txt");
-    if !header.exists() {
-        std::fs::create_dir_all(&header_dir)
-            .with_context(|| format!("create {}", header_dir.display()))?;
-        std::fs::write(&header, STARTER_HEADER)
-            .with_context(|| format!("write {}", header.display()))?;
-        written.push(header);
+    if include_license_header {
+        let header_dir = target_dir.join("config");
+        let header = header_dir.join("license-header.txt");
+        if !header.exists() {
+            std::fs::create_dir_all(&header_dir)
+                .with_context(|| format!("create {}", header_dir.display()))?;
+            std::fs::write(&header, STARTER_HEADER)
+                .with_context(|| format!("write {}", header.display()))?;
+            written.push(header);
+        }
     }
     Ok(written)
 }
@@ -219,8 +223,8 @@ impl DetectedLanguages {
 }
 
 /// Walk `target_dir` looking for `.kt`/`.kts`, `.java`, and `.rs` files.
-/// Skips `.git/`, `build/`, `target/`, and `node_modules/` to keep this
-/// snappy on large repos. Stops scanning once every language has been seen.
+/// Skips `.git/`, `build/`, `target/`, and `node_modules/`. Stops scanning
+/// once every language has been seen.
 pub fn detect_languages(target_dir: &Path) -> DetectedLanguages {
     let mut found = DetectedLanguages::default();
     let walker = walkdir::WalkDir::new(target_dir)
@@ -252,9 +256,9 @@ pub fn detect_languages(target_dir: &Path) -> DetectedLanguages {
     found
 }
 
-fn build_starter_config(langs: DetectedLanguages) -> String {
-    // No detected languages → write all formatter sections so the config is
-    // complete; user can trim what they don't need.
+fn build_starter_config(langs: DetectedLanguages, include_license_header: bool) -> String {
+    // No detected languages means there is no useful signal, so emit the full
+    // starter config.
     let neither = !langs.kotlin && !langs.java && !langs.rust;
     let want_ktfmt = langs.kotlin || neither;
     let want_gjf = langs.java || neither;
@@ -274,7 +278,9 @@ fn build_starter_config(langs: DetectedLanguages) -> String {
     if want_rustfmt {
         out.push_str("[rustfmt]\n\n");
     }
-    out.push_str("[license-header]\nfile = \"config/license-header.txt\"\n\n");
+    if include_license_header {
+        out.push_str("[license-header]\nfile = \"config/license-header.txt\"\n\n");
+    }
     out.push_str("[hook]\nmode = \"format\"   # format | check\n");
     out
 }
@@ -307,8 +313,8 @@ pub fn keep_paths_for_config(config: &Config, repo_root: &Path, cache: &Cache) -
     keep
 }
 
-/// Pre-fetch jars per config. Tools using `path = ...` are skipped (their
-/// binary is already in the repo).
+/// Pre-fetch formatter artifacts per config. Tools using `path = ...` are
+/// skipped because their binary is already in the repo.
 pub fn run_update(
     config: &Config,
     repo_root: &Path,
@@ -376,8 +382,8 @@ fn resolve_gjf_invoker(
     }
 }
 
-/// Outcome of `kempt vendor`. `entries` lists newly-copied jars; `skipped`
-/// names tools that were already vendored (using `path = ...`).
+/// Outcome of `kempt vendor`. `entries` lists newly-copied artifacts;
+/// `skipped` names tools that were already vendored (using `path = ...`).
 #[derive(Debug, Default)]
 pub struct VendorOutcome {
     pub entries: Vec<VendorEntry>,
@@ -394,7 +400,7 @@ pub struct VendorEntry {
     pub config_value: PathBuf,
 }
 
-/// Download (if needed) and copy formatter jars into `target_dir`. The
+/// Download (if needed) and copy formatter artifacts into `target_dir`. The
 /// directory is interpreted relative to `repo_root`. Tools already using
 /// `path = ...` are skipped.
 pub fn run_vendor(
@@ -452,7 +458,7 @@ fn copy_into(
 ) -> Result<VendorEntry> {
     let filename = src
         .file_name()
-        .ok_or_else(|| anyhow!("cache jar has no file name: {}", src.display()))?;
+        .ok_or_else(|| anyhow!("cache artifact has no file name: {}", src.display()))?;
     let dest = abs_target.join(filename);
     std::fs::copy(src, &dest)
         .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
@@ -1473,17 +1479,31 @@ diff --git a/Foo.java b/Foo.java\n\
     #[test]
     fn run_init_writes_starter_files() {
         let dir = tempfile::tempdir().unwrap();
-        let written = run_init(dir.path()).unwrap();
+        let written = run_init(dir.path(), false).unwrap();
+        assert_eq!(written.len(), 1);
+        assert!(dir.path().join(".kempt.toml").exists());
+        assert!(!dir.path().join("config/license-header.txt").exists());
+        let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
+        assert!(!body.contains("[license-header]"));
+    }
+
+    #[test]
+    fn run_init_with_license_header_writes_header_config_and_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = run_init(dir.path(), true).unwrap();
         assert_eq!(written.len(), 2);
         assert!(dir.path().join(".kempt.toml").exists());
         assert!(dir.path().join("config/license-header.txt").exists());
+        let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
+        assert!(body.contains("[license-header]"));
+        assert!(body.contains("file = \"config/license-header.txt\""));
     }
 
     #[test]
     fn run_init_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let _ = run_init(dir.path()).unwrap();
-        let again = run_init(dir.path()).unwrap();
+        let _ = run_init(dir.path(), true).unwrap();
+        let again = run_init(dir.path(), true).unwrap();
         assert!(again.is_empty(), "second run should write nothing");
     }
 
@@ -1551,7 +1571,7 @@ diff --git a/Foo.java b/Foo.java\n\
     fn run_init_kotlin_only_omits_gjf() {
         let dir = tempfile::tempdir().unwrap();
         write_blank(dir.path(), "src/Foo.kt");
-        run_init(dir.path()).unwrap();
+        run_init(dir.path(), false).unwrap();
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         assert!(body.contains("[ktfmt]"));
         assert!(!body.contains("[gjf]"));
@@ -1562,7 +1582,7 @@ diff --git a/Foo.java b/Foo.java\n\
     fn run_init_java_only_omits_ktfmt() {
         let dir = tempfile::tempdir().unwrap();
         write_blank(dir.path(), "src/Bar.java");
-        run_init(dir.path()).unwrap();
+        run_init(dir.path(), false).unwrap();
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         assert!(body.contains("[gjf]"));
         assert!(!body.contains("[ktfmt]"));
@@ -1573,7 +1593,7 @@ diff --git a/Foo.java b/Foo.java\n\
     fn run_init_rust_only_omits_ktfmt_and_gjf() {
         let dir = tempfile::tempdir().unwrap();
         write_blank(dir.path(), "src/lib.rs");
-        run_init(dir.path()).unwrap();
+        run_init(dir.path(), false).unwrap();
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         assert!(body.contains("[rustfmt]"));
         assert!(!body.contains("[ktfmt]"));
@@ -1583,7 +1603,7 @@ diff --git a/Foo.java b/Foo.java\n\
     #[test]
     fn run_init_empty_repo_writes_both_sections() {
         let dir = tempfile::tempdir().unwrap();
-        run_init(dir.path()).unwrap();
+        run_init(dir.path(), false).unwrap();
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         assert!(body.contains("[ktfmt]"));
         assert!(body.contains("[gjf]"));
@@ -1598,7 +1618,7 @@ diff --git a/Foo.java b/Foo.java\n\
         write_blank(dir.path(), "src/Foo.kt");
         write_blank(dir.path(), "src/Bar.java");
         write_blank(dir.path(), "src/lib.rs");
-        run_init(dir.path()).unwrap();
+        run_init(dir.path(), false).unwrap();
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         assert!(
             !body.contains("style = \"google\""),
@@ -1612,7 +1632,7 @@ diff --git a/Foo.java b/Foo.java\n\
         write_blank(dir.path(), "src/Foo.kt");
         write_blank(dir.path(), "src/Bar.java");
         write_blank(dir.path(), "src/lib.rs");
-        run_init(dir.path()).unwrap();
+        run_init(dir.path(), false).unwrap();
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         // Must be a valid kempt config end-to-end.
         let cfg = Config::parse(&body).expect("starter parses");

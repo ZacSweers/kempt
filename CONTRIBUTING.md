@@ -18,6 +18,21 @@ cargo fmt --check
 CI runs all four. Treat clippy warnings as errors locally too; the CI job
 does.
 
+## Local kempt setup
+
+This repo has its own `.kempt.toml`. To use the same formatting pipeline before
+commits, install the local binary and then install the hook:
+
+```sh
+cargo install --path .
+kempt install-hook --force
+kempt check --all
+```
+
+The installed hook lives at `.git/hooks/pre-commit` and runs `kempt hook` from
+your `PATH`. Since git does not track files under `.git/hooks`, each clone opts in by
+running `kempt install-hook`.
+
 ## Module layout
 
 The crate is split so that pure logic stays separable from I/O. Each module
@@ -30,10 +45,10 @@ has its own tests at the bottom of the file.
 - `git.rs`: `GitContext` trait, `RealGit` shell-out implementation, and a
   `FakeGit` test double under `#[cfg(test)] pub mod testing`.
 - `paths.rs`: file collection and glob filtering. Tested with `FakeGit`.
-- `cache.rs`: version-suffixed jar paths plus a `Downloader` trait and
+- `cache.rs`: version-suffixed formatter artifacts plus a `Downloader` trait and
   `FakeDownloader`. Network is never touched in tests.
-- `formatters.rs`: pure command-line builders for ktfmt and gjf, plus the
-  one function that actually spawns `java`.
+- `formatters.rs`: command-line builders for ktfmt and gjf, plus the
+  process runners for JVM jars and native binaries.
 - `pipeline.rs`: orchestration of the in-process steps (license header,
   whitespace) on a single file's contents.
 - `hook.rs`: partial-staging detection and pre-commit installer.
@@ -56,7 +71,7 @@ real tempdirs with the fakes wired in. No network, no JVM, no real git.
 
 When adding a new feature, the order is usually:
 
-1. Add a pure function (or trait method on an existing seam).
+1. Add a pure function (or trait method on an existing boundary).
 2. Unit-test it.
 3. Wire it into `commands.rs`.
 4. Add a `commands.rs` test that exercises the new path with the fakes.
@@ -70,8 +85,8 @@ The pattern lives in `formatters.rs` and `cache.rs`:
 3. Add `<tool>_args()` to `formatters.rs`.
 4. Wire it into `apply_jvm_formatters` in `commands.rs`.
 
-Don't add a new "runner" trait unless you find yourself stubbing the JVM. The
-existing seams (config, cache, formatters) cover it.
+Don't add a new "runner" trait unless tests need to replace process
+execution. The existing config/cache/formatter boundaries usually cover it.
 
 ## Manual smoke test
 
@@ -100,8 +115,8 @@ $KEMPT init
 $KEMPT check                          # exits 1 if anything would change
 $KEMPT format --dry-run               # equivalent
 $KEMPT update                         # populates ~/.kempt/cache
-$KEMPT cache list                     # lists cached jars
-$KEMPT vendor --dir /tmp/kempt-out    # copies jars + prints `path = ...` snippet
+$KEMPT cache list                     # lists cached formatter artifacts
+$KEMPT vendor --dir /tmp/kempt-out    # copies artifacts + prints `path = ...` snippet
 ```
 
 **Capture exit codes correctly:** `$KEMPT check | tail` gives you `tail`'s
@@ -111,7 +126,7 @@ exit code, not kempt's. Use `$KEMPT check; echo $?` or `${PIPESTATUS[0]}`.
 
 ```sh
 mkdir /tmp/kempt-test && cd /tmp/kempt-test && git init -q
-$KEMPT vendor --dir vendor             # populates vendor/ with jars
+$KEMPT vendor --dir vendor             # populates vendor/ with artifacts
 # Paste the printed snippet into .kempt.toml.
 mkdir src && printf 'package x\n\nclass    Foo\n' > src/Foo.kt
 git add -A && git commit -q -m init
@@ -138,7 +153,7 @@ git commit -m "test"                   # exercises the hook
 **Cleanup after testing:**
 
 ```sh
-rm -rf ~/.kempt/cache                  # ~70 MB of jars, regenerable
+rm -rf ~/.kempt/cache                  # formatter artifacts, regeneratable
 rm /path/to/test-repo/.kempt.toml      # if you scaffolded into a real repo
 ```
 
@@ -154,5 +169,5 @@ workflow. CI runs the dist plan on PRs.
 - No emoji in code or docs.
 - Comments only when the why is non-obvious.
 - Tests get descriptive names, not `test_1` / `test_2`.
-- Clippy warnings are errors. If a lint is genuinely wrong for a case, allow
-  it inline with a one-line comment explaining why.
+- Clippy warnings are errors. If a lint does not fit a case, allow it inline
+  with a one-line comment explaining why.

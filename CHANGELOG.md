@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Make `kempt init` license-header scaffolding opt-in with `--license-header`.
+
 ## [0.1.1]
 
 _2026-06-21_

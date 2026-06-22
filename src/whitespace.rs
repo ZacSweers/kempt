@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Zac Sweers
+// SPDX-License-Identifier: Apache-2.0
 //! Trailing whitespace + final newline normalization. Pure string transforms.
 //!
 //! Two passes are independent: stripping trailing whitespace from each line,

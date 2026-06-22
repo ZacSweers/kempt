@@ -47,14 +47,14 @@ A working `cargo fmt` on `PATH` is required when `[rustfmt]` is enabled.
 In an existing repo:
 
 ```sh
-kempt init             # writes .kempt.toml + config/license-header.txt
+kempt init             # writes .kempt.toml based on detected languages
 kempt install-hook     # writes .git/hooks/pre-commit
 kempt format           # format everything once
 ```
 
 `kempt init` walks the repo root looking for `.kt`/`.kts`, `.java`, and `.rs`
-source files, skipping gen/vcs dirs like `.git/`, `build/`, `target/`, `node_modules/`, etc. It
-tailors the starter config based on what it finds:
+source files, skipping gen/vcs dirs like `.git`, `build`, `target`, and
+`node_modules`. It tailors the starter config based on what it finds:
 
 - `[ktfmt]` is emitted only when Kotlin files exist
 - `[gjf]` only when Java files exist
@@ -63,6 +63,10 @@ tailors the starter config based on what it finds:
 An empty repo gets all formatter sections. The versions
 written into the starter are the latest available at the time kempt was built;
 an automated workflow keeps them current.
+
+By default, `kempt init` does not configure license headers. Pass
+`--license-header` to also write `config/license-header.txt` and enable
+`[license-header]` in the starter config.
 
 `kempt check` is the read-only variant. It exits non-zero if any file _would_
 change. That's what you want in CI formatting checks.
@@ -130,7 +134,8 @@ final-newline = true    # ensure files end with one trailing newline
 mode = "format"            # format | check
 ```
 
-The license header file is a literal template. `${YEAR}` is expanded at write-time.
+When configured, the license header file is a literal template. `${YEAR}` is
+expanded at write-time.
 
 `[license-header]` sets the default template used by every language.
 `[ktfmt.license-header]`, `[gjf.license-header]`, and
@@ -156,9 +161,8 @@ no header. If a file is in a license-header _excludes file_ but not in
 `[paths].exclude`, kempt still formats it with its configured tool; it just won't
 prepend a header.
 
-When in doubt, prefer `[paths].exclude`. Reach for the license-header excludes
-only when you genuinely want the formatter to run but the header to stay off
-(rare in practice).
+When in doubt, prefer `[paths].exclude`. Use license-header excludes only when
+the formatter should still run on a file that should not receive a header.
 
 ### Per-tool path scope
 
@@ -233,17 +237,16 @@ needing formatting, it appends a copy-pasteable command listing those files
 specifically. Useful for fixing a small subset locally after a CI failure
 without touching the rest of the working tree.
 
-`--discovery=walk` is the escape hatch when you have files git doesn't know
-about (recently dropped in, never staged) and want kempt to format them
-anyway. It deliberately skips `.gitignore` because if you're explicitly
-opting out of VCS-driven discovery, deferring to a VCS-managed `.*ignore` file
-is incoherent. Use `[paths].exclude` to filter out build outputs and the
-like (the defaults already cover `**/build/**` and `**/target/**`). The
-`.git/` directory is always pruned regardless of config.
+`--discovery=walk` is for files outside git's index, such as newly created
+files that have not been staged. It does not consult `.gitignore`. In walk
+mode, `[paths].exclude` is the only filter. Use `[paths].exclude` to filter
+out build outputs and similar directories (the defaults already cover
+`**/build/**` and `**/target/**`). The `.git/` directory is always skipped
+before config filters are applied.
 
 ### Config reference
 
-Every option, with their default. A `-` in the default column means "no built-in
+Every option, with its default. A `-` in the default column means "no built-in
 default; the section that contains it is what enables the feature."
 
 | Key                                 | Default                                           | Notes                                                                                                                    |
@@ -287,10 +290,10 @@ Omitting a section disables that step. `[paths]`, `[whitespace]`, and
 |----------------------|------------------------------------------------------------------------------------------------------------------------------------------|
 | `kempt format`       | Format files in place.                                                                                                                   |
 | `kempt check`        | Dry-run; exits non-zero if changes are needed. Suitable for CI.                                                                          |
-| `kempt init`         | Scaffold `.kempt.toml` plus a starter `config/license-header.txt`. Detects `.kt`/`.java`/`.rs` to decide which sections to write.        |
+| `kempt init`         | Scaffold `.kempt.toml`. Detects `.kt`/`.java`/`.rs` to decide which sections to write.                                                  |
 | `kempt install-hook` | Write a `.git/hooks/pre-commit` that calls `kempt hook`.                                                                                 |
 | `kempt hook`         | Run as the pre-commit hook. Not normally invoked manually.                                                                               |
-| `kempt update`       | Download formatter jars/binaries per config. Pre-warms the cache.                                                                        |
+| `kempt update`       | Download formatter artifacts per config. Pre-warms the cache.                                                                            |
 | `kempt upgrade`      | Bump tool versions in `.kempt.toml` to the latest upstream release. Preserves comments and formatting. `--dry-run` previews.             |
 | `kempt vendor`       | Download and copy formatter binaries into the repo for check-in (default dir `config/bin/`). Prints the `path = "..."` snippet to paste. |
 | `kempt cache list`   | Show cached artifacts and their sizes.                                                                                                   |
@@ -311,6 +314,9 @@ Omitting a section disables that step. `[paths]`, `[whitespace]`, and
 
 `--all`, `--staged`, `--discovery=walk`, and explicit positional paths are
 mutually exclusive.
+
+`kempt init` takes `--license-header` to add `[license-header]` and write a
+starter `config/license-header.txt`.
 
 `kempt install-hook` takes `--force` to overwrite an existing pre-commit
 hook (default refuses).
@@ -343,7 +349,26 @@ deprecation warnings are filtered out, so the actual error is what you read.
 
 ## Pre-commit hook
 
-`kempt install-hook` writes a one-line `pre-commit` that calls `kempt hook`.
+`kempt install-hook` writes a one-line `.git/hooks/pre-commit` that calls
+`kempt hook`.
+
+`.git/hooks/pre-commit` is local Git metadata though. If you want the hook script to
+be shared, commit it in a tracked path (such as `.githooks/pre-commit`), make
+that script call `kempt hook`, and ask developers to run a one-time setup:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+If you do not want a tracked hook script, each developer who wants the default
+local Git hook must run `kempt install-hook` after cloning instead.
+
+After installing the hook, keep using the normal Git flow: stage the files you
+want to commit and run `git commit`. In the default `format` mode, the hook
+formats matching staged files and re-stages only the files it changed before the
+commit continues. Running `kempt format --all` once after setup is a good way to
+baseline an existing repo before relying on the hook for incremental changes.
+
 The hook does, in order:
 
 1. Collect staged files matching the config's path globs.
@@ -370,8 +395,8 @@ instead of formatting in place.
 ## CI
 
 The cache lives at `~/.kempt/cache/` by default. Point it elsewhere with
-`KEMPT_CACHE_DIR`. The cache contains versioned jars only, so the cache key
-is just the contents of `.kempt.toml`.
+`KEMPT_CACHE_DIR`. Cached artifacts are versioned, so the cache key is just
+the contents of `.kempt.toml`.
 
 ### GitHub Actions
 
@@ -404,8 +429,8 @@ jobs:
 
 What to cache:
 
-- `~/.kempt/cache/` (or wherever `KEMPT_CACHE_DIR` points). Jars are 5 to 30
-  MiB each.
+- `~/.kempt/cache/` (or wherever `KEMPT_CACHE_DIR` points). Formatter
+  artifacts are usually 5 to 30 MiB each.
 
 What not to cache:
 
@@ -421,7 +446,7 @@ read in CI logs.
 Pin `version = "..."` in each tool's section. The cache is version-suffixed,
 so multiple repos with different pins coexist without re-downloading. To
 update, change the version in `.kempt.toml`, run `kempt update`, then
-`kempt cache prune` to drop the old jar.
+`kempt cache prune` to drop the old artifact.
 
 ### `kempt upgrade`
 
@@ -523,14 +548,13 @@ Dependabot does not support arbitrary regex-based managers, so there is no
 direct equivalent for `.kempt.toml`. If Dependabot is a hard requirement,
 the workaround is to keep the version pin in a file Dependabot already
 understands (e.g., a Gradle `libs.versions.toml`) and copy it into
-`.kempt.toml` manually or via a small CI step. Native catalog support in
-kempt itself is on the table for a future release.
+`.kempt.toml` manually or via a small CI step.
 
 ### Native gjf
 
 Starting with gjf 1.20.0, Google publishes GraalVM-native binaries alongside
 the JVM jar. They start in roughly 20ms instead of ~500ms (JVM warmup),
-don't need a JDK, and skip the `--add-opens` dance entirely. Native builds
+don't need a JDK, and avoid the JVM `--add-opens` flags. Native builds
 exist for `darwin-arm64`, `linux-x86-64`, `linux-arm64` (1.26.0+), and
 `windows-x86-64`. There is no Intel macOS (`darwin-x86-64`) native build,
 and no native ktfmt at all.
@@ -548,7 +572,7 @@ ktfmt is unaffected (always JVM).
 
 If you want full reproducibility or your CI can't reach Maven Central and
 GitHub releases, commit the formatter binaries and point at them with
-`path` instead of `version`. The fast path:
+`path` instead of `version`:
 
 ```sh
 kempt vendor                    # downloads (if needed) and copies into config/bin/
