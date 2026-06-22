@@ -349,7 +349,26 @@ deprecation warnings are filtered out, so the actual error is what you read.
 
 ## Pre-commit hook
 
-`kempt install-hook` writes a one-line `pre-commit` that calls `kempt hook`.
+`kempt install-hook` writes a one-line `.git/hooks/pre-commit` that calls
+`kempt hook`.
+
+`.git/hooks/pre-commit` is local Git metadata though. If you want the hook script to
+be shared, commit it in a tracked path (such as `.githooks/pre-commit`), make
+that script call `kempt hook`, and ask developers to run a one-time setup:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+If you do not want a tracked hook script, each developer who wants the default
+local Git hook must run `kempt install-hook` after cloning instead.
+
+After installing the hook, keep using the normal Git flow: stage the files you
+want to commit and run `git commit`. In the default `format` mode, the hook
+formats matching staged files and re-stages only the files it changed before the
+commit continues. Running `kempt format --all` once after setup is a good way to
+baseline an existing repo before relying on the hook for incremental changes.
+
 The hook does, in order:
 
 1. Collect staged files matching the config's path globs.

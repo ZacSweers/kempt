@@ -18,6 +18,21 @@ cargo fmt --check
 CI runs all four. Treat clippy warnings as errors locally too; the CI job
 does.
 
+## Local kempt setup
+
+This repo has its own `.kempt.toml`. To use the same formatting pipeline before
+commits, install the local binary and then install the hook:
+
+```sh
+cargo install --path .
+kempt install-hook --force
+kempt check --all
+```
+
+The installed hook lives at `.git/hooks/pre-commit` and runs `kempt hook` from
+your `PATH`. Since git does not track files under `.git/hooks`, each clone opts in by
+running `kempt install-hook`.
+
 ## Module layout
 
 The crate is split so that pure logic stays separable from I/O. Each module
