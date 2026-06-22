@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Re-stage hook-formatted files with `git add --force` so tracked files inside
+  ignored directories do not fail the commit hook.
+
 ## [0.1.0]
 
 _2026-06-12_
