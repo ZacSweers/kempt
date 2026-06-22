@@ -351,7 +351,8 @@ The hook does, in order:
    2. `git stash --keep-index`
    3. Commit with `--no-verify`.
 3. Run the full pipeline (license headers, whitespace, ktfmt, gjf, cargo fmt).
-4. `git add` the formatted files back to the index.
+4. `git add --force` the formatted files back to the index (--force so tracked files
+   inside ignored directories can still be re-staged).
 
 Experimental: set `KEMPT_EXPERIMENTAL_PARTIAL_GJF=1` to allow partially
 staged GJF-managed Java files. kempt formats the staged Java hunks through GJF
