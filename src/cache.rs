@@ -1,7 +1,8 @@
 //! Binary cache management.
 //!
-//! Layout: `~/.kempt/cache/{ktfmt,gjf}-<version>.jar`. Version-suffixed so
-//! repos with different pins coexist without re-downloading.
+//! Cached files are version-suffixed so repos with different pins coexist:
+//! `ktfmt-<version>.jar`, `gjf-<version>.jar`, and native gjf binaries named
+//! `gjf-<version>-<asset>[.exe]`.
 //!
 //! Downloads are abstracted behind [`Downloader`] so tests can fake them.
 
@@ -206,8 +207,8 @@ impl Cache {
         Ok(dest.to_path_buf())
     }
 
-    /// List all `.jar` files currently in the cache. Returns an empty list if
-    /// the cache directory does not yet exist.
+    /// List kempt-managed files currently in the cache. Returns an empty list
+    /// if the cache directory does not yet exist.
     pub fn list_entries(&self) -> Result<Vec<CacheEntry>> {
         if !self.root.exists() {
             return Ok(Vec::new());
@@ -229,11 +230,7 @@ impl Cache {
             if name.starts_with('.') {
                 continue;
             }
-            // Recognize kempt-managed artifacts: jar files plus native gjf binaries.
-            let is_jar = path.extension().and_then(|e| e.to_str()) == Some("jar");
-            let is_kempt_artifact =
-                is_jar || name.starts_with("gjf-") || name.starts_with("ktfmt-");
-            if !is_kempt_artifact {
+            if !is_kempt_artifact_name(name) {
                 continue;
             }
             let size = dirent.metadata()?.len();
@@ -243,7 +240,7 @@ impl Cache {
         Ok(entries)
     }
 
-    /// Remove every `.jar` in the cache that is not in `keep`. Returns the
+    /// Remove every managed cache entry not in `keep`. Returns the
     /// removed paths in sorted order.
     pub fn prune(&self, keep: &[PathBuf]) -> Result<Vec<PathBuf>> {
         let entries = self.list_entries()?;
@@ -259,6 +256,25 @@ impl Cache {
         }
         Ok(removed)
     }
+}
+
+fn is_kempt_artifact_name(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("ktfmt-") {
+        return starts_with_digit(rest) && rest.ends_with(".jar");
+    }
+    let Some(rest) = name.strip_prefix("gjf-") else {
+        return false;
+    };
+    starts_with_digit(rest)
+        && (rest.ends_with(".jar")
+            || rest.ends_with(".exe")
+            || ["-darwin-arm64", "-linux-x86-64", "-linux-arm64"]
+                .iter()
+                .any(|suffix| rest.ends_with(suffix)))
+}
+
+fn starts_with_digit(s: &str) -> bool {
+    s.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn list_entries_returns_jars_with_sizes() {
+    fn list_entries_returns_artifacts_with_sizes() {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(dir.path().to_path_buf());
         let dl = FakeDownloader::new(b"abcdef".to_vec());
@@ -533,6 +549,9 @@ mod tests {
         let cache = Cache::new(dir.path().to_path_buf());
         fs::create_dir_all(cache.root()).unwrap();
         fs::write(cache.root().join("notes.txt"), b"x").unwrap();
+        fs::write(cache.root().join("notes.jar"), b"x").unwrap();
+        fs::write(cache.root().join("gjf-notes.txt"), b"x").unwrap();
+        fs::write(cache.root().join("ktfmt-notes.txt"), b"x").unwrap();
         fs::write(cache.root().join(".hidden.tmp"), b"x").unwrap();
         fs::write(cache.root().join("ktfmt-0.56.jar"), b"x").unwrap();
         let entries = cache.list_entries().unwrap();

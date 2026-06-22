@@ -96,7 +96,7 @@ fn run_vendor_subcommand(config_path: Option<PathBuf>, dir: PathBuf) -> Result<E
         return Ok(ExitCode::SUCCESS);
     }
 
-    println!("vendored {} jar(s):", outcome.entries.len());
+    println!("vendored {} artifact(s):", outcome.entries.len());
     for e in &outcome.entries {
         println!("  {} {} -> {}", e.tool, e.version, e.dest.display());
     }

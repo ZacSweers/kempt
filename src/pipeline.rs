@@ -264,11 +264,7 @@ mod tests {
             file: PathBuf::from("header.txt"),
             excludes: Some(PathBuf::from("excludes.txt")),
         };
-        let spec = HeaderSpec::load(&resolved, dir.path(), 2026).unwrap();
-        // tempdir lives only as long as `dir`; loading happens immediately so
-        // it's fine to drop here.
-        std::mem::forget(dir);
-        spec
+        HeaderSpec::load(&resolved, dir.path(), 2026).unwrap()
     }
 
     #[test]

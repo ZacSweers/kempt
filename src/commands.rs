@@ -181,7 +181,8 @@ fn experimental_partial_gjf_enabled() -> bool {
 /// Write a starter config + license header template to `target_dir`. The
 /// config is tailored to what kempt finds in the repo: `[ktfmt]` is included
 /// only when `.kt`/`.kts` files exist, `[gjf]` only when `.java` files
-/// exist. An empty repo gets both (the user can trim later).
+/// exist, and `[rustfmt]` only when `.rs` files exist. An empty repo gets all
+/// formatter sections.
 /// Idempotent.
 pub fn run_init(target_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
@@ -219,8 +220,8 @@ impl DetectedLanguages {
 }
 
 /// Walk `target_dir` looking for `.kt`/`.kts`, `.java`, and `.rs` files.
-/// Skips `.git/`, `build/`, `target/`, and `node_modules/` to keep this
-/// snappy on large repos. Stops scanning once every language has been seen.
+/// Skips `.git/`, `build/`, `target/`, and `node_modules/`. Stops scanning
+/// once every language has been seen.
 pub fn detect_languages(target_dir: &Path) -> DetectedLanguages {
     let mut found = DetectedLanguages::default();
     let walker = walkdir::WalkDir::new(target_dir)
@@ -253,8 +254,8 @@ pub fn detect_languages(target_dir: &Path) -> DetectedLanguages {
 }
 
 fn build_starter_config(langs: DetectedLanguages) -> String {
-    // No detected languages → write all formatter sections so the config is
-    // complete; user can trim what they don't need.
+    // No detected languages means there is no useful signal, so emit the full
+    // starter config.
     let neither = !langs.kotlin && !langs.java && !langs.rust;
     let want_ktfmt = langs.kotlin || neither;
     let want_gjf = langs.java || neither;
@@ -307,8 +308,8 @@ pub fn keep_paths_for_config(config: &Config, repo_root: &Path, cache: &Cache) -
     keep
 }
 
-/// Pre-fetch jars per config. Tools using `path = ...` are skipped (their
-/// binary is already in the repo).
+/// Pre-fetch formatter artifacts per config. Tools using `path = ...` are
+/// skipped because their binary is already in the repo.
 pub fn run_update(
     config: &Config,
     repo_root: &Path,
@@ -376,8 +377,8 @@ fn resolve_gjf_invoker(
     }
 }
 
-/// Outcome of `kempt vendor`. `entries` lists newly-copied jars; `skipped`
-/// names tools that were already vendored (using `path = ...`).
+/// Outcome of `kempt vendor`. `entries` lists newly-copied artifacts;
+/// `skipped` names tools that were already vendored (using `path = ...`).
 #[derive(Debug, Default)]
 pub struct VendorOutcome {
     pub entries: Vec<VendorEntry>,
@@ -394,7 +395,7 @@ pub struct VendorEntry {
     pub config_value: PathBuf,
 }
 
-/// Download (if needed) and copy formatter jars into `target_dir`. The
+/// Download (if needed) and copy formatter artifacts into `target_dir`. The
 /// directory is interpreted relative to `repo_root`. Tools already using
 /// `path = ...` are skipped.
 pub fn run_vendor(
@@ -452,7 +453,7 @@ fn copy_into(
 ) -> Result<VendorEntry> {
     let filename = src
         .file_name()
-        .ok_or_else(|| anyhow!("cache jar has no file name: {}", src.display()))?;
+        .ok_or_else(|| anyhow!("cache artifact has no file name: {}", src.display()))?;
     let dest = abs_target.join(filename);
     std::fs::copy(src, &dest)
         .with_context(|| format!("copy {} -> {}", src.display(), dest.display()))?;
