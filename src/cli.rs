@@ -34,8 +34,8 @@ pub enum Cmd {
     Format(FormatArgs),
     /// Check formatting without modifying files. Exits non-zero if changes are needed.
     Check(CheckArgs),
-    /// Write a starter .kempt.toml and license header template.
-    Init,
+    /// Write a starter .kempt.toml.
+    Init(InitArgs),
     /// Install a pre-commit hook in this git repo.
     InstallHook(InstallHookArgs),
     /// Run as the pre-commit hook. Invoked by `.git/hooks/pre-commit`.
@@ -50,6 +50,13 @@ pub enum Cmd {
     /// Inspect or clean the formatter binary cache.
     #[command(subcommand)]
     Cache(CacheCmd),
+}
+
+#[derive(Args, Debug, Default)]
+pub struct InitArgs {
+    /// Also write config/license-header.txt and enable [license-header].
+    #[arg(long)]
+    pub license_header: bool,
 }
 
 #[derive(Args, Debug, Default)]

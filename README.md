@@ -47,7 +47,7 @@ A working `cargo fmt` on `PATH` is required when `[rustfmt]` is enabled.
 In an existing repo:
 
 ```sh
-kempt init             # writes .kempt.toml + config/license-header.txt
+kempt init             # writes .kempt.toml based on detected languages
 kempt install-hook     # writes .git/hooks/pre-commit
 kempt format           # format everything once
 ```
@@ -63,6 +63,10 @@ source files, skipping gen/vcs dirs like `.git`, `build`, `target`, and
 An empty repo gets all formatter sections. The versions
 written into the starter are the latest available at the time kempt was built;
 an automated workflow keeps them current.
+
+By default, `kempt init` does not configure license headers. Pass
+`--license-header` to also write `config/license-header.txt` and enable
+`[license-header]` in the starter config.
 
 `kempt check` is the read-only variant. It exits non-zero if any file _would_
 change. That's what you want in CI formatting checks.
@@ -130,7 +134,8 @@ final-newline = true    # ensure files end with one trailing newline
 mode = "format"            # format | check
 ```
 
-The license header file is a literal template. `${YEAR}` is expanded at write-time.
+When configured, the license header file is a literal template. `${YEAR}` is
+expanded at write-time.
 
 `[license-header]` sets the default template used by every language.
 `[ktfmt.license-header]`, `[gjf.license-header]`, and
@@ -285,7 +290,7 @@ Omitting a section disables that step. `[paths]`, `[whitespace]`, and
 |----------------------|------------------------------------------------------------------------------------------------------------------------------------------|
 | `kempt format`       | Format files in place.                                                                                                                   |
 | `kempt check`        | Dry-run; exits non-zero if changes are needed. Suitable for CI.                                                                          |
-| `kempt init`         | Scaffold `.kempt.toml` plus a starter `config/license-header.txt`. Detects `.kt`/`.java`/`.rs` to decide which sections to write.        |
+| `kempt init`         | Scaffold `.kempt.toml`. Detects `.kt`/`.java`/`.rs` to decide which sections to write.                                                  |
 | `kempt install-hook` | Write a `.git/hooks/pre-commit` that calls `kempt hook`.                                                                                 |
 | `kempt hook`         | Run as the pre-commit hook. Not normally invoked manually.                                                                               |
 | `kempt update`       | Download formatter artifacts per config. Pre-warms the cache.                                                                            |
@@ -309,6 +314,9 @@ Omitting a section disables that step. `[paths]`, `[whitespace]`, and
 
 `--all`, `--staged`, `--discovery=walk`, and explicit positional paths are
 mutually exclusive.
+
+`kempt init` takes `--license-header` to add `[license-header]` and write a
+starter `config/license-header.txt`.
 
 `kempt install-hook` takes `--force` to overwrite an existing pre-commit
 hook (default refuses).

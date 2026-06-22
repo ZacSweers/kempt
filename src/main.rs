@@ -32,9 +32,9 @@ fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
 
     match cli.command {
-        Cmd::Init => {
+        Cmd::Init(args) => {
             let cwd = std::env::current_dir().context("read current dir")?;
-            let written = commands::run_init(&cwd)?;
+            let written = commands::run_init(&cwd, args.license_header)?;
             if written.is_empty() {
                 println!("kempt: nothing to do (config already exists)");
             } else {

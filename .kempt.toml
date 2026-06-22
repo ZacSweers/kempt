@@ -1,0 +1,7 @@
+# kempt configuration: https://github.com/ZacSweers/kempt
+# Run `kempt --help` to see all options.
+
+[rustfmt]
+
+[hook]
+mode = "format"   # format | check
