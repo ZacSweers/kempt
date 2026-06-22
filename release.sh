@@ -2,17 +2,107 @@
 set -euo pipefail
 
 # Automate a kempt release.
-# Usage: ./release.sh <version>   (e.g. ./release.sh 0.2.0)
+# Usage:
+#   ./release.sh <version>   (e.g. ./release.sh 0.2.0)
+#   ./release.sh --patch
+#   ./release.sh --minor
+#   ./release.sh --major
 
-VERSION="${1:-}"
+usage() {
+  cat <<'EOF'
+Usage:
+  ./release.sh <version>   (e.g. ./release.sh 0.2.0)
+  ./release.sh --patch     (bump latest CHANGELOG.md release by one patch)
+  ./release.sh --minor     (bump latest CHANGELOG.md release by one minor)
+  ./release.sh --major     (bump latest CHANGELOG.md release by one major)
+EOF
+}
 
-if [[ -z "$VERSION" ]]; then
-  echo "Usage: ./release.sh <version>"
-  echo "Example: ./release.sh 0.2.0"
+latest_changelog_version() {
+  awk '
+    /^## \[Unreleased\]$/ {
+      seen_unreleased = 1
+      next
+    }
+    seen_unreleased && /^## \[[0-9]+\.[0-9]+\.[0-9]+\]$/ {
+      version = $0
+      sub(/^## \[/, "", version)
+      sub(/\]$/, "", version)
+      print version
+      exit
+    }
+  ' CHANGELOG.md
+}
+
+bump_version() {
+  local version="$1"
+  local bump="$2"
+  local major minor patch
+  IFS=. read -r major minor patch <<<"$version"
+
+  if [[ ! "$major" =~ ^[0-9]+$ || ! "$minor" =~ ^[0-9]+$ || ! "$patch" =~ ^[0-9]+$ ]]; then
+    echo "Error: latest CHANGELOG.md release is not a stable semver version: ${version}"
+    exit 1
+  fi
+
+  case "$bump" in
+    patch)
+      patch=$((patch + 1))
+      ;;
+    minor)
+      minor=$((minor + 1))
+      patch=0
+      ;;
+    major)
+      major=$((major + 1))
+      minor=0
+      patch=0
+      ;;
+    *)
+      echo "Error: unknown bump type: ${bump}"
+      exit 1
+      ;;
+  esac
+
+  printf "%s.%s.%s\n" "$major" "$minor" "$patch"
+}
+
+if [[ "$#" -ne 1 ]]; then
+  usage
   exit 1
 fi
 
+case "$1" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  --patch | --minor | --major)
+    BUMP="${1#--}"
+    LAST_VERSION=$(latest_changelog_version)
+    if [[ -z "$LAST_VERSION" ]]; then
+      echo "Error: could not find the latest release in CHANGELOG.md."
+      exit 1
+    fi
+    VERSION=$(bump_version "$LAST_VERSION" "$BUMP")
+    echo "Latest CHANGELOG.md release is ${LAST_VERSION}; ${BUMP} bump is ${VERSION}"
+    ;;
+  --*)
+    echo "Error: unknown option: $1"
+    usage
+    exit 1
+    ;;
+  *)
+    VERSION="$1"
+    ;;
+esac
+
 VERSION="${VERSION#v}"
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Error: version must be stable semver, e.g. 0.2.0"
+  exit 1
+fi
+
 TAG="v${VERSION}"
 REPO="ZacSweers/kempt"
 
