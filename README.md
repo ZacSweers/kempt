@@ -16,7 +16,7 @@ Supported targets:
 
 > The binary is named `kempt` everywhere. The crate is published as
 > `kempt-fmt` because the shorter `kempt` name is already taken on
-> crates.io by an unrelated project; that suffix shows up in the install
+> crates.io by an unrelated project; that suffix shows up in the installation
 > URLs and the homebrew formula filename below.
 
 ### Homebrew (macOS, Linux)
@@ -52,14 +52,19 @@ kempt install-hook     # writes .git/hooks/pre-commit
 kempt format           # format everything once
 ```
 
-`kempt init` scans the repo and tailors the starter config: `[ktfmt]` is
-emitted only when `.kt`/`.kts` files exist, `[gjf]` only when `.java` files
-exist, and `[rustfmt]` only when `.rs` files exist. An empty repo gets all
-formatter sections. The versions written into the starter are the latest
-available at the time kempt was built; an automated workflow keeps them
-current.
+`kempt init` walks the repo root looking for `.kt`/`.kts`, `.java`, and `.rs`
+source files, skipping gen/vcs dirs like `.git/`, `build/`, `target/`, `node_modules/`, etc. It
+tailors the starter config based on what it finds:
 
-`kempt check` is the read-only variant. It exits non-zero if any file would
+- `[ktfmt]` is emitted only when Kotlin files exist
+- `[gjf]` only when Java files exist
+- `[rustfmt]` only when Rust files exist.
+
+An empty repo gets all formatter sections. The versions
+written into the starter are the latest available at the time kempt was built;
+an automated workflow keeps them current.
+
+`kempt check` is the read-only variant. It exits non-zero if any file _would_
 change. That's what you want in CI formatting checks.
 
 ## Configuration
@@ -69,7 +74,7 @@ disable that step.
 
 ```toml
 [ktfmt]
-version = "0.62"
+version = "0.63"
 style = "google"           # google | kotlinlang | meta
 
 [gjf]
@@ -96,7 +101,7 @@ file = "config/license-header-rust.txt"        # overrides global for .rs
 excludes = "config/license-excludes-rs.txt"
 
 [paths]
-# Universal exclude applied before any tool's own filter. Inline array OR
+# Global exclude applied before any tool's own filter. Inline array OR
 # a path to a text file (one glob per line, `#` comments).
 exclude = ["**/build/**", "**/target/**"]
 
@@ -141,13 +146,13 @@ The exclude files are plain text, one glob per line, `#` comments allowed.
 
 kempt has two exclude mechanisms because they answer different questions:
 
-| Where                                      | Question it answers                          | Example use                                                          |
-|--------------------------------------------|----------------------------------------------|----------------------------------------------------------------------|
-| `[paths].exclude` (inline list)            | "Should kempt touch this file at all?"       | Build output, test fixtures, generated code, vendored upstream files |
+| Where                                             | Question it answers                          | Example use                                                          |
+|---------------------------------------------------|----------------------------------------------|----------------------------------------------------------------------|
+| `[paths].exclude` (inline list)                   | "Should kempt touch this file at all?"       | Build output, test fixtures, generated code, vendored upstream files |
 | `[<tool>.license-header].excludes` (file pointer) | "Should kempt insert a header in this file?" | Files with their own license header that should still be formatted   |
 
 If a file matches `[paths].exclude`, kempt skips it completely, no formatter and
-no header. If a file is in a license-header excludes file but not in
+no header. If a file is in a license-header _excludes file_ but not in
 `[paths].exclude`, kempt still formats it with its configured tool; it just won't
 prepend a header.
 
@@ -231,14 +236,14 @@ without touching the rest of the working tree.
 `--discovery=walk` is the escape hatch when you have files git doesn't know
 about (recently dropped in, never staged) and want kempt to format them
 anyway. It deliberately skips `.gitignore` because if you're explicitly
-opting out of VCS-driven discovery, deferring to a VCS-managed ignore file
+opting out of VCS-driven discovery, deferring to a VCS-managed `.*ignore` file
 is incoherent. Use `[paths].exclude` to filter out build outputs and the
 like (the defaults already cover `**/build/**` and `**/target/**`). The
 `.git/` directory is always pruned regardless of config.
 
 ### Config reference
 
-Every option, with default. A `-` in the default column means "no built-in
+Every option, with their default. A `-` in the default column means "no built-in
 default; the section that contains it is what enables the feature."
 
 | Key                                 | Default                                           | Notes                                                                                                                    |
@@ -263,7 +268,7 @@ default; the section that contains it is what enables the feature."
 | `[rustfmt.license-header].file`     | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
 | `[rustfmt.license-header].excludes` | none                                              | Path to a glob list.                                                                                                     |
 | `[license-header].file`             | -                                                 | Default license header template, `${YEAR}` expanded at write time. Section absence = no header insertion.                |
-| `[paths].exclude`                   | `["**/build/**", "**/target/**"]`                 | Universal exclude, applied before any tool's filter. Inline array or path to a glob-list file.                           |
+| `[paths].exclude`                   | `["**/build/**", "**/target/**"]`                 | Global exclude, applied before any tool's filter. Inline array or path to a glob-list file.                              |
 | `[whitespace].strip-trailing`       | `true`                                            | Strip trailing space/tab/CR on every line.                                                                               |
 | `[whitespace].final-newline`        | `true`                                            | Ensure files end with exactly one `\n`.                                                                                  |
 | `[whitespace.paths].include`        | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | Inline array or path to a glob-list file.                                                                                |
@@ -328,13 +333,13 @@ followed by an actionable trailer that's tailored to scope and content:
 - `--discovery=walk`: trailer suggests `kempt format --discovery=walk`.
 - Hook in `[hook] mode = "check"`: trailer reminds about
   `git commit --no-verify` as the bypass.
-- Mixed format diffs + parse errors: trailer says "fix the syntax errors
+- Mixed format diffs plus parse errors: trailer says "fix the syntax errors
   above, then run `kempt format` for the rest."
 - Pure parse errors: trailer says formatting can't proceed until they're
   fixed.
 
 ktfmt/gjf parse errors are surfaced with their file:line:col message; JVM
-deprecation warnings are filtered out so the actual error is what you read.
+deprecation warnings are filtered out, so the actual error is what you read.
 
 ## Pre-commit hook
 
@@ -517,7 +522,7 @@ skipped automatically (no `version` line to match).
 Dependabot does not support arbitrary regex-based managers, so there is no
 direct equivalent for `.kempt.toml`. If Dependabot is a hard requirement,
 the workaround is to keep the version pin in a file Dependabot already
-understands (e.g. a Gradle `libs.versions.toml`) and copy it into
+understands (e.g., a Gradle `libs.versions.toml`) and copy it into
 `.kempt.toml` manually or via a small CI step. Native catalog support in
 kempt itself is on the table for a future release.
 
