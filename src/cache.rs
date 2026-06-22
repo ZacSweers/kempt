@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Zac Sweers
+// SPDX-License-Identifier: Apache-2.0
 //! Binary cache management.
 //!
 //! Cached files are version-suffixed so repos with different pins coexist:

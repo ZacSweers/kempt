@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Zac Sweers
+// SPDX-License-Identifier: Apache-2.0
 //! Build java command lines for ktfmt and gjf, and execute them.
 //!
 //! Two helpers handle large file lists:

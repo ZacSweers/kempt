@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Zac Sweers
+// SPDX-License-Identifier: Apache-2.0
 //! License header insertion.
 //!
 //! Replaces ${YEAR} in the template, detects the language-specific insertion

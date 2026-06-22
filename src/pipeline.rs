@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Zac Sweers
+// SPDX-License-Identifier: Apache-2.0
 //! In-process formatting steps (license header + whitespace) that don't need
 //! to spawn a JVM. Keeping them here makes the orchestration easy to unit-test.
 

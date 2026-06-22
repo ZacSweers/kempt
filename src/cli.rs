@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Zac Sweers
+// SPDX-License-Identifier: Apache-2.0
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
