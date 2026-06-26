@@ -1,0 +1,89 @@
+name: Kempt
+description: Install Kempt, optionally warm its formatter cache, and run a formatting check.
+branding:
+  icon: wind
+  color: green
+inputs:
+  version:
+    description: Kempt release tag to install, or "latest".
+    required: false
+    default: latest
+  cache:
+    description: Restore and save the Kempt formatter cache.
+    required: false
+    default: "false"
+  cache-path:
+    description: Kempt formatter cache path. Keep this aligned with KEMPT_CACHE_DIR when overriding it.
+    required: false
+    default: ~/.kempt/cache
+  cache-key:
+    description: Cache key. Defaults to a key derived from .kempt.toml when omitted.
+    required: false
+    default: ""
+  update:
+    description: Run "kempt update" before checking.
+    required: false
+    default: "true"
+  check:
+    description: Run "kempt check".
+    required: false
+    default: "true"
+  update-args:
+    description: Extra arguments passed to "kempt update".
+    required: false
+    default: ""
+  check-args:
+    description: Extra arguments passed to "kempt check".
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Cache Kempt formatter binaries
+      if: ${{ inputs.cache == 'true' }}
+      uses: actions/cache@v6
+      with:
+        path: ${{ inputs.cache-path }}
+        key: ${{ inputs.cache-key || format('kempt-{0}', hashFiles('.kempt.toml')) }}
+
+    - name: Install Kempt
+      if: ${{ runner.os != 'Windows' }}
+      shell: bash
+      env:
+        KEMPT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        if [[ "$KEMPT_VERSION" == "latest" ]]; then
+          installer_url="https://github.com/ZacSweers/kempt/releases/latest/download/kempt-fmt-installer.sh"
+        else
+          installer_url="https://github.com/ZacSweers/kempt/releases/download/${KEMPT_VERSION}/kempt-fmt-installer.sh"
+        fi
+
+        curl --proto '=https' --tlsv1.2 -LsSf "$installer_url" | sh
+
+    - name: Install Kempt
+      if: ${{ runner.os == 'Windows' }}
+      shell: pwsh
+      env:
+        KEMPT_VERSION: ${{ inputs.version }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        if ($env:KEMPT_VERSION -eq 'latest') {
+          $installerUrl = 'https://github.com/ZacSweers/kempt/releases/latest/download/kempt-fmt-installer.ps1'
+        } else {
+          $installerUrl = "https://github.com/ZacSweers/kempt/releases/download/$env:KEMPT_VERSION/kempt-fmt-installer.ps1"
+        }
+
+        Invoke-RestMethod -Uri $installerUrl | Invoke-Expression
+
+    - name: Pre-warm Kempt cache
+      if: ${{ inputs.update == 'true' }}
+      shell: bash
+      run: kempt update ${{ inputs.update-args }}
+
+    - name: Check formatting
+      if: ${{ inputs.check == 'true' }}
+      shell: bash
+      run: kempt check ${{ inputs.check-args }}

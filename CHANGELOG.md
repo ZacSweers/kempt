@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Add a reusable GitHub Action for installing Kempt and checking formatting.
+
 ## [0.1.2]
 
 _2026-06-22_
