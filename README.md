@@ -290,7 +290,7 @@ Omitting a section disables that step. `[paths]`, `[whitespace]`, and
 |----------------------|------------------------------------------------------------------------------------------------------------------------------------------|
 | `kempt format`       | Format files in place.                                                                                                                   |
 | `kempt check`        | Dry-run; exits non-zero if changes are needed. Suitable for CI.                                                                          |
-| `kempt init`         | Scaffold `.kempt.toml`. Detects `.kt`/`.java`/`.rs` to decide which sections to write.                                                  |
+| `kempt init`         | Scaffold `.kempt.toml`. Detects `.kt`/`.java`/`.rs` to decide which sections to write.                                                   |
 | `kempt install-hook` | Write a `.git/hooks/pre-commit` that calls `kempt hook`.                                                                                 |
 | `kempt hook`         | Run as the pre-commit hook. Not normally invoked manually.                                                                               |
 | `kempt update`       | Download formatter artifacts per config. Pre-warms the cache.                                                                            |
