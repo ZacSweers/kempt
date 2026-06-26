@@ -413,18 +413,9 @@ jobs:
         with:
           distribution: zulu
           java-version: '21'
-      - uses: actions/cache@v5
+      - uses: ZacSweers/kempt@main
         with:
-          path: ~/.kempt/cache
-          key: kempt-${{ hashFiles('.kempt.toml') }}
-      - name: Install kempt
-        run: |
-          curl --proto '=https' --tlsv1.2 -LsSf \
-            https://github.com/ZacSweers/kempt/releases/latest/download/kempt-fmt-installer.sh | sh
-      - name: Pre-warm cache
-        run: kempt update
-      - name: Check formatting
-        run: kempt check
+          cache: true
 ```
 
 What to cache:
@@ -437,9 +428,50 @@ What not to cache:
 - The Rust toolchain. kempt is shipped as a static binary; no `cargo`
   required at run time.
 
+The reusable action installs kempt, runs `kempt update`, then runs
+`kempt check`. Its cache step is optional, so you can also keep caching
+separate when your workflow supports parallel setup:
+
+```yaml
+      - parallel:
+          - uses: actions/setup-java@v5
+            with:
+              distribution: zulu
+              java-version: '21'
+          - uses: actions/cache@v6
+            with:
+              path: ~/.kempt/cache
+              # If referencing a Gradle version catalog, add that here too
+              # e.g., hashFiles('.kempt.toml', 'gradle/libs.versions.toml')
+              key: kempt-${{ hashFiles('.kempt.toml') }}
+
+      - uses: ZacSweers/kempt@main
+```
+
+#### Manual CI setup
+
+For reference, the reusable action is equivalent to these steps:
+
+```yaml
+      - uses: actions/cache@v6
+        with:
+          path: ~/.kempt/cache
+          # If referencing a Gradle version catalog, add that here too
+          # e.g., hashFiles('.kempt.toml', 'gradle/libs.versions.toml')
+          key: kempt-${{ hashFiles('.kempt.toml') }}
+      - name: Install kempt
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/ZacSweers/kempt/releases/latest/download/kempt-fmt-installer.sh | sh
+      - name: Pre-warm cache
+        run: kempt update
+      - name: Check formatting
+        run: kempt check
+```
+
 `kempt update` is optional; the formatter will download on demand. Splitting
 it out makes the failure mode (network down vs. real format error) easier to
-read in CI logs.
+read in CI logs. Set `update: false` to skip that pre-warm step.
 
 ## Versioning the formatter binaries
 
