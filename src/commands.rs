@@ -609,7 +609,7 @@ fn copy_into(
 /// `.github/workflows/bump-starter-versions.yml` workflow scrapes the latest
 /// releases weekly and opens a PR bumping these constants. Format must stay
 /// `pub const NAME: &str = "x.y.z";` exactly so the workflow's regex hits.
-pub const STARTER_KTFMT_VERSION: &str = "0.63";
+pub const STARTER_KTFMT_VERSION: &str = "0.64";
 pub const STARTER_GJF_VERSION: &str = "1.35.0";
 
 const STARTER_HEADER: &str =
