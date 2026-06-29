@@ -46,12 +46,50 @@ jobs:
         id: decide
         run: |
           set -euo pipefail
-          if [ "${{ steps.current.outputs.ktfmt }}" = "${{ steps.latest.outputs.ktfmt }}" ] \
-             && [ "${{ steps.current.outputs.gjf }}" = "${{ steps.latest.outputs.gjf }}" ]; then
+          title_parts=()
+          commit_lines=()
+          body_lines=()
+
+          if [ "${{ steps.current.outputs.ktfmt }}" != "${{ steps.latest.outputs.ktfmt }}" ]; then
+            title_parts+=("ktfmt ${{ steps.latest.outputs.ktfmt }}")
+            commit_lines+=("ktfmt: ${{ steps.current.outputs.ktfmt }} -> ${{ steps.latest.outputs.ktfmt }}")
+            body_lines+=("- ktfmt: \`${{ steps.current.outputs.ktfmt }}\` -> \`${{ steps.latest.outputs.ktfmt }}\`")
+            body_lines+=("  <https://github.com/facebook/ktfmt/releases>")
+          fi
+
+          if [ "${{ steps.current.outputs.gjf }}" != "${{ steps.latest.outputs.gjf }}" ]; then
+            title_parts+=("gjf ${{ steps.latest.outputs.gjf }}")
+            commit_lines+=("gjf: ${{ steps.current.outputs.gjf }} -> ${{ steps.latest.outputs.gjf }}")
+            body_lines+=("- gjf: \`${{ steps.current.outputs.gjf }}\` -> \`${{ steps.latest.outputs.gjf }}\`")
+            body_lines+=("  <https://github.com/google/google-java-format/releases>")
+          fi
+
+          if [ ${#title_parts[@]} -eq 0 ]; then
             echo "Already current."
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
+            title="${title_parts[0]}"
+            for part in "${title_parts[@]:1}"; do
+              title="$title, $part"
+            done
             echo "changed=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "title=Bump starter versions: $title"
+              echo "commit_message<<EOF"
+              echo "Bump starter versions"
+              echo
+              printf '%s\n' "${commit_lines[@]}"
+              echo "EOF"
+              echo "body<<EOF"
+              echo "Automated bump of the versions kempt init writes into a fresh"
+              echo '`.kempt.toml`.'
+              echo
+              printf '%s\n' "${body_lines[@]}"
+              echo
+              echo "Existing repos with pinned versions are unaffected; this only"
+              echo 'changes the values written by `kempt init`.'
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
           fi
 
       - name: Edit constants
@@ -71,29 +109,23 @@ jobs:
           cargo test
 
       - name: Open PR
+        id: cpr
         if: steps.decide.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.KEMPT_CREATE_PR_TOKEN || github.token }}
           branch: bump-starter-versions
           base: main
-          title: "Bump starter versions: ktfmt ${{ steps.latest.outputs.ktfmt }}, gjf ${{ steps.latest.outputs.gjf }}"
-          commit-message: |
-            Bump starter versions
-
-            ktfmt: ${{ steps.current.outputs.ktfmt }} -> ${{ steps.latest.outputs.ktfmt }}
-            gjf:   ${{ steps.current.outputs.gjf }} -> ${{ steps.latest.outputs.gjf }}
-          body: |
-            Automated bump of the versions kempt init writes into a fresh
-            `.kempt.toml`.
-
-            - ktfmt: `${{ steps.current.outputs.ktfmt }}` -> `${{ steps.latest.outputs.ktfmt }}`
-              <https://github.com/facebook/ktfmt/releases>
-            - gjf: `${{ steps.current.outputs.gjf }}` -> `${{ steps.latest.outputs.gjf }}`
-              <https://github.com/google/google-java-format/releases>
-
-            Existing repos with pinned versions are unaffected; this only
-            changes the values written by `kempt init`.
+          title: ${{ steps.decide.outputs.title }}
+          commit-message: ${{ steps.decide.outputs.commit_message }}
+          body: ${{ steps.decide.outputs.body }}
           labels: |
             automated
             dependencies
+
+      - name: Enable auto-merge
+        if: steps.decide.outputs.changed == 'true' && steps.cpr.outputs.pull-request-number != '' && steps.cpr.outputs.pull-request-operation != 'closed'
+        env:
+          GH_TOKEN: ${{ secrets.KEMPT_CREATE_PR_TOKEN || github.token }}
+        run: |
+          gh pr merge --repo "$GITHUB_REPOSITORY" --auto --squash --delete-branch "${{ steps.cpr.outputs.pull-request-number }}"
