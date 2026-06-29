@@ -13,11 +13,13 @@ use crate::pipeline::{self, Headers, PipelineReport};
 use anyhow::{anyhow, Context, Result};
 use globset::GlobSet;
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const EXPERIMENTAL_PARTIAL_GJF_ENV: &str = "KEMPT_EXPERIMENTAL_PARTIAL_GJF";
+const EXPERIMENTAL_PARTIAL_KTFMT_ENV: &str = "KEMPT_EXPERIMENTAL_PARTIAL_KTFMT";
 
 /// Outcome of a format/check run.
 #[derive(Debug, Default)]
@@ -85,8 +87,132 @@ pub fn run_hook(
         cache,
         downloader,
         year,
-        experimental_partial_gjf_enabled(),
+        PartialFormattingOptions::from_env(),
     )
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PartialFormattingOptions {
+    ktfmt: bool,
+    gjf: bool,
+}
+
+impl PartialFormattingOptions {
+    fn from_env() -> Self {
+        Self {
+            ktfmt: PartialFormatter::Ktfmt.enabled_from_env(),
+            gjf: PartialFormatter::Gjf.enabled_from_env(),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        !self.ktfmt && !self.gjf
+    }
+
+    fn enabled_formatters(self) -> impl Iterator<Item = PartialFormatter> {
+        [
+            (self.ktfmt, PartialFormatter::Ktfmt),
+            (self.gjf, PartialFormatter::Gjf),
+        ]
+        .into_iter()
+        .filter_map(|(enabled, formatter)| enabled.then_some(formatter))
+    }
+
+    fn supported_descriptions(self) -> String {
+        let descriptions: Vec<&str> = self
+            .enabled_formatters()
+            .map(PartialFormatter::supported_description)
+            .collect();
+        match descriptions.as_slice() {
+            [] => "no files".to_string(),
+            [only] => (*only).to_string(),
+            [first, second] => format!("{first} and {second}"),
+            _ => descriptions.join(", "),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartialFormatter {
+    Ktfmt,
+    Gjf,
+}
+
+impl PartialFormatter {
+    fn env(self) -> &'static str {
+        match self {
+            Self::Ktfmt => EXPERIMENTAL_PARTIAL_KTFMT_ENV,
+            Self::Gjf => EXPERIMENTAL_PARTIAL_GJF_ENV,
+        }
+    }
+
+    fn enabled_from_env(self) -> bool {
+        std::env::var_os(self.env()).is_some()
+    }
+
+    fn tool(self) -> &'static str {
+        match self {
+            Self::Ktfmt => "ktfmt",
+            Self::Gjf => "gjf",
+        }
+    }
+
+    fn supported_description(self) -> &'static str {
+        match self {
+            Self::Ktfmt => "ktfmt-managed Kotlin files",
+            Self::Gjf => "GJF-managed Java files",
+        }
+    }
+
+    fn matches(self, config: &Config, scopes: &ToolScopes, path: &Path) -> bool {
+        match self {
+            Self::Ktfmt => {
+                config.ktfmt.is_some()
+                    && matches!(
+                        SourceKind::from_path(path),
+                        Some(SourceKind::Kotlin | SourceKind::Kts)
+                    )
+                    && scopes.matches_ktfmt(path)
+            }
+            Self::Gjf => {
+                config.gjf.is_some()
+                    && SourceKind::from_path(path) == Some(SourceKind::Java)
+                    && scopes.matches_gjf(path)
+            }
+        }
+    }
+
+    fn invocation(
+        self,
+        config: &Config,
+        git: &dyn GitContext,
+        cache: &Cache,
+        downloader: &dyn Downloader,
+    ) -> Result<Option<(formatters::Invoker, Vec<OsString>)>> {
+        match self {
+            Self::Ktfmt => {
+                let Some(kt) = &config.ktfmt else {
+                    return Ok(None);
+                };
+                let jar = resolve_jar(kt.source(git.root()), &|v| {
+                    cache.ensure_ktfmt(v, downloader)
+                })?;
+                Ok(Some((
+                    formatters::Invoker::Jar(jar),
+                    formatters::ktfmt_args(kt.style, false),
+                )))
+            }
+            Self::Gjf => {
+                let Some(g) = &config.gjf else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    resolve_gjf_invoker(g, git.root(), cache, downloader)?,
+                    formatters::gjf_args(g.style, false),
+                )))
+            }
+        }
+    }
 }
 
 fn run_hook_inner(
@@ -95,7 +221,7 @@ fn run_hook_inner(
     cache: &Cache,
     downloader: &dyn Downloader,
     year: u32,
-    allow_partial_gjf: bool,
+    partial_options: PartialFormattingOptions,
 ) -> Result<FormatOutcome> {
     let candidates = collect_candidates(git, &Scope::Staged, config)?;
     if candidates.is_empty() {
@@ -103,15 +229,20 @@ fn run_hook_inner(
     }
     let check_mode = matches!(config.hook.mode, HookMode::Check);
     let mut normal_candidates = candidates.clone();
-    let mut partial_gjf_files = Vec::new();
+    let mut partial_targets: Vec<(PartialFormatter, Vec<PathBuf>)> = Vec::new();
 
     if !check_mode {
         match hook::check_partial_staging(git, &candidates)? {
             StagingCheck::Safe => {}
             StagingCheck::PartialStage { files } => {
-                if allow_partial_gjf {
-                    partial_gjf_files = partial_gjf_candidates(config, git.root(), &files)?;
-                    let handled: BTreeSet<PathBuf> = partial_gjf_files.iter().cloned().collect();
+                if !partial_options.is_empty() {
+                    partial_targets =
+                        partial_formatter_targets(config, git.root(), &files, partial_options)?;
+                    let handled: BTreeSet<PathBuf> = partial_targets
+                        .iter()
+                        .flat_map(|(_formatter, files)| files.iter())
+                        .cloned()
+                        .collect();
                     let unhandled: Vec<PathBuf> = files
                         .iter()
                         .filter(|p| !handled.contains(*p))
@@ -121,9 +252,7 @@ fn run_hook_inner(
                         normal_candidates.retain(|p| !handled.contains(p));
                     } else {
                         eprint!("{}", hook::format_partial_stage_error(&unhandled));
-                        return Err(anyhow!(
-                            "partial staging detected; {EXPERIMENTAL_PARTIAL_GJF_ENV} only supports GJF-managed Java files"
-                        ));
+                        return Err(partial_formatting_scope_error(partial_options));
                     }
                 } else {
                     eprint!("{}", hook::format_partial_stage_error(&files));
@@ -150,18 +279,21 @@ fn run_hook_inner(
         check_mode,
         &mut outcome,
     )?;
-    let partial_gjf_changed = if !check_mode && !partial_gjf_files.is_empty() {
-        apply_partial_gjf_to_index(config, git, cache, downloader, &partial_gjf_files)?
-    } else {
-        BTreeSet::new()
-    };
-    outcome.changed.extend(partial_gjf_changed.iter().cloned());
+    let mut partial_changed = BTreeSet::new();
+    if !check_mode {
+        for (formatter, files) in &partial_targets {
+            partial_changed.extend(apply_partial_formatter_to_index(
+                config, git, cache, downloader, *formatter, files,
+            )?);
+        }
+    }
+    outcome.changed.extend(partial_changed.iter().cloned());
 
     if !check_mode && !outcome.changed.is_empty() {
         let to_add: Vec<PathBuf> = outcome
             .changed
             .iter()
-            .filter(|p| !partial_gjf_changed.contains(*p))
+            .filter(|p| !partial_changed.contains(*p))
             .cloned()
             .collect();
         git.add(&to_add).context("git add post-format")?;
@@ -169,15 +301,11 @@ fn run_hook_inner(
     Ok(outcome)
 }
 
-fn experimental_partial_gjf_enabled() -> bool {
-    std::env::var(EXPERIMENTAL_PARTIAL_GJF_ENV)
-        .map(|v| {
-            matches!(
-                v.as_str(),
-                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-            )
-        })
-        .unwrap_or(false)
+fn partial_formatting_scope_error(options: PartialFormattingOptions) -> anyhow::Error {
+    let supported = options.supported_descriptions();
+    anyhow!(
+        "partial staging detected; {EXPERIMENTAL_PARTIAL_KTFMT_ENV}/{EXPERIMENTAL_PARTIAL_GJF_ENV} only support {supported}"
+    )
 }
 
 /// Write a starter config to `target_dir`. The config is tailored to what
@@ -794,33 +922,47 @@ fn formatter_failure(tool: &str, output: std::process::Output) -> anyhow::Error 
     }
 }
 
-fn partial_gjf_candidates(
+fn partial_formatter_targets(
     config: &Config,
     repo_root: &Path,
     files: &[PathBuf],
-) -> Result<Vec<PathBuf>> {
-    if config.gjf.is_none() {
-        return Ok(Vec::new());
-    }
+    options: PartialFormattingOptions,
+) -> Result<Vec<(PartialFormatter, Vec<PathBuf>)>> {
     let scopes = ToolScopes::build(config, repo_root)?;
-    Ok(files
-        .iter()
-        .filter(|p| SourceKind::from_path(p) == Some(SourceKind::Java) && scopes.matches_gjf(p))
-        .cloned()
+    Ok(options
+        .enabled_formatters()
+        .filter_map(|formatter| {
+            let matching_files: Vec<PathBuf> = files
+                .iter()
+                .filter(|path| formatter.matches(config, &scopes, path))
+                .cloned()
+                .collect();
+            (!matching_files.is_empty()).then_some((formatter, matching_files))
+        })
         .collect())
 }
 
-fn apply_partial_gjf_to_index(
+fn apply_partial_formatter_to_index(
     config: &Config,
     git: &dyn GitContext,
     cache: &Cache,
     downloader: &dyn Downloader,
+    formatter: PartialFormatter,
     files: &[PathBuf],
 ) -> Result<BTreeSet<PathBuf>> {
-    let Some(g) = &config.gjf else {
+    let Some((invoker, base_args)) = formatter.invocation(config, git, cache, downloader)? else {
         return Ok(BTreeSet::new());
     };
-    let invoker = resolve_gjf_invoker(g, git.root(), cache, downloader)?;
+    apply_partial_formatter_invocation_to_index(git, files, formatter.tool(), &invoker, base_args)
+}
+
+fn apply_partial_formatter_invocation_to_index(
+    git: &dyn GitContext,
+    files: &[PathBuf],
+    tool: &str,
+    invoker: &formatters::Invoker,
+    base_args: Vec<OsString>,
+) -> Result<BTreeSet<PathBuf>> {
     let mut changed = BTreeSet::new();
     for rel in files {
         let diff = git.staged_diff(rel, 0)?;
@@ -831,32 +973,41 @@ fn apply_partial_gjf_to_index(
 
         let staged_contents = git.read_staged_file(rel)?;
         let mut tmp = tempfile::Builder::new()
-            .prefix("kempt-partial-gjf-")
-            .suffix(".java")
+            .prefix(&format!("kempt-partial-{tool}-"))
+            .suffix(partial_temp_suffix(rel))
             .tempfile()
-            .context("create partial gjf tempfile")?;
+            .with_context(|| format!("create partial {tool} tempfile"))?;
         tmp.write_all(&staged_contents)
             .with_context(|| format!("write staged contents for {}", rel.display()))?;
         tmp.flush()
             .with_context(|| format!("flush staged contents for {}", rel.display()))?;
 
-        let mut args = formatters::gjf_args(g.style, false);
+        let mut args = base_args.clone();
         for (start, end) in line_ranges {
             args.push("--lines".into());
             args.push(format!("{start}:{end}").into());
         }
         args.push(tmp.path().into());
-        formatters::run("gjf", &invoker, args)
-            .with_context(|| format!("partial gjf failed for {}", rel.display()))?;
+        formatters::run(tool, invoker, args)
+            .with_context(|| format!("partial {tool} failed for {}", rel.display()))?;
 
         let formatted = std::fs::read(tmp.path())
-            .with_context(|| format!("read partial gjf output for {}", rel.display()))?;
+            .with_context(|| format!("read partial {tool} output for {}", rel.display()))?;
         if formatted != staged_contents {
             git.update_staged_file(rel, &formatted)?;
             changed.insert(rel.clone());
         }
     }
     Ok(changed)
+}
+
+fn partial_temp_suffix(path: &Path) -> &'static str {
+    match SourceKind::from_path(path) {
+        Some(SourceKind::Kotlin) => ".kt",
+        Some(SourceKind::Kts) => ".kts",
+        Some(SourceKind::Java) => ".java",
+        Some(SourceKind::Rust) | None => "",
+    }
 }
 
 fn parse_added_line_ranges(diff: &str) -> Vec<(usize, usize)> {
@@ -1165,6 +1316,31 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn fake_ktfmt_marking_new_line(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake_ktfmt = root.join("fake-partial-ktfmt");
+        std::fs::write(
+            &fake_ktfmt,
+            "#!/bin/sh\n\
+             file=\"\"\n\
+             for arg in \"$@\"; do\n\
+               case \"$arg\" in\n\
+                 *.kt|*.kts) file=\"$arg\" ;;\n\
+               esac\n\
+             done\n\
+             [ -n \"$file\" ] || exit 2\n\
+             awk '{ if ($0 ~ /new staged/) print $0 \" // formatted\"; else print }' \"$file\" > \"$file.out\"\n\
+             mv \"$file.out\" \"$file\"\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_ktfmt).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_ktfmt, perms).unwrap();
+        fake_ktfmt
+    }
+
+    #[cfg(unix)]
     fn git_cmd(root: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .args(args)
@@ -1188,6 +1364,13 @@ diff --git a/Foo.java b/Foo.java\n\
 @@ -8,0 +10,3 @@\n\
 @@ -20,2 +24,0 @@\n";
         assert_eq!(parse_added_line_ranges(diff), vec![(1, 2), (10, 12)]);
+    }
+
+    #[test]
+    fn partial_temp_suffix_matches_source_kind() {
+        assert_eq!(partial_temp_suffix(Path::new("Foo.kt")), ".kt");
+        assert_eq!(partial_temp_suffix(Path::new("build.gradle.kts")), ".kts");
+        assert_eq!(partial_temp_suffix(Path::new("Foo.java")), ".java");
     }
 
     #[test]
@@ -1348,7 +1531,15 @@ diff --git a/Foo.java b/Foo.java\n\
         let cache = Cache::new(root.join(".cache"));
         let dl = FakeDownloader::new(b"".to_vec());
 
-        let err = run_hook_inner(&cfg, &git, &cache, &dl, 2026, false).unwrap_err();
+        let err = run_hook_inner(
+            &cfg,
+            &git,
+            &cache,
+            &dl,
+            2026,
+            PartialFormattingOptions::default(),
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("partial staging"));
         // file should not have been modified
         let body = std::fs::read_to_string(root.join("src/Foo.kt")).unwrap();
@@ -1410,7 +1601,18 @@ diff --git a/Foo.java b/Foo.java\n\
         let cache = Cache::new(root.join(".cache"));
         let dl = FakeDownloader::new(b"".to_vec());
 
-        let out = run_hook_inner(&cfg, &git, &cache, &dl, 2026, true).unwrap();
+        let out = run_hook_inner(
+            &cfg,
+            &git,
+            &cache,
+            &dl,
+            2026,
+            PartialFormattingOptions {
+                ktfmt: false,
+                gjf: true,
+            },
+        )
+        .unwrap();
         assert_eq!(out.changed, BTreeSet::from([PathBuf::from("src/Foo.java")]));
 
         let staged = git_cmd(root, &["show", ":src/Foo.java"]);
@@ -1420,6 +1622,79 @@ diff --git a/Foo.java b/Foo.java\n\
 
         let worktree = std::fs::read_to_string(root.join("src/Foo.java")).unwrap();
         assert!(worktree.contains("new staged\");"));
+        assert!(worktree.contains("worktree unstaged"));
+        assert!(!worktree.contains("// formatted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_ktfmt_updates_index_without_staging_unstaged_hunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_cmd(root, &["init"]);
+        git_cmd(root, &["config", "user.email", "test@example.com"]);
+        git_cmd(root, &["config", "user.name", "Test User"]);
+
+        write(
+            root,
+            "src/Foo.kt",
+            "class Foo {\n\
+             fun staged() {\n\
+               println(\"old staged\")\n\
+             }\n\
+             fun unstaged() {\n\
+               println(\"old unstaged\")\n\
+             }\n\
+             }\n",
+        );
+        git_cmd(root, &["add", "src/Foo.kt"]);
+        git_cmd(root, &["commit", "-m", "initial"]);
+
+        write(
+            root,
+            "src/Foo.kt",
+            "class Foo {\n\
+             fun staged() {\n\
+               println(\"new staged\")\n\
+             }\n\
+             fun unstaged() {\n\
+               println(\"old unstaged\")\n\
+             }\n\
+             }\n",
+        );
+        git_cmd(root, &["add", "src/Foo.kt"]);
+        write(
+            root,
+            "src/Foo.kt",
+            "class Foo {\n\
+             fun staged() {\n\
+               println(\"new staged\")\n\
+             }\n\
+             fun unstaged() {\n\
+               println(\"worktree unstaged\")\n\
+             }\n\
+             }\n",
+        );
+
+        let git = RealGit::discover(root).unwrap();
+        let invoker = formatters::Invoker::Native(fake_ktfmt_marking_new_line(root));
+        let changed = apply_partial_formatter_invocation_to_index(
+            &git,
+            &[PathBuf::from("src/Foo.kt")],
+            "ktfmt",
+            &invoker,
+            formatters::ktfmt_args(crate::config::KtfmtStyle::Google, false),
+        )
+        .unwrap();
+        assert_eq!(changed, BTreeSet::from([PathBuf::from("src/Foo.kt")]));
+
+        let staged = git_cmd(root, &["show", ":src/Foo.kt"]);
+        assert!(staged.contains("new staged\") // formatted"));
+        assert!(staged.contains("old unstaged"));
+        assert!(!staged.contains("worktree unstaged"));
+
+        let worktree = std::fs::read_to_string(root.join("src/Foo.kt")).unwrap();
+        assert!(worktree.contains("new staged\")"));
         assert!(worktree.contains("worktree unstaged"));
         assert!(!worktree.contains("// formatted"));
     }

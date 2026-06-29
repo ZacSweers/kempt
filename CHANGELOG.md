@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 - Add a reusable GitHub Action for installing Kempt and checking formatting.
+- Add experimental partial-staging support for ktfmt-managed Kotlin files behind
+  `KEMPT_EXPERIMENTAL_PARTIAL_KTFMT`. Note this requires ktfmt 0.65+.
 
 ## [0.1.2]
 
