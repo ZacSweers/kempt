@@ -384,13 +384,19 @@ The hook does, in order:
 4. `git add --force` the formatted files back to the index (--force so tracked files
    inside ignored directories can still be re-staged).
 
-Experimental: set `KEMPT_EXPERIMENTAL_PARTIAL_GJF=1` to allow partially
-staged GJF-managed Java files. kempt formats the staged Java hunks through GJF
-and updates the index directly, without staging unrelated worktree hunks. Other
-partially staged files still use the refusal path above.
-
 Set `[hook] mode = "check"` to make the hook fail on any required change
 instead of formatting in place.
+
+### Experimental: Partial file formatting
+
+GJF and ktfmt (`0.65` or later) both support partial formatting files.
+
+- set the `KEMPT_EXPERIMENTAL_PARTIAL_KTFMT` env flag to allow partially staged ktfmt-managed Kotlin files
+- set the `KEMPT_EXPERIMENTAL_PARTIAL_GJF` env flag to allow partially staged GJF-managed Java files
+
+kempt formats the staged hunks through the matching formatter and updates the index directly,
+without staging unrelated worktree hunks. Other partially staged files still use the refusal
+path above.
 
 ## CI
 
