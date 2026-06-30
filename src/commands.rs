@@ -1393,6 +1393,34 @@ diff --git a/Foo.java b/Foo.java\n\
     }
 
     #[test]
+    fn run_format_inserts_kts_header_after_shebang() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "scripts/tool.main.kts",
+            "#!/usr/bin/env kotlin\n\nimport kotlin.system.exitProcess\n\nexitProcess(0)\n",
+        );
+        let cfg = config_inproc_only(root);
+        let git = FakeGit::new(root).with_tracked(vec!["scripts/tool.main.kts"]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_format(&cfg, &git, &cache, &dl, Scope::All, false, 2026).unwrap();
+        assert_eq!(out.changed.len(), 1);
+        assert!(!out.check_failed);
+
+        let body = std::fs::read_to_string(root.join("scripts/tool.main.kts")).unwrap();
+        assert_eq!(
+            body,
+            "#!/usr/bin/env kotlin\n\
+             // (c) 2026 test\n\
+             import kotlin.system.exitProcess\n\n\
+             exitProcess(0)\n"
+        );
+    }
+
+    #[test]
     fn run_format_check_mode_does_not_write() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
