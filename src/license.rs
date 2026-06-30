@@ -64,6 +64,15 @@ impl SourceKind {
             ],
         }
     }
+
+    fn protected_preamble_end(self, content: &str) -> usize {
+        match self {
+            Self::Kts if content.starts_with("#!") => {
+                content.find('\n').map_or(content.len(), |idx| idx + 1)
+            }
+            _ => 0,
+        }
+    }
 }
 
 /// Substitute `${YEAR}` in the template.
@@ -118,9 +127,10 @@ pub fn has_header(content: &str, marker: &str) -> bool {
 /// Returns the new content. `header` is expected to end with a newline.
 pub fn insert_header(content: &str, header: &str, kind: SourceKind) -> String {
     let prefixes = kind.delimiter_prefixes();
+    let protected_end = kind.protected_preamble_end(content);
     let mut byte_idx = None;
-    let mut cursor = 0usize;
-    for line in content.split_inclusive('\n') {
+    let mut cursor = protected_end;
+    for line in content[protected_end..].split_inclusive('\n') {
         let trimmed_start = line.trim_start();
         if prefixes.iter().any(|p| trimmed_start.starts_with(p)) {
             byte_idx = Some(cursor);
@@ -129,10 +139,14 @@ pub fn insert_header(content: &str, header: &str, kind: SourceKind) -> String {
         cursor += line.len();
     }
     let mut out = String::with_capacity(header.len() + content.len());
+    out.push_str(&content[..protected_end]);
+    if protected_end == content.len() && protected_end > 0 && !out.ends_with('\n') {
+        out.push('\n');
+    }
     out.push_str(header);
     match byte_idx {
         Some(idx) => out.push_str(&content[idx..]),
-        None => out.push_str(content),
+        None => out.push_str(&content[protected_end..]),
     }
     out
 }
@@ -261,6 +275,35 @@ mod tests {
         let out = insert_header(content, &header, SourceKind::Kts);
         assert!(out.starts_with("// Copyright (C) 2026"));
         assert!(out.contains("plugins {"));
+    }
+
+    #[test]
+    fn insert_header_kts_preserves_shebang_first() {
+        let content =
+            "#!/usr/bin/env kotlin\n\nimport kotlin.system.exitProcess\n\nexitProcess(0)\n";
+        let header = render_header(&template(), 2026);
+        let out = insert_header(content, &header, SourceKind::Kts);
+        assert_eq!(
+            out,
+            "#!/usr/bin/env kotlin\n\
+             // Copyright (C) 2026 Zac Sweers\n\
+             // SPDX-License-Identifier: Apache-2.0\n\
+             import kotlin.system.exitProcess\n\n\
+             exitProcess(0)\n"
+        );
+    }
+
+    #[test]
+    fn insert_header_kts_preserves_shebang_without_trailing_newline() {
+        let content = "#!/usr/bin/env kotlin";
+        let header = render_header(&template(), 2026);
+        let out = insert_header(content, &header, SourceKind::Kts);
+        assert_eq!(
+            out,
+            "#!/usr/bin/env kotlin\n\
+             // Copyright (C) 2026 Zac Sweers\n\
+             // SPDX-License-Identifier: Apache-2.0\n"
+        );
     }
 
     #[test]
