@@ -9,7 +9,7 @@ _2026-06-30_
 - Add a reusable GitHub Action for installing Kempt and checking formatting.
 - Preserve Kotlin script shebangs when inserting license headers.
 - Add experimental partial-staging support for ktfmt-managed Kotlin files behind
-  `KEMPT_EXPERIMENTAL_PARTIAL_KTFMT`. Note this requires ktfmt `0.65`+.
+  `KEMPT_EXPERIMENTAL_PARTIAL_KTFMT`. Note this requires ktfmt Y`0.65`+.
 
 ## [0.1.2]
 
