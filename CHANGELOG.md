@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.2.0]
+
+_2026-06-30_
+
 - Add a reusable GitHub Action for installing Kempt and checking formatting.
 - Preserve Kotlin script shebangs when inserting license headers.
 - Add experimental partial-staging support for ktfmt-managed Kotlin files behind
