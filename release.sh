@@ -198,7 +198,7 @@ echo "Release workflow succeeded"
 read -rp "Publish to crates.io? [Y/n] " reply
 if [[ -z "$reply" || "$reply" =~ ^[Yy] ]]; then
   echo "Publishing to crates.io"
-  cargo publish
+  cargo publish --allow-dirty
 fi
 
 echo
