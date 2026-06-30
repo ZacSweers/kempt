@@ -1,4 +1,4 @@
-name: Kempt
+name: kempt-fmt
 description: Install Kempt, optionally warm its formatter cache, and run a formatting check.
 branding:
   icon: wind
