@@ -387,16 +387,21 @@ The hook does, in order:
 Set `[hook] mode = "check"` to make the hook fail on any required change
 instead of formatting in place.
 
-### Experimental: Partial file formatting
+### Partial file formatting
 
-GJF and ktfmt (`0.65` or later) both support partial formatting files.
+kempt's in-process formatting steps, including whitespace normalization and
+license-header insertion, support partially staged files by updating the Git
+index directly.
+
+GJF and ktfmt (`0.65` or later) also support partial formatting files, but must
+be enabled explicitly:
 
 - set the `KEMPT_EXPERIMENTAL_PARTIAL_KTFMT` env flag to allow partially staged ktfmt-managed Kotlin files
 - set the `KEMPT_EXPERIMENTAL_PARTIAL_GJF` env flag to allow partially staged GJF-managed Java files
 
-kempt formats the staged hunks through the matching formatter and updates the index directly,
-without staging unrelated worktree hunks. Other partially staged files still use the refusal
-path above.
+kempt formats the staged content and updates the index directly, without
+staging unrelated worktree hunks. Other partially staged files still use the
+refusal path above.
 
 ## CI
 
