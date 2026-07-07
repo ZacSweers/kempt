@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Support partially staged files for in-process formatting steps such as
+  whitespace normalization by updating the Git index directly.
+
 ## [0.2.0]
 
 _2026-06-30_

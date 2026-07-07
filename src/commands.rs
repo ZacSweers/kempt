@@ -105,10 +105,6 @@ impl PartialFormattingOptions {
         }
     }
 
-    fn is_empty(self) -> bool {
-        !self.ktfmt && !self.gjf
-    }
-
     fn enabled_formatters(self) -> impl Iterator<Item = PartialFormatter> {
         [
             (self.ktfmt, PartialFormatter::Ktfmt),
@@ -229,34 +225,26 @@ fn run_hook_inner(
     }
     let check_mode = matches!(config.hook.mode, HookMode::Check);
     let mut normal_candidates = candidates.clone();
+    let mut partial_pipeline_files: Vec<PathBuf> = Vec::new();
     let mut partial_targets: Vec<(PartialFormatter, Vec<PathBuf>)> = Vec::new();
 
     if !check_mode {
         match hook::check_partial_staging(git, &candidates)? {
             StagingCheck::Safe => {}
             StagingCheck::PartialStage { files } => {
-                if !partial_options.is_empty() {
-                    partial_targets =
-                        partial_formatter_targets(config, git.root(), &files, partial_options)?;
-                    let handled: BTreeSet<PathBuf> = partial_targets
-                        .iter()
-                        .flat_map(|(_formatter, files)| files.iter())
-                        .cloned()
-                        .collect();
-                    let unhandled: Vec<PathBuf> = files
-                        .iter()
-                        .filter(|p| !handled.contains(*p))
-                        .cloned()
-                        .collect();
-                    if unhandled.is_empty() {
-                        normal_candidates.retain(|p| !handled.contains(p));
-                    } else {
-                        eprint!("{}", hook::format_partial_stage_error(&unhandled));
-                        return Err(partial_formatting_scope_error(partial_options));
-                    }
+                let plan = partial_formatting_plan(config, git.root(), &files, partial_options)?;
+                if plan.unhandled.is_empty() {
+                    normal_candidates.retain(|p| !plan.handled.contains(p));
+                    partial_pipeline_files = plan.handled.into_iter().collect();
+                    partial_targets = partial_formatter_targets(
+                        config,
+                        git.root(),
+                        &partial_pipeline_files,
+                        partial_options,
+                    )?;
                 } else {
-                    eprint!("{}", hook::format_partial_stage_error(&files));
-                    return Err(anyhow!("partial staging detected"));
+                    eprint!("{}", hook::format_partial_stage_error(&plan.unhandled));
+                    return Err(partial_formatting_scope_error(partial_options));
                 }
             }
         }
@@ -281,6 +269,12 @@ fn run_hook_inner(
     )?;
     let mut partial_changed = BTreeSet::new();
     if !check_mode {
+        partial_changed.extend(apply_partial_pipeline_to_index(
+            config,
+            git,
+            &partial_pipeline_files,
+            year,
+        )?);
         for (formatter, files) in &partial_targets {
             partial_changed.extend(apply_partial_formatter_to_index(
                 config, git, cache, downloader, *formatter, files,
@@ -304,8 +298,50 @@ fn run_hook_inner(
 fn partial_formatting_scope_error(options: PartialFormattingOptions) -> anyhow::Error {
     let supported = options.supported_descriptions();
     anyhow!(
-        "partial staging detected; {EXPERIMENTAL_PARTIAL_KTFMT_ENV}/{EXPERIMENTAL_PARTIAL_GJF_ENV} only support {supported}"
+        "partial staging detected; in-process formatting supports partial files, but {EXPERIMENTAL_PARTIAL_KTFMT_ENV}/{EXPERIMENTAL_PARTIAL_GJF_ENV} only support {supported}"
     )
+}
+
+struct PartialFormattingPlan {
+    handled: BTreeSet<PathBuf>,
+    unhandled: Vec<PathBuf>,
+}
+
+fn partial_formatting_plan(
+    config: &Config,
+    repo_root: &Path,
+    files: &[PathBuf],
+    options: PartialFormattingOptions,
+) -> Result<PartialFormattingPlan> {
+    let scopes = ToolScopes::build(config, repo_root)?;
+    let mut handled = BTreeSet::new();
+    let mut unhandled = Vec::new();
+    for path in files {
+        if partial_file_supported(config, &scopes, path, options) {
+            handled.insert(path.clone());
+        } else {
+            unhandled.push(path.clone());
+        }
+    }
+    Ok(PartialFormattingPlan { handled, unhandled })
+}
+
+fn partial_file_supported(
+    config: &Config,
+    scopes: &ToolScopes,
+    path: &Path,
+    options: PartialFormattingOptions,
+) -> bool {
+    if scopes.matches_rustfmt(path) {
+        return false;
+    }
+    if PartialFormatter::Ktfmt.matches(config, scopes, path) && !options.ktfmt {
+        return false;
+    }
+    if PartialFormatter::Gjf.matches(config, scopes, path) && !options.gjf {
+        return false;
+    }
+    true
 }
 
 /// Write a starter config to `target_dir`. The config is tailored to what
@@ -768,6 +804,51 @@ fn apply_pipeline(
         outcome.check_failed = true;
     }
     Ok(outcome)
+}
+
+fn apply_partial_pipeline_to_index(
+    config: &Config,
+    git: &dyn GitContext,
+    files: &[PathBuf],
+    year: u32,
+) -> Result<BTreeSet<PathBuf>> {
+    let headers = Headers::build(config, git.root(), year)?;
+    let ws_opts = crate::whitespace::Options::from(&config.whitespace);
+    let scopes = ToolScopes::build(config, git.root())?;
+    let mut changed = BTreeSet::new();
+
+    for rel in files {
+        let Some(kind) = SourceKind::from_path(rel) else {
+            continue;
+        };
+        let header_arg = headers.for_kind(kind).and_then(|h| {
+            if h.is_excluded(rel) {
+                None
+            } else {
+                Some((h.rendered.as_str(), h.marker.as_str()))
+            }
+        });
+        let effective_ws = if scopes.matches_whitespace(rel) {
+            ws_opts
+        } else {
+            crate::whitespace::Options::default()
+        };
+        if header_arg.is_none() && !effective_ws.strip_trailing && !effective_ws.final_newline {
+            continue;
+        }
+
+        let staged_contents = git.read_staged_file(rel)?;
+        let content = String::from_utf8(staged_contents)
+            .with_context(|| format!("staged file is not utf8: {}", rel.display()))?;
+        let (new_content, file_report) =
+            pipeline::process_content(&content, kind, header_arg, effective_ws);
+        if file_report.changed() {
+            git.update_staged_file(rel, new_content.as_bytes())?;
+            changed.insert(rel.clone());
+        }
+    }
+
+    Ok(changed)
 }
 
 fn apply_jvm_formatters(
@@ -1290,6 +1371,16 @@ mod tests {
         }
     }
 
+    fn config_whitespace_only() -> Config {
+        Config {
+            paths: Paths {
+                exclude: crate::config::GlobList::Inline(vec![]),
+            },
+            whitespace: Whitespace::default(),
+            ..Default::default()
+        }
+    }
+
     #[cfg(unix)]
     fn fake_gjf_marking_new_line(root: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -1550,12 +1641,12 @@ diff --git a/Foo.java b/Foo.java\n\
     fn run_hook_aborts_on_partial_stage() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write(root, "src/Foo.kt", "package foo   \n");
-        let cfg = config_inproc_only(root);
+        write(root, "src/lib.rs", "pub fn answer()->i32{1}\n");
+        let cfg = config_rustfmt_only();
         let git = FakeGit::new(root)
-            .with_tracked(vec!["src/Foo.kt"])
-            .with_staged(vec!["src/Foo.kt"])
-            .with_unstaged(vec!["src/Foo.kt"]);
+            .with_tracked(vec!["src/lib.rs"])
+            .with_staged(vec!["src/lib.rs"])
+            .with_unstaged(vec!["src/lib.rs"]);
         let cache = Cache::new(root.join(".cache"));
         let dl = FakeDownloader::new(b"".to_vec());
 
@@ -1570,8 +1661,67 @@ diff --git a/Foo.java b/Foo.java\n\
         .unwrap_err();
         assert!(format!("{err:#}").contains("partial staging"));
         // file should not have been modified
-        let body = std::fs::read_to_string(root.join("src/Foo.kt")).unwrap();
-        assert_eq!(body, "package foo   \n");
+        let body = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert_eq!(body, "pub fn answer()->i32{1}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_hook_partial_whitespace_updates_index_without_staging_unstaged_hunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_cmd(root, &["init"]);
+        git_cmd(root, &["config", "user.email", "test@example.com"]);
+        git_cmd(root, &["config", "user.name", "Test User"]);
+
+        write(
+            root,
+            "src/Foo.kt",
+            "fun staged() = \"old staged\"\n\
+             fun unstaged() = \"old unstaged\"\n",
+        );
+        git_cmd(root, &["add", "src/Foo.kt"]);
+        git_cmd(root, &["commit", "-m", "initial"]);
+
+        write(
+            root,
+            "src/Foo.kt",
+            "fun staged() = \"new staged\"   \n\
+             fun unstaged() = \"old unstaged\"\n",
+        );
+        git_cmd(root, &["add", "src/Foo.kt"]);
+        write(
+            root,
+            "src/Foo.kt",
+            "fun staged() = \"new staged\"   \n\
+             fun unstaged() = \"worktree unstaged\"   \n",
+        );
+
+        let cfg = config_whitespace_only();
+        let git = RealGit::discover(root).unwrap();
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_hook_inner(
+            &cfg,
+            &git,
+            &cache,
+            &dl,
+            2026,
+            PartialFormattingOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(out.changed, BTreeSet::from([PathBuf::from("src/Foo.kt")]));
+
+        let staged = git_cmd(root, &["show", ":src/Foo.kt"]);
+        assert!(staged.contains("fun staged() = \"new staged\"\n"));
+        assert!(staged.contains("fun unstaged() = \"old unstaged\"\n"));
+        assert!(!staged.contains("worktree unstaged"));
+        assert!(!staged.contains("new staged\"   "));
+
+        let worktree = std::fs::read_to_string(root.join("src/Foo.kt")).unwrap();
+        assert!(worktree.contains("fun staged() = \"new staged\"   \n"));
+        assert!(worktree.contains("fun unstaged() = \"worktree unstaged\"   \n"));
     }
 
     #[cfg(unix)]
