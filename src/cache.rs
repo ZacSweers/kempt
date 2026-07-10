@@ -3,8 +3,8 @@
 //! Binary cache management.
 //!
 //! Cached files are version-suffixed so repos with different pins coexist:
-//! `ktfmt-<version>.jar`, `gjf-<version>.jar`, and native gjf binaries named
-//! `gjf-<version>-<asset>[.exe]`.
+//! `ktfmt-<version>.jar`, `gjf-<version>.jar`, and native binaries named
+//! `<tool>-<version>-<asset>[.exe]`.
 //!
 //! Downloads are abstracted behind [`Downloader`] so tests can fake them.
 
@@ -16,13 +16,16 @@ use std::path::{Path, PathBuf};
 pub const KTFMT_URL: &str =
     "https://repo1.maven.org/maven2/com/facebook/ktfmt/{v}/ktfmt-{v}-with-dependencies.jar";
 
+pub const KTFMT_NATIVE_URL: &str =
+    "https://github.com/facebook/ktfmt/releases/download/v{v}/ktfmt_{asset}{ext}";
+
 pub const GJF_URL: &str =
     "https://github.com/google/google-java-format/releases/download/v{v}/google-java-format-{v}-all-deps.jar";
 
 pub const GJF_NATIVE_URL: &str =
     "https://github.com/google/google-java-format/releases/download/v{v}/google-java-format_{asset}{ext}";
 
-/// gjf's published native asset for a particular `(os, arch)` combo.
+/// Published native asset for a particular `(os, arch)` combo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeAsset {
     /// The asset segment, e.g. `darwin-arm64` or `linux-x86-64`.
@@ -31,7 +34,7 @@ pub struct NativeAsset {
     pub exe_suffix: &'static str,
 }
 
-/// Native asset for the current host, if gjf publishes one for this combo.
+/// Native asset for the current host, if the formatter publishes one for this combo.
 /// Returns `None` for Intel macOS and unknown platforms.
 pub fn current_native_asset() -> Option<NativeAsset> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -55,9 +58,14 @@ pub fn current_native_asset() -> Option<NativeAsset> {
     }
 }
 
+/// Whether ktfmt publishes native assets for `version`.
+pub fn ktfmt_native_supported_for_version(version: &str) -> bool {
+    parse_version(version).is_some_and(|(maj, min, _)| (maj, min) >= (0, 65))
+}
+
 /// Whether gjf publishes the given native asset for `version`. Native builds
 /// started in 1.20.0; linux-arm64 was added in 1.26.0.
-pub fn native_supported_for_version(version: &str, asset: &NativeAsset) -> bool {
+pub fn gjf_native_supported_for_version(version: &str, asset: &NativeAsset) -> bool {
     let Some((maj, min, _)) = parse_version(version) else {
         return false;
     };
@@ -77,6 +85,35 @@ pub enum GjfFlavor {
     Native(NativeAsset),
 }
 
+/// Outcome of choosing between native and jar for a particular ktfmt install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KtfmtFlavor {
+    Jar,
+    Native(NativeAsset),
+}
+
+/// Decide whether to use the native binary or the jar for `version`,
+/// considering the user's preference and what ktfmt publishes for this host.
+pub fn resolve_ktfmt_flavor(
+    version: &str,
+    prefer_native: bool,
+    require_native: bool,
+) -> Result<KtfmtFlavor> {
+    if prefer_native {
+        if let Some(asset) = current_native_asset() {
+            if ktfmt_native_supported_for_version(version) {
+                return Ok(KtfmtFlavor::Native(asset));
+            }
+        }
+        if require_native {
+            return Err(anyhow!(
+                "native ktfmt is not available for version {version} on this platform"
+            ));
+        }
+    }
+    Ok(KtfmtFlavor::Jar)
+}
+
 /// Decide whether to use the native binary or the jar for `version`,
 /// considering the user's preference and what gjf publishes for this host.
 ///
@@ -90,7 +127,7 @@ pub fn resolve_gjf_flavor(
 ) -> Result<GjfFlavor> {
     if prefer_native {
         if let Some(asset) = current_native_asset() {
-            if native_supported_for_version(version, &asset) {
+            if gjf_native_supported_for_version(version, &asset) {
                 return Ok(GjfFlavor::Native(asset));
             }
         }
@@ -155,6 +192,14 @@ impl Cache {
         self.root.join(format!("ktfmt-{version}.jar"))
     }
 
+    /// Path for the ktfmt native binary on the given platform asset.
+    pub fn ktfmt_native_path(&self, version: &str, asset: &NativeAsset) -> PathBuf {
+        self.root.join(format!(
+            "ktfmt-{version}-{}{}",
+            asset.asset, asset.exe_suffix
+        ))
+    }
+
     /// Path for the gjf JVM jar (no platform/arch suffix).
     pub fn gjf_jar_path(&self, version: &str) -> PathBuf {
         self.root.join(format!("gjf-{version}.jar"))
@@ -173,6 +218,23 @@ impl Cache {
         self.ensure(&dest, &url, downloader)
     }
 
+    /// Ensure the ktfmt native binary for `version` + `asset` is present and executable.
+    pub fn ensure_ktfmt_native(
+        &self,
+        version: &str,
+        asset: &NativeAsset,
+        downloader: &dyn Downloader,
+    ) -> Result<PathBuf> {
+        let dest = self.ktfmt_native_path(version, asset);
+        let url = KTFMT_NATIVE_URL
+            .replace("{v}", version)
+            .replace("{asset}", asset.asset)
+            .replace("{ext}", asset.exe_suffix);
+        let path = self.ensure(&dest, &url, downloader)?;
+        ensure_executable(&path)?;
+        Ok(path)
+    }
+
     /// Ensure the gjf jar for `version` is present.
     pub fn ensure_gjf_jar(&self, version: &str, downloader: &dyn Downloader) -> Result<PathBuf> {
         let dest = self.gjf_jar_path(version);
@@ -182,7 +244,7 @@ impl Cache {
 
     /// Ensure the gjf native binary for `version` + `asset` is present and
     /// executable. Caller is responsible for checking that the combo is
-    /// supported (see [`native_supported_for_version`]).
+    /// supported (see [`gjf_native_supported_for_version`]).
     pub fn ensure_gjf_native(
         &self,
         version: &str,
@@ -262,17 +324,20 @@ impl Cache {
 
 fn is_kempt_artifact_name(name: &str) -> bool {
     if let Some(rest) = name.strip_prefix("ktfmt-") {
-        return starts_with_digit(rest) && rest.ends_with(".jar");
+        return starts_with_digit(rest) && has_managed_artifact_suffix(rest);
     }
     let Some(rest) = name.strip_prefix("gjf-") else {
         return false;
     };
-    starts_with_digit(rest)
-        && (rest.ends_with(".jar")
-            || rest.ends_with(".exe")
-            || ["-darwin-arm64", "-linux-x86-64", "-linux-arm64"]
-                .iter()
-                .any(|suffix| rest.ends_with(suffix)))
+    starts_with_digit(rest) && has_managed_artifact_suffix(rest)
+}
+
+fn has_managed_artifact_suffix(name: &str) -> bool {
+    name.ends_with(".jar")
+        || name.ends_with(".exe")
+        || ["-darwin-arm64", "-linux-x86-64", "-linux-arm64"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
 }
 
 fn starts_with_digit(s: &str) -> bool {
@@ -366,6 +431,16 @@ mod tests {
     fn paths_are_version_suffixed() {
         let c = Cache::new(PathBuf::from("/c"));
         assert_eq!(c.ktfmt_path("0.56"), PathBuf::from("/c/ktfmt-0.56.jar"));
+        assert_eq!(
+            c.ktfmt_native_path(
+                "0.65",
+                &NativeAsset {
+                    asset: "darwin-arm64",
+                    exe_suffix: "",
+                }
+            ),
+            PathBuf::from("/c/ktfmt-0.65-darwin-arm64")
+        );
         assert_eq!(c.gjf_jar_path("1.28.0"), PathBuf::from("/c/gjf-1.28.0.jar"));
     }
 
@@ -394,6 +469,48 @@ mod tests {
         cache.ensure_ktfmt("0.56", &dl).unwrap();
         cache.ensure_ktfmt("0.56", &dl).unwrap();
         assert_eq!(dl.calls.borrow().len(), 1, "should only download once");
+    }
+
+    #[test]
+    fn ensure_ktfmt_native_uses_release_asset_url_and_chmods() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        let dl = FakeDownloader::new(b"native-bytes".to_vec());
+        let asset = NativeAsset {
+            asset: "darwin-arm64",
+            exe_suffix: "",
+        };
+
+        let path = cache.ensure_ktfmt_native("0.65", &asset, &dl).unwrap();
+
+        let calls = dl.calls.borrow();
+        assert_eq!(
+            calls[0].0,
+            "https://github.com/facebook/ktfmt/releases/download/v0.65/ktfmt_darwin-arm64"
+        );
+        assert!(path.ends_with("ktfmt-0.65-darwin-arm64"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "expected +x");
+        }
+    }
+
+    #[test]
+    fn ensure_ktfmt_native_windows_includes_exe_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        let dl = FakeDownloader::new(b"x".to_vec());
+        let asset = NativeAsset {
+            asset: "windows-x86-64",
+            exe_suffix: ".exe",
+        };
+
+        let path = cache.ensure_ktfmt_native("0.65", &asset, &dl).unwrap();
+
+        assert!(path.ends_with("ktfmt-0.65-windows-x86-64.exe"));
+        assert!(dl.calls.borrow()[0].0.ends_with("ktfmt_windows-x86-64.exe"));
     }
 
     #[test]
@@ -452,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn native_supported_for_version_uses_correct_cutoffs() {
+    fn gjf_native_supported_for_version_uses_correct_cutoffs() {
         let darwin = NativeAsset {
             asset: "darwin-arm64",
             exe_suffix: "",
@@ -462,13 +579,13 @@ mod tests {
             exe_suffix: "",
         };
         // Pre-1.20: nothing.
-        assert!(!native_supported_for_version("1.19.0", &darwin));
+        assert!(!gjf_native_supported_for_version("1.19.0", &darwin));
         // 1.20+: most platforms.
-        assert!(native_supported_for_version("1.20.0", &darwin));
-        assert!(native_supported_for_version("1.28.0", &darwin));
+        assert!(gjf_native_supported_for_version("1.20.0", &darwin));
+        assert!(gjf_native_supported_for_version("1.28.0", &darwin));
         // linux-arm64 only from 1.26.
-        assert!(!native_supported_for_version("1.22.0", &linux_arm));
-        assert!(native_supported_for_version("1.26.0", &linux_arm));
+        assert!(!gjf_native_supported_for_version("1.22.0", &linux_arm));
+        assert!(gjf_native_supported_for_version("1.26.0", &linux_arm));
     }
 
     #[test]
@@ -477,8 +594,34 @@ mod tests {
             asset: "darwin-arm64",
             exe_suffix: "",
         };
-        assert!(!native_supported_for_version("garbage", &asset));
-        assert!(!native_supported_for_version("1", &asset));
+        assert!(!gjf_native_supported_for_version("garbage", &asset));
+        assert!(!gjf_native_supported_for_version("1", &asset));
+    }
+
+    #[test]
+    fn ktfmt_native_supported_from_0_65() {
+        assert!(!ktfmt_native_supported_for_version("0.64"));
+        assert!(ktfmt_native_supported_for_version("0.65"));
+        assert!(ktfmt_native_supported_for_version("0.65.1"));
+        assert!(!ktfmt_native_supported_for_version("garbage"));
+    }
+
+    #[test]
+    fn resolve_ktfmt_flavor_returns_jar_when_native_disabled() {
+        let flavor = resolve_ktfmt_flavor("0.65", false, false).unwrap();
+        assert_eq!(flavor, KtfmtFlavor::Jar);
+    }
+
+    #[test]
+    fn resolve_ktfmt_flavor_falls_back_for_old_version() {
+        let flavor = resolve_ktfmt_flavor("0.64", true, false).unwrap();
+        assert_eq!(flavor, KtfmtFlavor::Jar);
+    }
+
+    #[test]
+    fn resolve_ktfmt_flavor_require_errors_when_unavailable() {
+        let err = resolve_ktfmt_flavor("0.64", true, true).unwrap_err();
+        assert!(format!("{err:#}").contains("native ktfmt is not available"));
     }
 
     #[test]
@@ -568,6 +711,17 @@ mod tests {
         fs::create_dir_all(cache.root()).unwrap();
         fs::write(cache.root().join("gjf-1.28.0-darwin-arm64"), b"x").unwrap();
         fs::write(cache.root().join("gjf-1.28.0.jar"), b"x").unwrap();
+        let entries = cache.list_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn list_entries_includes_native_ktfmt_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        fs::create_dir_all(cache.root()).unwrap();
+        fs::write(cache.root().join("ktfmt-0.65-darwin-arm64"), b"x").unwrap();
+        fs::write(cache.root().join("ktfmt-0.65.jar"), b"x").unwrap();
         let entries = cache.list_entries().unwrap();
         assert_eq!(entries.len(), 2);
     }

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Support ktfmt 0.65+ GraalVM-native binaries with automatic JVM jar fallback,
+  matching the existing GJF native modes.
+
 ## [0.2.1]
 
 _2026-07-07_

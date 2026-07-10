@@ -80,6 +80,7 @@ disable that step.
 [ktfmt]
 version = "0.63"
 style = "google"           # google | kotlinlang | meta
+native = "auto"            # auto | always | never
 
 [gjf]
 version = "1.35.0"
@@ -249,34 +250,35 @@ before config filters are applied.
 Every option, with its default. A `-` in the default column means "no built-in
 default; the section that contains it is what enables the feature."
 
-| Key                                 | Default                                           | Notes                                                                                                                    |
-|-------------------------------------|---------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
-| `[ktfmt].version`                   | -                                                 | Maven Central version. Either a literal `"0.62"` or a catalog reference `{ file, key }`. Mutually exclusive with `path`. |
-| `[ktfmt].path`                      | -                                                 | Path to a checked-in jar. Mutually exclusive with `version`.                                                             |
-| `[ktfmt].style`                     | `"google"`                                        | `google` / `kotlinlang` / `meta`                                                                                         |
-| `[ktfmt.paths].include`             | `["**/*.kt", "**/*.kts"]`                         | Inline array or path to a glob-list file.                                                                                |
-| `[ktfmt.paths].exclude`             | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
-| `[ktfmt.license-header].file`       | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
-| `[ktfmt.license-header].excludes`   | none                                              | Path to a glob list (one per line, `#` comments).                                                                        |
-| `[gjf].version`                     | -                                                 | GitHub release version. Either a literal or a catalog reference `{ file, key }`. Mutually exclusive with `path`.         |
-| `[gjf].path`                        | -                                                 | Path to a checked-in jar or native binary. Mutually exclusive with `version`.                                            |
-| `[gjf].style`                       | `"google"`                                        | `google` / `aosp`                                                                                                        |
-| `[gjf].native`                      | `"auto"`                                          | `auto` / `always` / `never`. See "Native gjf".                                                                           |
-| `[gjf.paths].include`               | `["**/*.java"]`                                   | Inline array or path to a glob-list file.                                                                                |
-| `[gjf.paths].exclude`               | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
-| `[gjf.license-header].file`         | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
-| `[gjf.license-header].excludes`     | none                                              | Path to a glob list.                                                                                                     |
-| `[rustfmt.paths].include`           | `["**/*.rs"]`                                     | Inline array or path to a glob-list file.                                                                                |
-| `[rustfmt.paths].exclude`           | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
-| `[rustfmt.license-header].file`     | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
-| `[rustfmt.license-header].excludes` | none                                              | Path to a glob list.                                                                                                     |
-| `[license-header].file`             | -                                                 | Default license header template, `${YEAR}` expanded at write time. Section absence = no header insertion.                |
-| `[paths].exclude`                   | `["**/build/**", "**/target/**"]`                 | Global exclude, applied before any tool's filter. Inline array or path to a glob-list file.                              |
-| `[whitespace].strip-trailing`       | `true`                                            | Strip trailing space/tab/CR on every line.                                                                               |
-| `[whitespace].final-newline`        | `true`                                            | Ensure files end with exactly one `\n`.                                                                                  |
-| `[whitespace.paths].include`        | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | Inline array or path to a glob-list file.                                                                                |
-| `[whitespace.paths].exclude`        | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
-| `[hook].mode`                       | `"format"`                                        | `format` formats and re-stages. `check` fails the commit if changes are needed.                                          |
+| Key                                 | Default                                           | Notes                                                                                                              |
+|-------------------------------------|---------------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
+| `[ktfmt].version`                   | -                                                 | Release version. Either a literal `"0.65"` or a catalog reference `{ file, key }`. Mutually exclusive with `path`. |
+| `[ktfmt].path`                      | -                                                 | Path to a checked-in jar or native binary. Mutually exclusive with `version`.                                      |
+| `[ktfmt].style`                     | `"google"`                                        | `google` / `kotlinlang` / `meta`                                                                                   |
+| `[ktfmt].native`                    | `"auto"`                                          | `auto` / `always` / `never`. See "Native formatter binaries".                                                      |
+| `[ktfmt.paths].include`             | `["**/*.kt", "**/*.kts"]`                         | Inline array or path to a glob-list file.                                                                          |
+| `[ktfmt.paths].exclude`             | `[]`                                              | Inline array or path to a glob-list file.                                                                          |
+| `[ktfmt.license-header].file`       | inherits `[license-header].file`                  | Per-tool template override.                                                                                        |
+| `[ktfmt.license-header].excludes`   | none                                              | Path to a glob list (one per line, `#` comments).                                                                  |
+| `[gjf].version`                     | -                                                 | GitHub release version. Either a literal or a catalog reference `{ file, key }`. Mutually exclusive with `path`.   |
+| `[gjf].path`                        | -                                                 | Path to a checked-in jar or native binary. Mutually exclusive with `version`.                                      |
+| `[gjf].style`                       | `"google"`                                        | `google` / `aosp`                                                                                                  |
+| `[gjf].native`                      | `"auto"`                                          | `auto` / `always` / `never`. See "Native formatter binaries".                                                      |
+| `[gjf.paths].include`               | `["**/*.java"]`                                   | Inline array or path to a glob-list file.                                                                          |
+| `[gjf.paths].exclude`               | `[]`                                              | Inline array or path to a glob-list file.                                                                          |
+| `[gjf.license-header].file`         | inherits `[license-header].file`                  | Per-tool template override.                                                                                        |
+| `[gjf.license-header].excludes`     | none                                              | Path to a glob list.                                                                                               |
+| `[rustfmt.paths].include`           | `["**/*.rs"]`                                     | Inline array or path to a glob-list file.                                                                          |
+| `[rustfmt.paths].exclude`           | `[]`                                              | Inline array or path to a glob-list file.                                                                          |
+| `[rustfmt.license-header].file`     | inherits `[license-header].file`                  | Per-tool template override.                                                                                        |
+| `[rustfmt.license-header].excludes` | none                                              | Path to a glob list.                                                                                               |
+| `[license-header].file`             | -                                                 | Default license header template, `${YEAR}` expanded at write time. Section absence = no header insertion.          |
+| `[paths].exclude`                   | `["**/build/**", "**/target/**"]`                 | Global exclude, applied before any tool's filter. Inline array or path to a glob-list file.                        |
+| `[whitespace].strip-trailing`       | `true`                                            | Strip trailing space/tab/CR on every line.                                                                         |
+| `[whitespace].final-newline`        | `true`                                            | Ensure files end with exactly one `\n`.                                                                            |
+| `[whitespace.paths].include`        | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | Inline array or path to a glob-list file.                                                                          |
+| `[whitespace.paths].exclude`        | `[]`                                              | Inline array or path to a glob-list file.                                                                          |
+| `[hook].mode`                       | `"format"`                                        | `format` formats and re-stages. `check` fails the commit if changes are needed.                                    |
 
 Sections that are entirely optional: `[ktfmt]`, `[gjf]`, `[rustfmt]`,
 `[license-header]`, `[ktfmt.license-header]`, `[gjf.license-header]`,
@@ -593,23 +595,20 @@ the workaround is to keep the version pin in a file Dependabot already
 understands (e.g., a Gradle `libs.versions.toml`) and copy it into
 `.kempt.toml` manually or via a small CI step.
 
-### Native gjf
+### Native formatter binaries
 
-Starting with gjf 1.20.0, Google publishes GraalVM-native binaries alongside
-the JVM jar. They start in roughly 20ms instead of ~500ms (JVM warmup),
-don't need a JDK, and avoid the JVM `--add-opens` flags. Native builds
-exist for `darwin-arm64`, `linux-x86-64`, `linux-arm64` (1.26.0+), and
-`windows-x86-64`. There is no Intel macOS (`darwin-x86-64`) native build,
-and no native ktfmt at all.
+ktfmt 0.65+ and gjf 1.20.0+ publish GraalVM-native binaries alongside their JVM
+jars. They start without JVM warmup, don't need a JDK, and avoid the JVM
+`--add-opens` flags. Both publish `darwin-arm64`, `linux-x86-64`,
+`linux-arm64`, and `windows-x86-64` binaries, though gjf added `linux-arm64`
+in 1.26.0. Neither publishes an Intel macOS (`darwin-x86-64`) binary.
 
-`[gjf].native` controls which artifact kempt downloads:
+`[ktfmt].native` and `[gjf].native` control which artifact kempt downloads:
 
 - `auto` (default): native when published for this platform + version, jar
   otherwise.
 - `always`: native always; errors if not published for the host.
 - `never`: jar always.
-
-ktfmt is unaffected (always JVM).
 
 ### Checking in the binaries (hermetic / offline builds)
 
