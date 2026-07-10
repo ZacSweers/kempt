@@ -4,6 +4,7 @@
 
 use crate::cache::{Cache, Downloader, GjfFlavor};
 use crate::config::{Config, Gjf, HookMode, NativeMode, ToolSource};
+use crate::detekt;
 use crate::formatters;
 use crate::git::GitContext;
 use crate::hook::{self, StagingCheck};
@@ -28,9 +29,16 @@ pub struct FormatOutcome {
     pub changed: BTreeSet<PathBuf>,
     /// True when running in check mode and at least one change is needed.
     pub check_failed: bool,
+    /// True when a formatter check found files that need changes.
+    pub formatting_failed: bool,
+    /// True when detekt reported one or more findings.
+    pub analysis_failed: bool,
     /// Filtered stderr from ktfmt/gjf (typically parse errors). Only
     /// populated in check mode.
     pub parse_errors: String,
+    /// Output produced by configured analyzers.
+    pub analysis_stdout: String,
+    pub analysis_stderr: String,
 }
 
 impl FormatOutcome {
@@ -41,7 +49,7 @@ impl FormatOutcome {
     }
 }
 
-/// Run the full format pipeline (in-process steps + ktfmt + gjf).
+/// Run the formatting pipeline and, in check mode, configured analyzers.
 ///
 /// `check` selects dry-run mode: nothing is written; non-zero exit indicates
 /// changes are needed.
@@ -69,6 +77,16 @@ pub fn run_format(
         &mut outcome,
     )?;
     apply_rustfmt(config, git.root(), &candidates, check, &mut outcome)?;
+    if check {
+        apply_detekt(
+            config,
+            cache,
+            downloader,
+            git.root(),
+            &candidates,
+            &mut outcome,
+        )?;
+    }
     Ok(outcome)
 }
 
@@ -292,6 +310,14 @@ fn run_hook_inner(
             .collect();
         git.add(&to_add).context("git add post-format")?;
     }
+    apply_detekt(
+        config,
+        cache,
+        downloader,
+        git.root(),
+        &candidates,
+        &mut outcome,
+    )?;
     Ok(outcome)
 }
 
@@ -474,10 +500,15 @@ pub fn keep_paths_for_config(config: &Config, repo_root: &Path, cache: &Cache) -
             }
         }
     }
+    if let Some(detekt) = &config.detekt {
+        if let ToolSource::Cached(version) = detekt.source(repo_root) {
+            keep.push(cache.detekt_path(&version));
+        }
+    }
     keep
 }
 
-/// Pre-fetch formatter artifacts per config. Tools using `path = ...` are
+/// Pre-fetch tool artifacts per config. Tools using `path = ...` are
 /// skipped because their binary is already in the repo.
 pub fn run_update(
     config: &Config,
@@ -493,6 +524,11 @@ pub fn run_update(
     if let Some(g) = &config.gjf {
         if let ToolSource::Cached(v) = g.source(repo_root) {
             ensure_gjf_artifact(&v, g, cache, downloader)?;
+        }
+    }
+    if let Some(detekt) = &config.detekt {
+        if let ToolSource::Cached(version) = detekt.source(repo_root) {
+            cache.ensure_detekt(&version, downloader)?;
         }
     }
     Ok(())
@@ -564,7 +600,7 @@ pub struct VendorEntry {
     pub config_value: PathBuf,
 }
 
-/// Download (if needed) and copy formatter artifacts into `target_dir`. The
+/// Download (if needed) and copy tool artifacts into `target_dir`. The
 /// directory is interpreted relative to `repo_root`. Tools already using
 /// `path = ...` are skipped.
 pub fn run_vendor(
@@ -607,6 +643,16 @@ pub fn run_vendor(
                 outcome.entries.push(entry);
             }
             ToolSource::Local(_) => outcome.skipped.push("gjf"),
+        }
+    }
+    if let Some(detekt) = &config.detekt {
+        match detekt.source(repo_root) {
+            ToolSource::Cached(version) => {
+                let src = cache.ensure_detekt(&version, downloader)?;
+                let entry = copy_into("detekt", &version, &src, &abs_target, target_dir)?;
+                outcome.entries.push(entry);
+            }
+            ToolSource::Local(_) => outcome.skipped.push("detekt"),
         }
     }
 
@@ -802,6 +848,7 @@ fn apply_pipeline(
     }
     if check && !outcome.changed.is_empty() {
         outcome.check_failed = true;
+        outcome.formatting_failed = true;
     }
     Ok(outcome)
 }
@@ -943,6 +990,7 @@ fn apply_rustfmt(
             let output = cargo_fmt(repo_root, check, std::slice::from_ref(&rel))?;
             if !output.status.success() {
                 outcome.check_failed = true;
+                outcome.formatting_failed = true;
                 outcome.changed.insert(rel);
                 append_rustfmt_stderr(outcome, &output.stderr);
             }
@@ -957,6 +1005,58 @@ fn apply_rustfmt(
         merge_format_changes(outcome, repo_root, before)?;
     }
     Ok(())
+}
+
+fn apply_detekt(
+    config: &Config,
+    cache: &Cache,
+    downloader: &dyn Downloader,
+    repo_root: &Path,
+    files: &[PathBuf],
+    outcome: &mut FormatOutcome,
+) -> Result<()> {
+    let Some(config) = &config.detekt else {
+        return Ok(());
+    };
+    let mut runs = Vec::new();
+    for target in config.resolve_targets(repo_root)? {
+        let (include, exclude) = paths::tool_globset(&target.paths)
+            .with_context(|| format!("invalid [detekt] target `{}` paths", target.name))?;
+        let target_files: Vec<PathBuf> = files
+            .iter()
+            .filter(|path| include.is_match(path) && !exclude.is_match(path))
+            .cloned()
+            .collect();
+        if target_files.is_empty() {
+            continue;
+        }
+        runs.push((target, target_files));
+    }
+    if runs.is_empty() {
+        return Ok(());
+    }
+    let (invoker, major) = detekt::resolve_invoker(config, repo_root, cache, downloader)?;
+    for (target, target_files) in runs {
+        let run = detekt::run(&invoker, major, &target, repo_root, &target_files)?;
+        append_output(&mut outcome.analysis_stdout, &run.stdout);
+        append_output(&mut outcome.analysis_stderr, &run.stderr);
+        if run.findings {
+            outcome.analysis_failed = true;
+            outcome.check_failed = true;
+        }
+    }
+    Ok(())
+}
+
+fn append_output(destination: &mut String, output: &str) {
+    let output = output.trim();
+    if output.is_empty() {
+        return;
+    }
+    if !destination.is_empty() {
+        destination.push('\n');
+    }
+    destination.push_str(output);
 }
 
 fn cargo_fmt(repo_root: &Path, check: bool, files: &[PathBuf]) -> Result<std::process::Output> {
@@ -1170,8 +1270,22 @@ fn shell_escape(p: &Path) -> String {
 /// nothing when the outcome is clean (no changes, no parse errors).
 pub fn render_check_summary(outcome: &FormatOutcome, ctx: CheckContext) -> Vec<String> {
     let mut lines = Vec::new();
-    let n_changed = outcome.changed.len();
+    let n_changed = if outcome.formatting_failed {
+        outcome.changed.len()
+    } else {
+        0
+    };
     let has_errors = outcome.has_parse_errors();
+    if n_changed == 0 && !has_errors && !outcome.analysis_failed {
+        return lines;
+    }
+    if outcome.analysis_failed {
+        lines.push("kempt: detekt reported findings.".to_string());
+        if matches!(ctx, CheckContext::Hook) {
+            lines.push("Fix the findings, then commit again.".to_string());
+            lines.push("Or commit with `--no-verify` to bypass.".to_string());
+        }
+    }
     if n_changed == 0 && !has_errors {
         return lines;
     }
@@ -1220,6 +1334,7 @@ pub fn render_check_summary(outcome: &FormatOutcome, ctx: CheckContext) -> Vec<S
 fn merge_jvm_check_run(outcome: &mut FormatOutcome, repo_root: &Path, run: formatters::CheckRun) {
     if !run.success {
         outcome.check_failed = true;
+        outcome.formatting_failed = true;
     }
     for abs in run.paths {
         let p = Path::new(&abs);
@@ -1300,6 +1415,7 @@ mod tests {
         Config {
             ktfmt: None,
             gjf: None,
+            detekt: None,
             rustfmt: None,
             license_header: Some(LicenseHeader {
                 file: PathBuf::from("config/header.txt"),
@@ -1351,6 +1467,7 @@ mod tests {
                 native: Default::default(),
                 paths: None,
             }),
+            detekt: None,
             rustfmt: None,
             license_header: None,
             paths: Paths {
@@ -1369,6 +1486,42 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[cfg(unix)]
+    fn fake_detekt(root: &Path, exit_code: i32) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let executable = root.join("fake-detekt");
+        let marker = root.join("detekt-ran");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"--version\" ]; then\n\
+                   echo '2.0.0-alpha.5'\n\
+                   exit 0\n\
+                 fi\n\
+                 : > '{}'\n\
+                 echo 'MagicNumber - sample finding'\n\
+                 exit {exit_code}\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        (executable, marker)
+    }
+
+    #[cfg(unix)]
+    fn config_detekt_only(executable: &Path) -> Config {
+        Config::parse(&format!(
+            "[detekt]\npath = \"{}\"\n\n[whitespace]\nstrip-trailing = false\nfinal-newline = false\n",
+            executable.display()
+        ))
+        .unwrap()
     }
 
     fn config_whitespace_only() -> Config {
@@ -1542,6 +1695,75 @@ diff --git a/Foo.java b/Foo.java\n\
         let out = run_format(&cfg, &git, &cache, &dl, Scope::All, false, 2026).unwrap();
         assert!(out.changed.is_empty());
         assert!(!out.check_failed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_format_does_not_run_detekt() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/A.kt", "fun answer() = 42\n");
+        let (executable, marker) = fake_detekt(dir.path(), 2);
+        let config = config_detekt_only(&executable);
+        let git = FakeGit::new(dir.path().to_path_buf()).with_tracked(vec!["src/A.kt"]);
+        let cache = Cache::new(dir.path().join("cache"));
+        let downloader = FakeDownloader::new(Vec::new());
+        let outcome =
+            run_format(&config, &git, &cache, &downloader, Scope::All, false, 2026).unwrap();
+        assert!(!outcome.analysis_failed);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn run_check_does_not_resolve_detekt_when_no_target_files_match() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/A.java", "class A {}\n");
+        let config = Config::parse(
+            "[detekt]\npath = \"missing-detekt\"\n\n[whitespace]\nstrip-trailing = false\nfinal-newline = false\n",
+        )
+        .unwrap();
+        let git = FakeGit::new(dir.path().to_path_buf()).with_tracked(vec!["src/A.java"]);
+        let cache = Cache::new(dir.path().join("cache"));
+        let downloader = FakeDownloader::new(Vec::new());
+        let outcome =
+            run_format(&config, &git, &cache, &downloader, Scope::All, true, 2026).unwrap();
+        assert!(!outcome.check_failed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_check_classifies_detekt_findings_separately_from_formatting() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/A.kt", "fun answer() = 42\n");
+        let (executable, marker) = fake_detekt(dir.path(), 2);
+        let config = config_detekt_only(&executable);
+        let git = FakeGit::new(dir.path().to_path_buf()).with_tracked(vec!["src/A.kt"]);
+        let cache = Cache::new(dir.path().join("cache"));
+        let downloader = FakeDownloader::new(Vec::new());
+        let outcome =
+            run_format(&config, &git, &cache, &downloader, Scope::All, true, 2026).unwrap();
+        assert!(marker.exists());
+        assert!(outcome.check_failed);
+        assert!(outcome.analysis_failed);
+        assert!(!outcome.formatting_failed);
+        assert!(outcome.changed.is_empty());
+        assert!(outcome.analysis_stdout.contains("MagicNumber"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_hook_runs_detekt_without_restaging_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/A.kt", "fun answer() = 42\n");
+        let (executable, marker) = fake_detekt(dir.path(), 2);
+        let config = config_detekt_only(&executable);
+        let git = FakeGit::new(dir.path().to_path_buf()).with_staged(vec!["src/A.kt"]);
+        let cache = Cache::new(dir.path().join("cache"));
+        let downloader = FakeDownloader::new(Vec::new());
+        let outcome = run_hook(&config, &git, &cache, &downloader, 2026).unwrap();
+        assert!(marker.exists());
+        assert!(outcome.analysis_failed);
+        assert!(outcome.changed.is_empty());
+        assert!(git.added.borrow().is_empty());
     }
 
     #[cfg(unix)]
@@ -2142,6 +2364,35 @@ diff --git a/Foo.java b/Foo.java\n\
     }
 
     #[test]
+    fn detekt_participates_in_update_keep_and_vendor() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().join("cache"));
+        let downloader = FakeDownloader::new(b"detekt-jar".to_vec());
+        let config = Config::parse("[detekt]\nversion = \"1.23.8\"\n").unwrap();
+
+        run_update(&config, dir.path(), &cache, &downloader).unwrap();
+        assert!(cache.detekt_path("1.23.8").exists());
+        assert_eq!(
+            keep_paths_for_config(&config, dir.path(), &cache),
+            vec![cache.detekt_path("1.23.8")]
+        );
+
+        let outcome = run_vendor(
+            &config,
+            dir.path(),
+            &cache,
+            &downloader,
+            Path::new("config/bin"),
+        )
+        .unwrap();
+        assert_eq!(outcome.entries.len(), 1);
+        assert_eq!(outcome.entries[0].tool, "detekt");
+        assert!(outcome.entries[0]
+            .dest
+            .ends_with("config/bin/detekt-1.23.8.jar"));
+    }
+
+    #[test]
     fn keep_paths_excludes_in_repo_jars() {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(dir.path().to_path_buf());
@@ -2363,6 +2614,7 @@ diff --git a/Foo.java b/Foo.java\n\
         for p in changed {
             o.changed.insert(PathBuf::from(p));
         }
+        o.formatting_failed = !changed.is_empty();
         o.parse_errors = parse_errors.to_string();
         o
     }
@@ -2500,6 +2752,18 @@ diff --git a/Foo.java b/Foo.java\n\
         let out = outcome_with(&["a/very/long/path/Foo.kt"], "");
         let summary = render_check_summary(&out, CheckContext::All);
         assert!(!summary[0].contains("Foo.kt"));
+    }
+
+    #[test]
+    fn check_summary_detekt_findings_do_not_claim_formatting_is_needed() {
+        let mut out = FormatOutcome {
+            analysis_failed: true,
+            ..Default::default()
+        };
+        out.changed.insert(PathBuf::from("already-formatted.kt"));
+        let summary = render_check_summary(&out, CheckContext::Hook).join("\n");
+        assert!(summary.contains("detekt reported findings"));
+        assert!(!summary.contains("needs formatting"));
     }
 
     // --- shell_escape ---

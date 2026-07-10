@@ -18,7 +18,7 @@ pub enum Discovery {
 #[command(
     name = "kempt",
     version,
-    about = "Multi-language source formatter (Kotlin, Java, Rust, license headers, whitespace)"
+    about = "Source formatting and analysis pipeline (Kotlin, Java, Rust, detekt, license headers, whitespace)"
 )]
 pub struct Cli {
     /// Path to config file. Defaults to `.kempt.toml` in the repo root.
@@ -34,7 +34,7 @@ pub enum Cmd {
     /// Format files (modifies in place). Pass `--dry-run` to preview without
     /// writing.
     Format(FormatArgs),
-    /// Check formatting without modifying files. Exits non-zero if changes are needed.
+    /// Check formatting and run analyzers without modifying files. Exits non-zero for changes or findings.
     Check(CheckArgs),
     /// Write a starter .kempt.toml.
     Init(InitArgs),
@@ -42,11 +42,11 @@ pub enum Cmd {
     InstallHook(InstallHookArgs),
     /// Run as the pre-commit hook. Invoked by `.git/hooks/pre-commit`.
     Hook,
-    /// Download/refresh formatter artifacts per config.
+    /// Download/refresh tool artifacts per config.
     Update,
     /// Bump tool versions in `.kempt.toml` to the latest upstream releases.
     Upgrade(UpgradeArgs),
-    /// Copy formatter artifacts into the repo (default `config/bin`) so they
+    /// Copy tool artifacts into the repo (default `config/bin`) so they
     /// can be checked in. Prints the config snippet to swap in afterward.
     Vendor(VendorArgs),
     /// Inspect or clean the formatter binary cache.
@@ -70,7 +70,7 @@ pub struct UpgradeArgs {
 
 #[derive(Args, Debug)]
 pub struct VendorArgs {
-    /// Directory to copy formatter artifacts into. Relative paths resolve
+    /// Directory to copy tool artifacts into. Relative paths resolve
     /// against the repo root.
     #[arg(long, default_value = "config/bin")]
     pub dir: PathBuf,
@@ -78,7 +78,7 @@ pub struct VendorArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum CacheCmd {
-    /// List cached formatter artifacts.
+    /// List cached tool artifacts.
     List,
     /// Remove cached artifacts not referenced by the current config.
     Prune(PruneArgs),

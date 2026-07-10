@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE: &str = ".kempt.toml";
 
-/// Where a tool's binary comes from after applying the rules in `[ktfmt]` /
-/// `[gjf]`.
+/// Where a tool's binary comes from after applying the rules in its config
+/// section.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolSource {
     /// Download `version` into the user cache.
@@ -32,7 +32,7 @@ pub struct VersionRef {
     /// Path to a catalog TOML, relative to repo root or absolute.
     pub file: PathBuf,
     /// Lookup key under the catalog's `[versions]` table. Defaults to the
-    /// tool name (`ktfmt` or `gjf`).
+    /// tool name (`ktfmt`, `gjf`, or `detekt`).
     pub key: Option<String>,
 }
 
@@ -133,6 +133,7 @@ impl VersionSpec {
 pub struct Config {
     pub ktfmt: Option<Ktfmt>,
     pub gjf: Option<Gjf>,
+    pub detekt: Option<Detekt>,
     pub rustfmt: Option<Rustfmt>,
     pub license_header: Option<LicenseHeader>,
     #[serde(default)]
@@ -141,6 +142,230 @@ pub struct Config {
     pub whitespace: Whitespace,
     #[serde(default)]
     pub hook: Hook,
+}
+
+/// A list of filesystem paths. Inline values are paths themselves; a string
+/// points to a text file containing one path per line (`#` comments allowed).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum PathList {
+    Inline(Vec<PathBuf>),
+    FromFile(PathBuf),
+}
+
+impl PathList {
+    pub fn resolve(&self, repo_root: &Path) -> Result<Vec<PathBuf>> {
+        let paths = match self {
+            Self::Inline(paths) => paths.clone(),
+            Self::FromFile(path) => {
+                let abs = resolve_path(repo_root, path);
+                let contents = std::fs::read_to_string(&abs)
+                    .with_context(|| format!("read path list {}", abs.display()))?;
+                contents
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(PathBuf::from)
+                    .collect()
+            }
+        };
+        Ok(paths
+            .into_iter()
+            .map(|path| resolve_path(repo_root, &path))
+            .collect())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Detekt {
+    /// GitHub release version. Mutually exclusive with `path`.
+    pub version: Option<VersionSpec>,
+    /// Path to a local detekt CLI jar or executable. Mutually exclusive with
+    /// `version`.
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub configs: Vec<PathBuf>,
+    #[serde(default)]
+    pub config_resources: Vec<String>,
+    pub baseline: Option<PathBuf>,
+    #[serde(default)]
+    pub build_upon_default_config: bool,
+    #[serde(default)]
+    pub plugins: Vec<PathBuf>,
+    #[serde(default)]
+    pub reports: Vec<String>,
+    pub paths: Option<ToolPaths>,
+    pub classpath: Option<PathList>,
+    pub jvm_target: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub targets: Vec<DetektTarget>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct DetektTarget {
+    pub name: String,
+    pub configs: Option<Vec<PathBuf>>,
+    pub config_resources: Option<Vec<String>>,
+    pub baseline: Option<PathBuf>,
+    pub build_upon_default_config: Option<bool>,
+    pub plugins: Option<Vec<PathBuf>>,
+    pub reports: Option<Vec<String>>,
+    pub paths: Option<ToolPaths>,
+    pub classpath: Option<PathList>,
+    pub jvm_target: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDetektTarget {
+    pub name: String,
+    pub configs: Vec<PathBuf>,
+    pub config_resources: Vec<String>,
+    pub baseline: Option<PathBuf>,
+    pub build_upon_default_config: bool,
+    pub plugins: Vec<PathBuf>,
+    pub reports: Vec<String>,
+    pub paths: ResolvedPaths,
+    pub classpath: Vec<PathBuf>,
+    pub jvm_target: Option<String>,
+    pub args: Vec<String>,
+}
+
+impl Detekt {
+    pub fn source(&self, repo_root: &Path) -> ToolSource {
+        resolve_source(
+            self.version.as_ref().map(VersionSpec::as_literal),
+            self.path.as_deref(),
+            repo_root,
+        )
+    }
+
+    pub fn resolve_targets(&self, repo_root: &Path) -> Result<Vec<ResolvedDetektTarget>> {
+        if self.targets.is_empty() {
+            return Ok(vec![self.resolve_target(repo_root, None)?]);
+        }
+        self.targets
+            .iter()
+            .map(|target| self.resolve_target(repo_root, Some(target)))
+            .collect()
+    }
+
+    fn resolve_target(
+        &self,
+        repo_root: &Path,
+        target: Option<&DetektTarget>,
+    ) -> Result<ResolvedDetektTarget> {
+        let paths = target
+            .and_then(|target| target.paths.clone())
+            .or_else(|| self.paths.clone())
+            .unwrap_or_default()
+            .resolve_with_defaults(repo_root, &["**/*.kt", "**/*.kts"], &[])?;
+        let classpath = match target
+            .and_then(|target| target.classpath.as_ref())
+            .or(self.classpath.as_ref())
+        {
+            Some(classpath) => classpath.resolve(repo_root)?,
+            None => Vec::new(),
+        };
+        let jvm_target = target
+            .and_then(|target| target.jvm_target.clone())
+            .or_else(|| self.jvm_target.clone());
+        if !classpath.is_empty() && jvm_target.is_none() {
+            let name = target
+                .map(|target| target.name.as_str())
+                .unwrap_or("default");
+            return Err(anyhow!(
+                "[detekt] target `{name}` sets `classpath` but not `jvm-target`"
+            ));
+        }
+
+        let mut args = self.args.clone();
+        if let Some(target) = target {
+            args.extend(target.args.clone());
+        }
+        validate_detekt_args(&args)?;
+
+        Ok(ResolvedDetektTarget {
+            name: target
+                .map(|target| target.name.clone())
+                .unwrap_or_else(|| "default".to_string()),
+            configs: resolve_paths(
+                repo_root,
+                target
+                    .and_then(|target| target.configs.as_ref())
+                    .unwrap_or(&self.configs),
+            ),
+            config_resources: target
+                .and_then(|target| target.config_resources.clone())
+                .unwrap_or_else(|| self.config_resources.clone()),
+            baseline: target
+                .and_then(|target| target.baseline.clone())
+                .or_else(|| self.baseline.clone())
+                .map(|path| resolve_path(repo_root, &path)),
+            build_upon_default_config: target
+                .and_then(|target| target.build_upon_default_config)
+                .unwrap_or(self.build_upon_default_config),
+            plugins: resolve_paths(
+                repo_root,
+                target
+                    .and_then(|target| target.plugins.as_ref())
+                    .unwrap_or(&self.plugins),
+            ),
+            reports: target
+                .and_then(|target| target.reports.clone())
+                .unwrap_or_else(|| self.reports.clone()),
+            paths,
+            classpath,
+            jvm_target,
+            args,
+        })
+    }
+}
+
+fn validate_detekt_args(args: &[String]) -> Result<()> {
+    const OWNED: &[&str] = &[
+        "--input",
+        "-i",
+        "--config",
+        "-c",
+        "--config-resource",
+        "-cr",
+        "--classpath",
+        "-cp",
+        "--plugins",
+        "-p",
+        "--baseline",
+        "-b",
+        "--report",
+        "-r",
+        "--base-path",
+        "-bp",
+        "--jvm-target",
+        "--analysis-mode",
+        "--auto-correct",
+        "-ac",
+        "--create-baseline",
+        "-cb",
+    ];
+    if let Some(arg) = args.iter().find(|arg| {
+        OWNED.iter().any(|owned| {
+            arg == owned
+                || (owned.starts_with("--")
+                    && arg
+                        .strip_prefix(owned)
+                        .is_some_and(|suffix| suffix.starts_with('=')))
+        })
+    }) {
+        return Err(anyhow!(
+            "[detekt].args cannot set Kempt-owned option `{arg}`"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -268,7 +493,7 @@ pub struct ResolvedHeader {
 
 /// Universal path filter applied before any tool-specific scope. Currently
 /// only excludes are configurable here; per-language inclusion lives in
-/// `[ktfmt.paths]`, `[gjf.paths]`, `[rustfmt.paths]`, and
+/// `[ktfmt.paths]`, `[gjf.paths]`, `[detekt.paths]`, `[rustfmt.paths]`, and
 /// `[whitespace.paths]`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -395,6 +620,13 @@ impl Config {
         if let Some(g) = &self.gjf {
             validate_source_xor(g.version.as_ref(), g.path.as_deref(), "gjf")?;
         }
+        if let Some(detekt) = &self.detekt {
+            validate_source_xor(detekt.version.as_ref(), detekt.path.as_deref(), "detekt")?;
+            validate_detekt_args(&detekt.args)?;
+            for target in &detekt.targets {
+                validate_detekt_args(&target.args)?;
+            }
+        }
         Ok(())
     }
 
@@ -415,6 +647,12 @@ impl Config {
             if let Some(VersionSpec::Ref(r)) = g.version.clone() {
                 let v = resolve_catalog_ref(&r, repo_root, "gjf", &mut cache)?;
                 g.version = Some(VersionSpec::Literal(v));
+            }
+        }
+        if let Some(detekt) = &mut self.detekt {
+            if let Some(VersionSpec::Ref(r)) = detekt.version.clone() {
+                let v = resolve_catalog_ref(&r, repo_root, "detekt", &mut cache)?;
+                detekt.version = Some(VersionSpec::Literal(v));
             }
         }
         Ok(self)
@@ -464,6 +702,21 @@ fn resolve_source(version: Option<&str>, path: Option<&Path>, repo_root: &Path) 
     } else {
         ToolSource::Cached(version.expect("validated").to_string())
     }
+}
+
+fn resolve_path(repo_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    }
+}
+
+fn resolve_paths(repo_root: &Path, paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .map(|path| resolve_path(repo_root, path))
+        .collect()
 }
 
 struct ParsedCatalog {
@@ -1415,5 +1668,133 @@ mod tests {
         .resolve_catalogs(dir.path())
         .unwrap();
         assert_eq!(c.ktfmt.unwrap().version.unwrap().as_literal(), "0.62");
+    }
+
+    #[test]
+    fn detekt_simple_config_resolves_default_light_target() {
+        let c = Config::parse(
+            r#"
+            [detekt]
+            version = "2.0.0-alpha.5"
+            configs = ["config/detekt.yml"]
+            build-upon-default-config = true
+
+            [detekt.paths]
+            exclude = ["**/generated/**"]
+        "#,
+        )
+        .unwrap();
+        let targets = c
+            .detekt
+            .unwrap()
+            .resolve_targets(Path::new("/repo"))
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "default");
+        assert_eq!(
+            targets[0].configs,
+            vec![PathBuf::from("/repo/config/detekt.yml")]
+        );
+        assert!(targets[0].classpath.is_empty());
+        assert_eq!(targets[0].paths.include, vec!["**/*.kt", "**/*.kts"]);
+        assert_eq!(targets[0].paths.exclude, vec!["**/generated/**"]);
+    }
+
+    #[test]
+    fn detekt_targets_can_override_config_and_classpath() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "config/main-classpath.txt",
+            "build/classes\n# comment\nlibs/dependency.jar\n",
+        );
+        let c = Config::parse(
+            r#"
+            [detekt]
+            version = "2.0.0-alpha.5"
+            configs = ["config/shared.yml"]
+
+            [[detekt.targets]]
+            name = "main"
+            classpath = "config/main-classpath.txt"
+            jvm-target = "17"
+            paths = { include = ["app/src/main/**/*.kt"] }
+
+            [[detekt.targets]]
+            name = "scripts"
+            configs = ["config/scripts.yml"]
+            paths = { include = ["**/*.kts"] }
+        "#,
+        )
+        .unwrap();
+        let targets = c.detekt.unwrap().resolve_targets(dir.path()).unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].name, "main");
+        assert_eq!(targets[0].jvm_target.as_deref(), Some("17"));
+        assert_eq!(targets[0].classpath.len(), 2);
+        assert!(targets[0].classpath[0].ends_with("build/classes"));
+        assert!(targets[1].classpath.is_empty());
+        assert!(targets[1].configs[0].ends_with("config/scripts.yml"));
+    }
+
+    #[test]
+    fn detekt_classpath_requires_jvm_target() {
+        let c = Config::parse(
+            r#"
+            [detekt]
+            version = "1.23.8"
+            classpath = ["build/classes"]
+        "#,
+        )
+        .unwrap();
+        let err = c
+            .detekt
+            .unwrap()
+            .resolve_targets(Path::new("/repo"))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("jvm-target"));
+    }
+
+    #[test]
+    fn detekt_args_reject_kempt_owned_inputs() {
+        let err = Config::parse(
+            r#"
+            [detekt]
+            version = "1.23.8"
+            args = ["--input", "src"]
+        "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("Kempt-owned"));
+
+        let err = Config::parse(
+            r#"
+            [detekt]
+            version = "2.0.0-alpha.5"
+            args = ["--analysis-mode=full"]
+        "#,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("Kempt-owned"));
+    }
+
+    #[test]
+    fn detekt_version_resolves_from_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "catalog.toml",
+            "[versions]\ndetekt = \"1.23.8\"\n",
+        );
+        let c = Config::parse(
+            r#"
+            [detekt]
+            version = { file = "catalog.toml" }
+        "#,
+        )
+        .unwrap()
+        .resolve_catalogs(dir.path())
+        .unwrap();
+        assert_eq!(c.detekt.unwrap().version.unwrap().as_literal(), "1.23.8");
     }
 }
