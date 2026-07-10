@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Add detekt 1.x/2.x static-analysis support to `kempt check` and the
+  pre-commit hook, including per-target configs/classpaths and managed
+  download, vendor, cache, and upgrade flows.
+
 ## [0.2.1]
 
 _2026-07-07_

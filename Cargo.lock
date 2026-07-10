@@ -328,6 +328,7 @@ dependencies = [
  "clap",
  "globset",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
  "toml_edit",

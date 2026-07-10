@@ -4,6 +4,7 @@ mod cache;
 mod cli;
 mod commands;
 mod config;
+mod detekt;
 mod formatters;
 mod git;
 mod hook;
@@ -20,6 +21,7 @@ use cli::{CacheCmd, Cli, Cmd, Discovery};
 use config::Config;
 use git::{GitContext, RealGit};
 use paths::Scope;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -87,7 +89,7 @@ fn run_vendor_subcommand(config_path: Option<PathBuf>, dir: PathBuf) -> Result<E
     let outcome = commands::run_vendor(&config, git.root(), &cache, &dl, &dir)?;
 
     if outcome.entries.is_empty() && outcome.skipped.is_empty() {
-        println!("kempt: nothing to vendor (no [ktfmt] or [gjf] in config)");
+        println!("kempt: nothing to vendor (no [ktfmt], [gjf], or [detekt] in config)");
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -340,6 +342,13 @@ fn print_check_outcome(out: &commands::FormatOutcome, ctx: commands::CheckContex
     }
     if !out.parse_errors.is_empty() {
         eprintln!("{}", out.parse_errors);
+    }
+    if !out.analysis_stdout.is_empty() {
+        println!("{}", out.analysis_stdout);
+    }
+    let _ = std::io::stdout().flush();
+    if !out.analysis_stderr.is_empty() {
+        eprintln!("{}", out.analysis_stderr);
     }
     let summary = commands::render_check_summary(out, ctx);
     if !summary.is_empty() {

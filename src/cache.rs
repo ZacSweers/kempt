@@ -3,8 +3,8 @@
 //! Binary cache management.
 //!
 //! Cached files are version-suffixed so repos with different pins coexist:
-//! `ktfmt-<version>.jar`, `gjf-<version>.jar`, and native gjf binaries named
-//! `gjf-<version>-<asset>[.exe]`.
+//! `ktfmt-<version>.jar`, `gjf-<version>.jar`, `detekt-<version>.jar`, and
+//! native gjf binaries named `gjf-<version>-<asset>[.exe]`.
 //!
 //! Downloads are abstracted behind [`Downloader`] so tests can fake them.
 
@@ -21,6 +21,9 @@ pub const GJF_URL: &str =
 
 pub const GJF_NATIVE_URL: &str =
     "https://github.com/google/google-java-format/releases/download/v{v}/google-java-format_{asset}{ext}";
+
+pub const DETEKT_URL: &str =
+    "https://github.com/detekt/detekt/releases/download/v{v}/detekt-cli-{v}-all.jar";
 
 /// gjf's published native asset for a particular `(os, arch)` combo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +163,10 @@ impl Cache {
         self.root.join(format!("gjf-{version}.jar"))
     }
 
+    pub fn detekt_path(&self, version: &str) -> PathBuf {
+        self.root.join(format!("detekt-{version}.jar"))
+    }
+
     /// Path for the gjf native binary on the given platform asset.
     pub fn gjf_native_path(&self, version: &str, asset: &NativeAsset) -> PathBuf {
         self.root
@@ -177,6 +184,12 @@ impl Cache {
     pub fn ensure_gjf_jar(&self, version: &str, downloader: &dyn Downloader) -> Result<PathBuf> {
         let dest = self.gjf_jar_path(version);
         let url = GJF_URL.replace("{v}", version);
+        self.ensure(&dest, &url, downloader)
+    }
+
+    pub fn ensure_detekt(&self, version: &str, downloader: &dyn Downloader) -> Result<PathBuf> {
+        let dest = self.detekt_path(version);
+        let url = DETEKT_URL.replace("{v}", version);
         self.ensure(&dest, &url, downloader)
     }
 
@@ -262,6 +275,9 @@ impl Cache {
 
 fn is_kempt_artifact_name(name: &str) -> bool {
     if let Some(rest) = name.strip_prefix("ktfmt-") {
+        return starts_with_digit(rest) && rest.ends_with(".jar");
+    }
+    if let Some(rest) = name.strip_prefix("detekt-") {
         return starts_with_digit(rest) && rest.ends_with(".jar");
     }
     let Some(rest) = name.strip_prefix("gjf-") else {
@@ -367,6 +383,10 @@ mod tests {
         let c = Cache::new(PathBuf::from("/c"));
         assert_eq!(c.ktfmt_path("0.56"), PathBuf::from("/c/ktfmt-0.56.jar"));
         assert_eq!(c.gjf_jar_path("1.28.0"), PathBuf::from("/c/gjf-1.28.0.jar"));
+        assert_eq!(
+            c.detekt_path("2.0.0-alpha.5"),
+            PathBuf::from("/c/detekt-2.0.0-alpha.5.jar")
+        );
     }
 
     #[test]
@@ -408,6 +428,17 @@ mod tests {
         assert!(calls[0]
             .0
             .contains("google-java-format-1.28.0-all-deps.jar"));
+    }
+
+    #[test]
+    fn ensure_detekt_uses_release_fat_jar() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        let dl = FakeDownloader::new(b"x".to_vec());
+        cache.ensure_detekt("2.0.0-alpha.5", &dl).unwrap();
+        let calls = dl.calls.borrow();
+        assert!(calls[0].0.contains("/v2.0.0-alpha.5/"));
+        assert!(calls[0].0.ends_with("detekt-cli-2.0.0-alpha.5-all.jar"));
     }
 
     #[test]
@@ -538,8 +569,9 @@ mod tests {
         let dl = FakeDownloader::new(b"abcdef".to_vec());
         cache.ensure_ktfmt("0.56", &dl).unwrap();
         cache.ensure_gjf_jar("1.28.0", &dl).unwrap();
+        cache.ensure_detekt("1.23.8", &dl).unwrap();
         let entries = cache.list_entries().unwrap();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         for e in &entries {
             assert_eq!(e.size, 6);
         }

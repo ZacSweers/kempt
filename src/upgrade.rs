@@ -11,6 +11,7 @@
 //! preserved.
 
 use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
 use std::path::Path;
 use toml_edit::DocumentMut;
 
@@ -34,6 +35,7 @@ pub struct Change {
 pub trait VersionFetcher {
     fn latest_ktfmt(&self) -> Result<String>;
     fn latest_gjf(&self) -> Result<String>;
+    fn latest_detekt(&self, current: &str) -> Result<String>;
 }
 
 pub struct UreqVersionFetcher;
@@ -65,6 +67,48 @@ impl VersionFetcher for UreqVersionFetcher {
             .ok_or_else(|| anyhow!("could not find `tag_name` in GitHub response from {url}"))?;
         Ok(tag.trim_start_matches('v').to_string())
     }
+
+    fn latest_detekt(&self, current: &str) -> Result<String> {
+        let url = "https://api.github.com/repos/detekt/detekt/releases?per_page=100";
+        let body = ureq::get(url)
+            .header("User-Agent", "kempt")
+            .header("Accept", "application/vnd.github+json")
+            .call()
+            .with_context(|| format!("GET {url}"))?
+            .into_body()
+            .read_to_string()
+            .context("read detekt releases body")?;
+        let releases: Vec<GitHubRelease> =
+            serde_json::from_str(&body).context("parse detekt releases response")?;
+        select_detekt_release(current, &releases)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    draft: bool,
+}
+
+fn select_detekt_release(current: &str, releases: &[GitHubRelease]) -> Result<String> {
+    let current = current.trim_start_matches('v');
+    let current_major = current
+        .split('.')
+        .next()
+        .ok_or_else(|| anyhow!("invalid detekt version `{current}`"))?;
+    let release = if current.contains('-') {
+        releases.iter().find(|release| {
+            !release.draft
+                && release.tag_name.trim_start_matches('v').split('.').next() == Some(current_major)
+        })
+    } else {
+        releases.iter().find(|release| {
+            !release.draft && !release.tag_name.trim_start_matches('v').contains('-')
+        })
+    };
+    release
+        .map(|release| release.tag_name.trim_start_matches('v').to_string())
+        .ok_or_else(|| anyhow!("could not find a compatible detekt release for `{current}`"))
 }
 
 fn extract_xml_tag(body: &str, tag: &str) -> Option<String> {
@@ -102,8 +146,11 @@ pub fn run_upgrade(
 
     let mut outcome = UpgradeOutcome::default();
 
-    upgrade_section(&mut doc, "ktfmt", &mut outcome, || fetcher.latest_ktfmt())?;
-    upgrade_section(&mut doc, "gjf", &mut outcome, || fetcher.latest_gjf())?;
+    upgrade_section(&mut doc, "ktfmt", &mut outcome, |_| fetcher.latest_ktfmt())?;
+    upgrade_section(&mut doc, "gjf", &mut outcome, |_| fetcher.latest_gjf())?;
+    upgrade_section(&mut doc, "detekt", &mut outcome, |current| {
+        fetcher.latest_detekt(current)
+    })?;
 
     if !dry_run && !outcome.changes.is_empty() {
         std::fs::write(config_path, doc.to_string())
@@ -116,7 +163,7 @@ fn upgrade_section(
     doc: &mut DocumentMut,
     tool: &'static str,
     outcome: &mut UpgradeOutcome,
-    fetch: impl FnOnce() -> Result<String>,
+    fetch: impl FnOnce(&str) -> Result<String>,
 ) -> Result<()> {
     let Some(item) = doc.get(tool) else {
         // Section not configured at all; nothing to upgrade.
@@ -140,7 +187,7 @@ fn upgrade_section(
         return Ok(());
     };
     let current = current.to_string();
-    let latest = fetch().with_context(|| format!("fetch latest {tool} version"))?;
+    let latest = fetch(&current).with_context(|| format!("fetch latest {tool} version"))?;
     if latest == current {
         outcome.already_current.push(tool);
         return Ok(());
@@ -175,6 +222,7 @@ mod tests {
     struct FakeFetcher {
         ktfmt: Result<String>,
         gjf: Result<String>,
+        detekt: Result<String>,
     }
 
     impl FakeFetcher {
@@ -182,6 +230,7 @@ mod tests {
             Self {
                 ktfmt: Ok(ktfmt.to_string()),
                 gjf: Ok(gjf.to_string()),
+                detekt: Ok("1.23.8".to_string()),
             }
         }
     }
@@ -195,6 +244,12 @@ mod tests {
         }
         fn latest_gjf(&self) -> Result<String> {
             self.gjf
+                .as_ref()
+                .map(String::clone)
+                .map_err(|e| anyhow!("{e}"))
+        }
+        fn latest_detekt(&self, _current: &str) -> Result<String> {
+            self.detekt
                 .as_ref()
                 .map(String::clone)
                 .map_err(|e| anyhow!("{e}"))
@@ -306,6 +361,38 @@ style = \"google\"
         assert_eq!(outcome.changes.len(), 1);
         // No skip noise for an absent section.
         assert!(outcome.skipped.is_empty());
+    }
+
+    #[test]
+    fn upgrades_detekt_without_crossing_back_from_v2_prereleases() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_config(dir.path(), "[detekt]\nversion = \"2.0.0-alpha.3\"\n");
+        let mut fetcher = FakeFetcher::new("0.62", "1.35.0");
+        fetcher.detekt = Ok("2.0.0-alpha.5".into());
+        let outcome = run_upgrade(&p, &fetcher, false).unwrap();
+        assert_eq!(outcome.changes.len(), 1);
+        assert_eq!(outcome.changes[0].tool, "detekt");
+        assert!(std::fs::read_to_string(p)
+            .unwrap()
+            .contains("2.0.0-alpha.5"));
+    }
+
+    #[test]
+    fn detekt_release_selection_preserves_prerelease_major() {
+        let releases = vec![
+            GitHubRelease {
+                tag_name: "v1.23.8".into(),
+                draft: false,
+            },
+            GitHubRelease {
+                tag_name: "v2.0.0-alpha.5".into(),
+                draft: false,
+            },
+        ];
+        assert_eq!(
+            select_detekt_release("2.0.0-alpha.3", &releases).unwrap(),
+            "2.0.0-alpha.5"
+        );
     }
 
     // --- extract helpers ---

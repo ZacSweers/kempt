@@ -1,16 +1,16 @@
 # kempt
 
-A pre-commit-friendly multi-language source formatting pipeline. It runs
-language formatters, inserts license headers, and normalizes trailing
-whitespace. Configured per repo via `.kempt.toml`.
+A pre-commit-friendly source formatting and analysis pipeline. It runs language
+formatters, inserts license headers, normalizes trailing whitespace, and can run
+detekt for Kotlin static analysis. Configured per repo via `.kempt.toml`.
 
 Supported targets:
 
-| Language | Extensions    | Formatter                                                          | Config section |
-|----------|---------------|--------------------------------------------------------------------|----------------|
-| Kotlin   | `.kt`, `.kts` | [ktfmt](https://github.com/facebook/ktfmt)                         | `[ktfmt]`      |
-| Java     | `.java`       | [google-java-format](https://github.com/google/google-java-format) | `[gjf]`        |
-| Rust     | `.rs`         | `cargo fmt`                                                        | `[rustfmt]`    |
+| Language | Extensions    | Formatter                                                          | Analyzer                                        | Config sections       |
+|----------|---------------|--------------------------------------------------------------------|-------------------------------------------------|-----------------------|
+| Kotlin   | `.kt`, `.kts` | [ktfmt](https://github.com/facebook/ktfmt)                         | [detekt](https://github.com/detekt/detekt)      | `[ktfmt]`, `[detekt]` |
+| Java     | `.java`       | [google-java-format](https://github.com/google/google-java-format) | -                                               | `[gjf]`               |
+| Rust     | `.rs`         | `cargo fmt`                                                        | -                                               | `[rustfmt]`           |
 
 ## Install
 
@@ -39,7 +39,8 @@ cargo install kempt-fmt
 
 ### Notes
 
-A working `java` (JDK 17+) on `PATH` is required to run ktfmt and gjf (unless using `native`).
+A working `java` (JDK 17+) on `PATH` is required to run ktfmt, detekt jars, and
+gjf (unless using `native`).
 A working `cargo fmt` on `PATH` is required when `[rustfmt]` is enabled.
 
 ## Quick start
@@ -60,6 +61,9 @@ source files, skipping gen/vcs dirs like `.git`, `build`, `target`, and
 - `[gjf]` only when Java files exist
 - `[rustfmt]` only when Rust files exist.
 
+`[detekt]` is never emitted automatically, even when Kotlin sources are found.
+Static analysis must be enabled explicitly in `.kempt.toml`.
+
 An empty repo gets all formatter sections. The versions
 written into the starter are the latest available at the time kempt was built;
 an automated workflow keeps them current.
@@ -69,7 +73,7 @@ By default, `kempt init` does not configure license headers. Pass
 `[license-header]` in the starter config.
 
 `kempt check` is the read-only variant. It exits non-zero if any file _would_
-change. That's what you want in CI formatting checks.
+change or detekt reports findings. That's what you want in CI.
 
 ## Configuration
 
@@ -87,6 +91,12 @@ style = "google"           # google | aosp
 native = "auto"            # auto | always | never
 
 [rustfmt]
+
+[detekt]
+version = "2.0.0-alpha.5"
+configs = ["config/detekt/detekt.yml"]
+baseline = "config/detekt/baseline.xml"
+build-upon-default-config = true
 
 [license-header]
 file = "config/license-header.txt"             # supports ${YEAR}
@@ -123,6 +133,9 @@ exclude = ["**/*Generated.java"]
 [rustfmt.paths]
 # defaults: include = ["**/*.rs"], exclude = []
 
+[detekt.paths]
+# defaults: include = ["**/*.kt", "**/*.kts"], exclude = []
+
 [whitespace.paths]
 # defaults: include = ["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"], exclude = []
 
@@ -133,6 +146,58 @@ final-newline = true    # ensure files end with one trailing newline
 [hook]
 mode = "format"            # format | check
 ```
+
+### Detekt
+
+Detekt is an analyzer, not a formatter in Kempt. `kempt check` and
+`kempt hook` run it; a normal `kempt format` does not. Findings use detekt's
+normal console output and fail the command without being reported as formatting
+changes. Kempt supports both detekt 1.x and 2.x CLI argument conventions.
+
+The simple `[detekt]` section runs one analysis over its matching paths. It
+accepts a cached `version` or local jar/executable `path`, plus `configs`,
+`config-resources`, `baseline`, `plugins`, `reports`, and
+`build-upon-default-config`. `args` is an escape hatch for other read-only
+detekt options; Kempt rejects arguments that would replace its managed inputs,
+configs, classpath, reports, or enable auto-correction/baseline creation.
+
+Without a classpath, detekt runs light analysis. Type-resolved projects must
+provide both `classpath` and `jvm-target`:
+
+```toml
+[detekt]
+version = "2.0.0-alpha.5"
+configs = ["config/detekt/detekt.yml"]
+classpath = "config/detekt/classpath.txt"
+jvm-target = "17"
+```
+
+`classpath` accepts an inline path array or a text file containing one path per
+line. Relative paths resolve against the repo root.
+
+Projects with module/source-set-specific configs or classpaths can define
+targets. Top-level detekt values are inherited unless the target overrides
+them:
+
+```toml
+[detekt]
+version = "2.0.0-alpha.5"
+configs = ["config/detekt/detekt.yml"]
+
+[[detekt.targets]]
+name = "app-main"
+classpath = "config/detekt/app-main-classpath.txt"
+jvm-target = "17"
+paths = { include = ["app/src/main/**/*.kt"] }
+
+[[detekt.targets]]
+name = "scripts"
+configs = ["config/detekt/scripts.yml"]
+paths = { include = ["**/*.kts"] }
+```
+
+Each non-empty target is one detekt invocation, preserving its own analysis
+context instead of combining incompatible module classpaths.
 
 When configured, the license header file is a literal template. `${YEAR}` is
 expanded at write-time.
@@ -174,6 +239,7 @@ defaults so you only configure these when you need to narrow further:
 | `[ktfmt.paths]`      | `["**/*.kt", "**/*.kts"]`                         | `[]`            |
 | `[gjf.paths]`        | `["**/*.java"]`                                   | `[]`            |
 | `[rustfmt.paths]`    | `["**/*.rs"]`                                     | `[]`            |
+| `[detekt.paths]`     | `["**/*.kt", "**/*.kts"]`                         | `[]`            |
 | `[whitespace.paths]` | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | `[]`            |
 
 The global `[paths].exclude` is applied first as a universal filter; each
@@ -266,6 +332,20 @@ default; the section that contains it is what enables the feature."
 | `[gjf.paths].exclude`               | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
 | `[gjf.license-header].file`         | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
 | `[gjf.license-header].excludes`     | none                                              | Path to a glob list.                                                                                                     |
+| `[detekt].version`                  | -                                                 | GitHub release version or catalog reference. Mutually exclusive with `path`.                                             |
+| `[detekt].path`                     | -                                                 | Local detekt CLI jar or executable. Mutually exclusive with `version`.                                                    |
+| `[detekt].configs`                  | `[]`                                              | Config file paths, applied in order.                                                                                     |
+| `[detekt].config-resources`         | `[]`                                              | Config resources available from detekt's classpath.                                                                      |
+| `[detekt].baseline`                 | none                                              | Existing detekt baseline XML.                                                                                            |
+| `[detekt].build-upon-default-config`| `false`                                           | Start from detekt's default configuration before applying `configs`.                                                     |
+| `[detekt].plugins`                  | `[]`                                              | Custom rule/report plugin jars.                                                                                          |
+| `[detekt].reports`                  | `[]`                                              | Report specifications such as `"sarif:build/reports/detekt.sarif"`.                                                     |
+| `[detekt].classpath`                | none                                              | Inline paths or a path-list file. Requires `jvm-target`; enables full analysis.                                          |
+| `[detekt].jvm-target`               | none                                              | JVM bytecode target used with `classpath`.                                                                               |
+| `[detekt].args`                     | `[]`                                              | Additional non-mutating detekt CLI arguments. Kempt-owned arguments are rejected.                                        |
+| `[detekt.paths].include`            | `["**/*.kt", "**/*.kts"]`                         | Inline array or path to a glob-list file.                                                                                |
+| `[detekt.paths].exclude`            | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
+| `[[detekt.targets]]`                | none                                              | Named per-invocation overrides for paths, config, classpath, plugins, reports, and args.                                 |
 | `[rustfmt.paths].include`           | `["**/*.rs"]`                                     | Inline array or path to a glob-list file.                                                                                |
 | `[rustfmt.paths].exclude`           | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
 | `[rustfmt.license-header].file`     | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
@@ -278,7 +358,7 @@ default; the section that contains it is what enables the feature."
 | `[whitespace.paths].exclude`        | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
 | `[hook].mode`                       | `"format"`                                        | `format` formats and re-stages. `check` fails the commit if changes are needed.                                          |
 
-Sections that are entirely optional: `[ktfmt]`, `[gjf]`, `[rustfmt]`,
+Sections that are entirely optional: `[ktfmt]`, `[gjf]`, `[detekt]`, `[rustfmt]`,
 `[license-header]`, `[ktfmt.license-header]`, `[gjf.license-header]`,
 `[rustfmt.license-header]`.
 Omitting a section disables that step. `[paths]`, `[whitespace]`, and
@@ -289,13 +369,13 @@ Omitting a section disables that step. `[paths]`, `[whitespace]`, and
 | Command              | Behavior                                                                                                                                 |
 |----------------------|------------------------------------------------------------------------------------------------------------------------------------------|
 | `kempt format`       | Format files in place.                                                                                                                   |
-| `kempt check`        | Dry-run; exits non-zero if changes are needed. Suitable for CI.                                                                          |
+| `kempt check`        | Check formatting and run configured analyzers; exits non-zero for required changes or findings. Suitable for CI.                       |
 | `kempt init`         | Scaffold `.kempt.toml`. Detects `.kt`/`.java`/`.rs` to decide which sections to write.                                                   |
 | `kempt install-hook` | Write a `.git/hooks/pre-commit` that calls `kempt hook`.                                                                                 |
 | `kempt hook`         | Run as the pre-commit hook. Not normally invoked manually.                                                                               |
-| `kempt update`       | Download formatter artifacts per config. Pre-warms the cache.                                                                            |
+| `kempt update`       | Download configured formatter/analyzer artifacts. Pre-warms the cache.                                                                  |
 | `kempt upgrade`      | Bump tool versions in `.kempt.toml` to the latest upstream release. Preserves comments and formatting. `--dry-run` previews.             |
-| `kempt vendor`       | Download and copy formatter binaries into the repo for check-in (default dir `config/bin/`). Prints the `path = "..."` snippet to paste. |
+| `kempt vendor`       | Download and copy tool binaries into the repo for check-in (default dir `config/bin/`). Prints the `path = "..."` snippet to paste.      |
 | `kempt cache list`   | Show cached artifacts and their sizes.                                                                                                   |
 | `kempt cache prune`  | Remove cached artifacts not referenced by `.kempt.toml`.                                                                                 |
 
@@ -343,6 +423,8 @@ followed by an actionable trailer that's tailored to scope and content:
   above, then run `kempt format` for the rest."
 - Pure parse errors: trailer says formatting can't proceed until they're
   fixed.
+- Detekt findings: preserves detekt's diagnostics and reports that analysis
+  failed without suggesting `kempt format` as a fix.
 
 ktfmt/gjf parse errors are surfaced with their file:line:col message; JVM
 deprecation warnings are filtered out, so the actual error is what you read.
@@ -380,9 +462,10 @@ The hook does, in order:
    1. Stage the rest
    2. `git stash --keep-index`
    3. Commit with `--no-verify`.
-3. Run the full pipeline (license headers, whitespace, ktfmt, gjf, cargo fmt).
+3. Run the formatting pipeline (license headers, whitespace, ktfmt, gjf, cargo fmt).
 4. `git add --force` the formatted files back to the index (--force so tracked files
    inside ignored directories can still be re-staged).
+5. Run detekt over matching staged paths, when configured.
 
 Set `[hook] mode = "check"` to make the hook fail on any required change
 instead of formatting in place.
@@ -402,6 +485,11 @@ be enabled explicitly:
 kempt formats the staged content and updates the index directly, without
 staging unrelated worktree hunks. Other partially staged files still use the
 refusal path above.
+
+Detekt is read-only and never enters the re-staging path. For staged scopes it
+receives the staged path list, but like other external checks it reads those
+paths from the working tree. Exact staged-blob analysis would require a
+temporary mirrored source tree and is not currently attempted.
 
 ## CI
 
@@ -484,7 +572,7 @@ For reference, the reusable action is equivalent to these steps:
 it out makes the failure mode (network down vs. real format error) easier to
 read in CI logs. Set `update: false` to skip that pre-warm step.
 
-## Versioning the formatter binaries
+## Versioning tool binaries
 
 Pin `version = "..."` in each tool's section. The cache is version-suffixed,
 so multiple repos with different pins coexist without re-downloading. To
@@ -520,10 +608,13 @@ version = { file = "gradle/libs.versions.toml", key = "ktfmt" }
 
 [gjf]
 version = { file = "gradle/libs.versions.toml" }   # key defaults to "gjf"
+
+[detekt]
+version = { file = "gradle/libs.versions.toml" }  # key defaults to "detekt"
 ```
 
 kempt resolves the reference by reading the catalog's `[versions]` table
-at startup. The `key` field defaults to the tool name (`ktfmt` or `gjf`)
+at startup. The `key` field defaults to the tool name (`ktfmt`, `gjf`, or `detekt`)
 so the common case is even shorter:
 
 ```toml
@@ -537,7 +628,7 @@ Resolution rules:
   versions (`{ strictly = "1.0", require = "..." }`) error with a clear
   message.
 - The catalog file is parsed at most once per kempt invocation, even if
-  both `[ktfmt]` and `[gjf]` reference the same file.
+  several tool sections reference the same file.
 
 This works well with **Dependabot**, which doesn't natively understand
 `.kempt.toml`: keep a dummy `[libraries]` entry in `libs.versions.toml`
@@ -614,7 +705,7 @@ ktfmt is unaffected (always JVM).
 ### Checking in the binaries (hermetic / offline builds)
 
 If you want full reproducibility or your CI can't reach Maven Central and
-GitHub releases, commit the formatter binaries and point at them with
+GitHub releases, commit the tool binaries and point at them with
 `path` instead of `version`:
 
 ```sh
@@ -631,6 +722,9 @@ path = "config/bin/ktfmt-0.62.jar"
 
 [gjf]
 path = "config/bin/gjf-1.35.0.jar"
+
+[detekt]
+path = "config/bin/detekt-2.0.0-alpha.5.jar"
 ```
 
 `path` and `version` are mutually exclusive; exactly one must be set per
@@ -639,7 +733,7 @@ as-is. When `path` is set, kempt never touches the cache for that tool:
 
 - `kempt update` skips it.
 - `kempt cache prune` ignores it.
-- `kempt format` and the hook run the in-repo binary directly.
+- Kempt commands and the hook run the in-repo binary directly.
 
 If the file is missing at the resolved path, kempt errors out with the full
 path so you can spot the typo quickly.
