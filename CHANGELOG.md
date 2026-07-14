@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Keep hook subprocess parsing stable when Git diff customization or JVM
+  environment-option announcements would otherwise alter captured output.
 - Add `--touched` to format or check files changed on the current branch,
   including committed, staged, unstaged, and non-ignored untracked files.
 - Support files, recursive directories, and glob patterns as explicit
