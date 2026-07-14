@@ -220,17 +220,24 @@ File paths are resolved relative to the repo root. The format is:
 ### File scope
 
 `kempt format` and `kempt check` default to every **tracked** file matching
-the include globs (via `git ls-files`). Two flags adjust the file set:
+the include globs (via `git ls-files`). Scope flags adjust the file set:
 
 | Flag                   | Effect                                                                                                                                                                      |
 |------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | (none) or `--all`      | All tracked files. The default "format everything" mode. `--all` exists as an explicit alias for symmetry with the other scope flags and so suggestions can be unambiguous. |
 | `--staged`             | Files in the index only. Used by the pre-commit hook.                                                                                                                       |
+| `--touched`            | Files changed on the current branch since it diverged from the default branch, including committed, staged, unstaged, and non-ignored untracked files.                      |
 | `--discovery=walk`     | Filesystem walk from the repo root. Includes untracked files. Does NOT consult `.gitignore`. `[paths].exclude` is the only filter.                                          |
 | `<path-or-pattern>...` | Operate on files, recursive directories, or glob patterns relative to the current directory. Respects configured path exclusions.                                           |
 
-`--all`, `--staged`, `--discovery=walk`, and explicit positional paths are
-all mutually exclusive.
+`--all`, `--staged`, `--touched`, `--discovery=walk`, and explicit positional
+paths are all mutually exclusive.
+
+`--touched` detects the default branch from the remote's symbolic `HEAD`, with
+`main`, `master`, and `trunk` fallbacks, then compares the working tree to its
+merge-base with `HEAD`. Pass `--base <ref>` to override the detected branch,
+for example `kempt format --touched --base upstream/main`. Formatting changes
+the working tree but does not stage or re-stage files.
 
 When `kempt check` (or `kempt format --dry-run`) finds 30 or fewer files
 needing formatting, it appends a copy-pasteable command listing those files

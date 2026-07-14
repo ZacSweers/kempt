@@ -1144,12 +1144,14 @@ fn parse_added_line_ranges(diff: &str) -> Vec<(usize, usize)> {
 
 /// Where the user invoked kempt from, used to tailor the "run X to fix"
 /// suggestion in the check summary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckContext {
     /// `kempt check` (default scope = all tracked).
     All,
     /// `kempt check --staged`.
     Staged,
+    /// `kempt check --touched`, optionally with an explicit base ref.
+    Touched { base: Option<String> },
     /// `kempt check --discovery=walk`.
     Walk,
     /// Running as the pre-commit hook with `[hook] mode = "check"`.
@@ -1159,16 +1161,20 @@ pub enum CheckContext {
 }
 
 impl CheckContext {
-    fn fix_command(self) -> &'static str {
+    fn fix_command(&self) -> String {
         match self {
-            Self::All => "kempt format --all",
-            Self::Staged | Self::Hook => "kempt format --staged",
-            Self::Walk => "kempt format --discovery=walk",
-            Self::Explicit => "kempt format",
+            Self::All => "kempt format --all".to_string(),
+            Self::Staged | Self::Hook => "kempt format --staged".to_string(),
+            Self::Touched { base: Some(base) } => {
+                format!("kempt format --touched --base {}", shell_escape_arg(base))
+            }
+            Self::Touched { base: None } => "kempt format --touched".to_string(),
+            Self::Walk => "kempt format --discovery=walk".to_string(),
+            Self::Explicit => "kempt format".to_string(),
         }
     }
 
-    fn allows_per_file_suggestion(self) -> bool {
+    fn allows_per_file_suggestion(&self) -> bool {
         // The hook's trailer is already multi-line and re-stages anyway;
         // per-file is awkward there. When the user already passed explicit
         // paths, they've got the file list.
@@ -1182,11 +1188,15 @@ pub const MAX_PER_FILE_SUGGESTION: usize = 30;
 
 fn shell_escape(p: &Path) -> String {
     let s = p.display().to_string();
+    shell_escape_arg(&s)
+}
+
+fn shell_escape_arg(s: &str) -> String {
     let needs_quote = s.is_empty()
         || s.chars()
             .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\' | '$' | '`' | '*' | '?'));
     if !needs_quote {
-        return s;
+        return s.to_string();
     }
     // Single-quote, escape any embedded single quotes.
     let escaped = s.replace('\'', "'\\''");
@@ -1217,7 +1227,7 @@ pub fn render_check_summary(outcome: &FormatOutcome, ctx: CheckContext) -> Vec<S
         lines.push(format!("  - Run `{cmd}` to format the rest"));
     } else if has_errors {
         lines.push("kempt: syntax errors prevent formatting (see above).".to_string());
-    } else if matches!(ctx, CheckContext::Hook) {
+    } else if matches!(&ctx, CheckContext::Hook) {
         lines.push(format!(
             "kempt: {n_changed} staged {n_word} {verb} formatting."
         ));
@@ -1225,7 +1235,7 @@ pub fn render_check_summary(outcome: &FormatOutcome, ctx: CheckContext) -> Vec<S
             "Run `{cmd}` to format and re-stage, then commit again."
         ));
         lines.push("Or commit with `--no-verify` to bypass.".to_string());
-    } else if matches!(ctx, CheckContext::Explicit) {
+    } else if matches!(&ctx, CheckContext::Explicit) {
         // The user already typed the file list; tell them to swap `check`
         // for `format`.
         lines.push(format!(
@@ -2559,6 +2569,30 @@ diff --git a/Foo.java b/Foo.java\n\
         let out = outcome_with(&["a.kt"], "");
         let summary = render_check_summary(&out, CheckContext::Staged);
         assert!(summary[0].contains("kempt format --staged"));
+    }
+
+    #[test]
+    fn check_summary_touched_scope_preserves_explicit_base() {
+        let out = outcome_with(&["a.kt"], "");
+        let summary = render_check_summary(
+            &out,
+            CheckContext::Touched {
+                base: Some("upstream/main".to_string()),
+            },
+        );
+        assert!(summary[0].contains("kempt format --touched --base upstream/main"));
+    }
+
+    #[test]
+    fn check_summary_touched_scope_shell_escapes_explicit_base() {
+        let out = outcome_with(&["a.kt"], "");
+        let summary = render_check_summary(
+            &out,
+            CheckContext::Touched {
+                base: Some("refs/heads/topic$branch".to_string()),
+            },
+        );
+        assert!(summary[0].contains("kempt format --touched --base 'refs/heads/topic$branch'"));
     }
 
     #[test]

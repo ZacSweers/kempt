@@ -25,6 +25,9 @@ pub enum Scope {
     All,
     /// Files in the index (staged for commit).
     Staged,
+    /// Files changed since the merge-base of the current branch and the
+    /// default branch (or an explicitly supplied base ref).
+    Touched { base: Option<String> },
     /// Filesystem walk from the repo root. Ignore files (`.gitignore` etc.)
     /// are NOT consulted. The `.git/` directory is always pruned.
     Walk,
@@ -149,6 +152,7 @@ pub fn collect_universe(git: &dyn GitContext, scope: Scope) -> Result<Vec<PathBu
     match scope {
         Scope::All => git.ls_files(),
         Scope::Staged => git.staged_files(),
+        Scope::Touched { base } => git.touched_files(base.as_deref()),
         Scope::Walk => walk_tree(git.root(), git.root()),
         Scope::Explicit { files, .. } => Ok(files),
     }
@@ -230,6 +234,22 @@ mod tests {
             .with_staged(vec!["a.kt"]);
         let out = collect_universe(&git, Scope::Staged).unwrap();
         assert_eq!(out, vec![PathBuf::from("a.kt")]);
+    }
+
+    #[test]
+    fn collect_universe_returns_touched_files() {
+        let git = FakeGit::new("/repo").with_touched(vec!["committed.kt", "untracked.kt"]);
+        let out = collect_universe(
+            &git,
+            Scope::Touched {
+                base: Some("origin/main".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![PathBuf::from("committed.kt"), PathBuf::from("untracked.kt")]
+        );
     }
 
     #[test]
