@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.3.0]
+
+_2026-07-14_
+
 - Keep hook subprocess parsing stable when Git diff customization or JVM
   environment-option announcements would otherwise alter captured output.
 - Add `--touched` to format or check files changed on the current branch,
