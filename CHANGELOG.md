@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Add `--touched` to format or check files changed on the current branch,
+  including committed, staged, unstaged, and non-ignored untracked files.
 - Support files, recursive directories, and glob patterns as explicit
   `format` and `check` targets. These respect global and per-tool path
   exclusions unless `--force` is passed.

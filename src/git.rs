@@ -3,6 +3,7 @@
 //! Git wrapper. Trait-based so paths/hook logic can be tested without a repo.
 
 use anyhow::{anyhow, Context, Result};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,6 +14,7 @@ pub trait GitContext {
     fn root(&self) -> &Path;
     fn ls_files(&self) -> Result<Vec<PathBuf>>;
     fn staged_files(&self) -> Result<Vec<PathBuf>>;
+    fn touched_files(&self, base: Option<&str>) -> Result<Vec<PathBuf>>;
     fn unstaged_modified_files(&self) -> Result<Vec<PathBuf>>;
     /// Stage paths, including tracked files hidden by ignore rules.
     fn add(&self, paths: &[PathBuf]) -> Result<()>;
@@ -74,6 +76,71 @@ impl RealGit {
             .map(PathBuf::from)
             .collect())
     }
+
+    fn symbolic_ref_target(&self, reference: &str) -> Result<Option<String>> {
+        let out = Command::new("git")
+            .args(["symbolic-ref", "--quiet", "--short", reference])
+            .current_dir(&self.root)
+            .output()
+            .with_context(|| format!("git symbolic-ref {reference} failed to spawn"))?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        Ok(Some(
+            String::from_utf8(out.stdout)
+                .context("git symbolic-ref output not utf8")?
+                .trim()
+                .to_string(),
+        ))
+    }
+
+    fn ref_exists(&self, reference: &str) -> Result<bool> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", reference])
+            .current_dir(&self.root)
+            .output()
+            .with_context(|| format!("git rev-parse {reference} failed to spawn"))?;
+        Ok(output.status.success())
+    }
+
+    fn infer_touched_base(&self) -> Result<String> {
+        if let Some(reference) = self.symbolic_ref_target("refs/remotes/origin/HEAD")? {
+            return Ok(reference);
+        }
+
+        let remote_heads = Command::new("git")
+            .args(["for-each-ref", "--format=%(refname)", "refs/remotes/*/HEAD"])
+            .current_dir(&self.root)
+            .output()
+            .context("git for-each-ref failed to spawn")?;
+        if remote_heads.status.success() {
+            for reference in String::from_utf8(remote_heads.stdout)
+                .context("git for-each-ref output not utf8")?
+                .lines()
+            {
+                if let Some(target) = self.symbolic_ref_target(reference)? {
+                    return Ok(target);
+                }
+            }
+        }
+
+        for candidate in [
+            "origin/main",
+            "origin/master",
+            "origin/trunk",
+            "main",
+            "master",
+            "trunk",
+        ] {
+            if self.ref_exists(candidate)? {
+                return Ok(candidate.to_string());
+            }
+        }
+
+        Err(anyhow!(
+            "could not determine the base branch for --touched; pass --base <ref>"
+        ))
+    }
 }
 
 impl GitContext for RealGit {
@@ -87,6 +154,36 @@ impl GitContext for RealGit {
 
     fn staged_files(&self) -> Result<Vec<PathBuf>> {
         self.run(&["diff", "--cached", "--name-only", "--diff-filter=ACMR"])
+    }
+
+    fn touched_files(&self, base: Option<&str>) -> Result<Vec<PathBuf>> {
+        let base = match base {
+            Some(base) => base.to_string(),
+            None => self.infer_touched_base()?,
+        };
+        let out = Command::new("git")
+            .args(["diff", "--name-only", "--diff-filter=ACMR", "--merge-base"])
+            .arg(&base)
+            .arg("--")
+            .current_dir(&self.root)
+            .output()
+            .with_context(|| format!("git diff from {base} failed to spawn"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!(
+                "could not determine files touched since {base}: {}. Ensure the base ref and its history are available, or pass --base <ref>",
+                stderr.trim()
+            ));
+        }
+
+        let mut files: BTreeSet<PathBuf> = String::from_utf8(out.stdout)
+            .context("git diff output not utf8")?
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        files.extend(self.run(&["ls-files", "--others", "--exclude-standard"])?);
+        Ok(files.into_iter().collect())
     }
 
     fn unstaged_modified_files(&self) -> Result<Vec<PathBuf>> {
@@ -261,13 +358,17 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    fn init_repo(root: &Path, branch: &str) {
+        git_cmd(root, &["init", "-b", branch]);
+        git_cmd(root, &["config", "user.email", "test@example.com"]);
+        git_cmd(root, &["config", "user.name", "Test User"]);
+    }
+
     #[test]
     fn add_restages_tracked_file_under_ignored_directory() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        git_cmd(root, &["init"]);
-        git_cmd(root, &["config", "user.email", "test@example.com"]);
-        git_cmd(root, &["config", "user.name", "Test User"]);
+        init_repo(root, "main");
         write(root, ".gitignore", "ignored/\n");
         write(root, "ignored/file.txt", "before\n");
         git_cmd(root, &["add", ".gitignore"]);
@@ -282,6 +383,88 @@ mod tests {
         let staged = git_cmd(root, &["diff", "--cached", "--name-only"]);
         assert_eq!(staged, "ignored/file.txt\n");
     }
+
+    #[test]
+    fn touched_files_include_branch_worktree_and_untracked_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root, "main");
+        write(root, ".gitignore", "ignored/\n");
+        write(root, "committed.kt", "before\n");
+        write(root, "staged.kt", "before\n");
+        write(root, "unstaged.kt", "before\n");
+        write(root, "deleted.kt", "before\n");
+        git_cmd(root, &["add", "."]);
+        git_cmd(root, &["commit", "-m", "initial"]);
+
+        git_cmd(root, &["switch", "-c", "feature"]);
+        write(root, "committed.kt", "committed on branch\n");
+        write(root, "branch-added.kt", "committed on branch\n");
+        git_cmd(root, &["add", "committed.kt", "branch-added.kt"]);
+        git_cmd(root, &["commit", "-m", "branch changes"]);
+
+        write(root, "staged.kt", "staged\n");
+        write(root, "staged-new.kt", "staged new file\n");
+        git_cmd(root, &["add", "staged.kt", "staged-new.kt"]);
+        write(root, "staged.kt", "staged plus newer unstaged edits\n");
+        write(root, "unstaged.kt", "unstaged\n");
+        std::fs::remove_file(root.join("deleted.kt")).unwrap();
+        write(root, "untracked.kt", "untracked\n");
+        write(root, "ignored/ignored.kt", "ignored\n");
+
+        let git = RealGit::discover(root).unwrap();
+        let touched = git.touched_files(None).unwrap();
+
+        assert_eq!(
+            touched,
+            vec![
+                PathBuf::from("branch-added.kt"),
+                PathBuf::from("committed.kt"),
+                PathBuf::from("staged-new.kt"),
+                PathBuf::from("staged.kt"),
+                PathBuf::from("unstaged.kt"),
+                PathBuf::from("untracked.kt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn touched_base_prefers_origin_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root, "main");
+        write(root, "file.kt", "initial\n");
+        git_cmd(root, &["add", "."]);
+        git_cmd(root, &["commit", "-m", "initial"]);
+        git_cmd(root, &["update-ref", "refs/remotes/origin/release", "HEAD"]);
+        git_cmd(
+            root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/release",
+            ],
+        );
+
+        let git = RealGit::discover(root).unwrap();
+
+        assert_eq!(git.infer_touched_base().unwrap(), "origin/release");
+    }
+
+    #[test]
+    fn touched_files_require_an_inferable_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root, "topic");
+        write(root, "file.kt", "initial\n");
+        git_cmd(root, &["add", "."]);
+        git_cmd(root, &["commit", "-m", "initial"]);
+        let git = RealGit::discover(root).unwrap();
+
+        let err = git.touched_files(None).unwrap_err();
+
+        assert!(format!("{err:#}").contains("pass --base <ref>"));
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +478,7 @@ pub mod testing {
         pub root: PathBuf,
         pub tracked: Vec<PathBuf>,
         pub staged: Vec<PathBuf>,
+        pub touched: Vec<PathBuf>,
         pub unstaged: Vec<PathBuf>,
         pub added: RefCell<Vec<PathBuf>>,
     }
@@ -305,6 +489,7 @@ pub mod testing {
                 root: root.into(),
                 tracked: vec![],
                 staged: vec![],
+                touched: vec![],
                 unstaged: vec![],
                 added: RefCell::new(vec![]),
             }
@@ -336,6 +521,15 @@ pub mod testing {
             self.unstaged = paths.into_iter().map(Into::into).collect();
             self
         }
+
+        pub fn with_touched<I, S>(mut self, paths: I) -> Self
+        where
+            I: IntoIterator<Item = S>,
+            S: Into<PathBuf>,
+        {
+            self.touched = paths.into_iter().map(Into::into).collect();
+            self
+        }
     }
 
     impl GitContext for FakeGit {
@@ -347,6 +541,9 @@ pub mod testing {
         }
         fn staged_files(&self) -> Result<Vec<PathBuf>> {
             Ok(self.staged.clone())
+        }
+        fn touched_files(&self, _base: Option<&str>) -> Result<Vec<PathBuf>> {
+            Ok(self.touched.clone())
         }
         fn unstaged_modified_files(&self) -> Result<Vec<PathBuf>> {
             Ok(self.unstaged.clone())

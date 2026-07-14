@@ -53,22 +53,33 @@ fn run() -> Result<ExitCode> {
             println!("installed {}", path.display());
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Format(args) => format_or_check(
-            cli.config,
-            args.all,
-            args.staged,
-            args.discovery,
-            args.paths,
-            args.force,
-            args.dry_run,
-        ),
+        Cmd::Format(args) => {
+            let check = args.dry_run;
+            format_or_check(
+                cli.config,
+                FileScopeOptions {
+                    all: args.all,
+                    staged: args.staged,
+                    touched: args.touched,
+                    base: args.base,
+                    discovery: args.discovery,
+                    explicit_paths: args.paths,
+                    force: args.force,
+                },
+                check,
+            )
+        }
         Cmd::Check(args) => format_or_check(
             cli.config,
-            args.all,
-            args.staged,
-            args.discovery,
-            args.paths,
-            args.force,
+            FileScopeOptions {
+                all: args.all,
+                staged: args.staged,
+                touched: args.touched,
+                base: args.base,
+                discovery: args.discovery,
+                explicit_paths: args.paths,
+                force: args.force,
+            },
             true,
         ),
         Cmd::Hook => run_hook_subcommand(cli.config),
@@ -168,23 +179,40 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-fn format_or_check(
-    config_path: Option<PathBuf>,
+struct FileScopeOptions {
     all: bool,
     staged: bool,
+    touched: bool,
+    base: Option<String>,
     discovery: Discovery,
     explicit_paths: Vec<PathBuf>,
     force: bool,
+}
+
+fn format_or_check(
+    config_path: Option<PathBuf>,
+    scope_options: FileScopeOptions,
     check: bool,
 ) -> Result<ExitCode> {
+    let FileScopeOptions {
+        all,
+        staged,
+        touched,
+        base,
+        discovery,
+        explicit_paths,
+        force,
+    } = scope_options;
     let cwd = std::env::current_dir().context("read current dir")?;
     let git = RealGit::discover(&cwd)?;
     let config = load_config(&config_path, git.root())?;
     let cache = Cache::new(Cache::default_root()?);
     let dl = UreqDownloader;
     let has_explicit = !explicit_paths.is_empty();
-    if has_explicit && (all || staged || discovery == Discovery::Walk) {
-        anyhow::bail!("explicit paths are incompatible with --all, --staged, and --discovery=walk");
+    if has_explicit && (all || staged || touched || discovery == Discovery::Walk) {
+        anyhow::bail!(
+            "explicit paths are incompatible with --all, --staged, --touched, and --discovery=walk"
+        );
     }
     if all && staged {
         anyhow::bail!("--all is incompatible with --staged");
@@ -192,8 +220,17 @@ fn format_or_check(
     if all && discovery == Discovery::Walk {
         anyhow::bail!("--all is incompatible with --discovery=walk");
     }
+    if all && touched {
+        anyhow::bail!("--all is incompatible with --touched");
+    }
     if staged && discovery == Discovery::Walk {
         anyhow::bail!("--staged is incompatible with --discovery=walk");
+    }
+    if staged && touched {
+        anyhow::bail!("--staged is incompatible with --touched");
+    }
+    if touched && discovery == Discovery::Walk {
+        anyhow::bail!("--touched is incompatible with --discovery=walk");
     }
 
     let scope = if has_explicit {
@@ -201,6 +238,8 @@ fn format_or_check(
             files: paths::resolve_explicit_targets(&explicit_paths, &cwd, git.root())?,
             force,
         }
+    } else if touched {
+        Scope::Touched { base }
     } else {
         match (discovery, staged) {
             (Discovery::Walk, _) => Scope::Walk,
@@ -330,6 +369,7 @@ fn check_context_for_scope(scope: &Scope) -> commands::CheckContext {
     match scope {
         Scope::All => commands::CheckContext::All,
         Scope::Staged => commands::CheckContext::Staged,
+        Scope::Touched { base } => commands::CheckContext::Touched { base: base.clone() },
         Scope::Walk => commands::CheckContext::Walk,
         Scope::Explicit { .. } => commands::CheckContext::Explicit,
     }
