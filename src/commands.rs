@@ -41,6 +41,12 @@ impl FormatOutcome {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FormatOptions {
+    check: bool,
+    ignore_excludes: bool,
+}
+
 /// Run the full format pipeline (in-process steps + ktfmt + gjf).
 ///
 /// `check` selects dry-run mode: nothing is written; non-zero exit indicates
@@ -54,21 +60,26 @@ pub fn run_format(
     check: bool,
     year: u32,
 ) -> Result<FormatOutcome> {
+    let force = matches!(scope, Scope::Explicit { force: true, .. });
+    let options = FormatOptions {
+        check,
+        ignore_excludes: force,
+    };
     let candidates = collect_candidates(git, &scope, config)?;
     if candidates.is_empty() {
         return Ok(FormatOutcome::default());
     }
-    let mut outcome = apply_pipeline(config, git.root(), &candidates, check, year)?;
+    let mut outcome = apply_pipeline(config, git.root(), &candidates, options, year)?;
     apply_jvm_formatters(
         config,
         cache,
         downloader,
         git.root(),
         &candidates,
-        check,
+        options,
         &mut outcome,
     )?;
-    apply_rustfmt(config, git.root(), &candidates, check, &mut outcome)?;
+    apply_rustfmt(config, git.root(), &candidates, options, &mut outcome)?;
     Ok(outcome)
 }
 
@@ -250,21 +261,36 @@ fn run_hook_inner(
         }
     }
 
-    let mut outcome = apply_pipeline(config, git.root(), &normal_candidates, check_mode, year)?;
+    let mut outcome = apply_pipeline(
+        config,
+        git.root(),
+        &normal_candidates,
+        FormatOptions {
+            check: check_mode,
+            ignore_excludes: false,
+        },
+        year,
+    )?;
     apply_jvm_formatters(
         config,
         cache,
         downloader,
         git.root(),
         &normal_candidates,
-        check_mode,
+        FormatOptions {
+            check: check_mode,
+            ignore_excludes: false,
+        },
         &mut outcome,
     )?;
     apply_rustfmt(
         config,
         git.root(),
         &normal_candidates,
-        check_mode,
+        FormatOptions {
+            check: check_mode,
+            ignore_excludes: false,
+        },
         &mut outcome,
     )?;
     let mut partial_changed = BTreeSet::new();
@@ -313,7 +339,7 @@ fn partial_formatting_plan(
     files: &[PathBuf],
     options: PartialFormattingOptions,
 ) -> Result<PartialFormattingPlan> {
-    let scopes = ToolScopes::build(config, repo_root)?;
+    let scopes = ToolScopes::build(config, repo_root, false)?;
     let mut handled = BTreeSet::new();
     let mut unhandled = Vec::new();
     for path in files {
@@ -660,8 +686,7 @@ fn collect_candidates(
     config: &Config,
 ) -> Result<Vec<PathBuf>> {
     let universe = paths::collect_universe(git, scope.clone())?;
-    if matches!(scope, Scope::Explicit(_)) {
-        // Explicit paths bypass all globsets, including the global one.
+    if matches!(scope, Scope::Explicit { force: true, .. }) {
         return Ok(universe);
     }
     let global_exclude_globs = config.paths.exclude.resolve(git.root())?;
@@ -677,10 +702,11 @@ struct ToolScopes {
     gjf: Option<(GlobSet, GlobSet)>,
     rustfmt: Option<(GlobSet, GlobSet)>,
     whitespace: (GlobSet, GlobSet),
+    ignore_excludes: bool,
 }
 
 impl ToolScopes {
-    fn build(config: &Config, repo_root: &Path) -> Result<Self> {
+    fn build(config: &Config, repo_root: &Path, ignore_excludes: bool) -> Result<Self> {
         let ktfmt = match &config.ktfmt {
             Some(kt) => {
                 let rp = kt.resolve_paths(repo_root)?;
@@ -708,33 +734,34 @@ impl ToolScopes {
             gjf,
             rustfmt,
             whitespace,
+            ignore_excludes,
         })
     }
 
     fn matches_ktfmt(&self, path: &Path) -> bool {
         match &self.ktfmt {
-            Some((inc, exc)) => inc.is_match(path) && !exc.is_match(path),
+            Some((inc, exc)) => inc.is_match(path) && (self.ignore_excludes || !exc.is_match(path)),
             None => false,
         }
     }
 
     fn matches_gjf(&self, path: &Path) -> bool {
         match &self.gjf {
-            Some((inc, exc)) => inc.is_match(path) && !exc.is_match(path),
+            Some((inc, exc)) => inc.is_match(path) && (self.ignore_excludes || !exc.is_match(path)),
             None => false,
         }
     }
 
     fn matches_rustfmt(&self, path: &Path) -> bool {
         match &self.rustfmt {
-            Some((inc, exc)) => inc.is_match(path) && !exc.is_match(path),
+            Some((inc, exc)) => inc.is_match(path) && (self.ignore_excludes || !exc.is_match(path)),
             None => false,
         }
     }
 
     fn matches_whitespace(&self, path: &Path) -> bool {
         let (inc, exc) = &self.whitespace;
-        inc.is_match(path) && !exc.is_match(path)
+        inc.is_match(path) && (self.ignore_excludes || !exc.is_match(path))
     }
 }
 
@@ -742,12 +769,12 @@ fn apply_pipeline(
     config: &Config,
     repo_root: &Path,
     files: &[PathBuf],
-    check: bool,
+    options: FormatOptions,
     year: u32,
 ) -> Result<FormatOutcome> {
     let headers = Headers::build(config, repo_root, year)?;
     let ws_opts = crate::whitespace::Options::from(&config.whitespace);
-    let scopes = ToolScopes::build(config, repo_root)?;
+    let scopes = ToolScopes::build(config, repo_root, options.ignore_excludes)?;
     let mut report = PipelineReport::default();
 
     for rel in files {
@@ -789,7 +816,7 @@ fn apply_pipeline(
             pipeline::process_content(&content, kind, header_arg, effective_ws);
         if file_report.changed() {
             report.record(rel, &file_report);
-            if !check {
+            if !options.check {
                 std::fs::write(&abs, new_content)
                     .with_context(|| format!("write {}", abs.display()))?;
             }
@@ -800,7 +827,7 @@ fn apply_pipeline(
     for p in report.changed {
         outcome.changed.insert(p);
     }
-    if check && !outcome.changed.is_empty() {
+    if options.check && !outcome.changed.is_empty() {
         outcome.check_failed = true;
     }
     Ok(outcome)
@@ -814,7 +841,7 @@ fn apply_partial_pipeline_to_index(
 ) -> Result<BTreeSet<PathBuf>> {
     let headers = Headers::build(config, git.root(), year)?;
     let ws_opts = crate::whitespace::Options::from(&config.whitespace);
-    let scopes = ToolScopes::build(config, git.root())?;
+    let scopes = ToolScopes::build(config, git.root(), false)?;
     let mut changed = BTreeSet::new();
 
     for rel in files {
@@ -857,10 +884,10 @@ fn apply_jvm_formatters(
     downloader: &dyn Downloader,
     repo_root: &Path,
     files: &[PathBuf],
-    check: bool,
+    options: FormatOptions,
     outcome: &mut FormatOutcome,
 ) -> Result<()> {
-    let scopes = ToolScopes::build(config, repo_root)?;
+    let scopes = ToolScopes::build(config, repo_root, options.ignore_excludes)?;
     let kt_files: Vec<PathBuf> = files
         .iter()
         .filter(|p| scopes.matches_ktfmt(p))
@@ -876,8 +903,8 @@ fn apply_jvm_formatters(
         if !kt_files.is_empty() {
             let jar = resolve_jar(kt.source(repo_root), &|v| cache.ensure_ktfmt(v, downloader))?;
             let invoker = formatters::Invoker::Jar(jar);
-            let base = formatters::ktfmt_args(kt.style, check);
-            if check {
+            let base = formatters::ktfmt_args(kt.style, options.check);
+            if options.check {
                 let run = formatters::run_batched_check(
                     "ktfmt",
                     &invoker,
@@ -903,8 +930,8 @@ fn apply_jvm_formatters(
     if let Some(g) = &config.gjf {
         if !java_files.is_empty() {
             let invoker = resolve_gjf_invoker(g, repo_root, cache, downloader)?;
-            let base = formatters::gjf_args(g.style, check);
-            if check {
+            let base = formatters::gjf_args(g.style, options.check);
+            if options.check {
                 let run = formatters::run_argfile_check("gjf", &invoker, base, &java_files)?;
                 merge_jvm_check_run(outcome, repo_root, run);
             } else {
@@ -922,13 +949,13 @@ fn apply_rustfmt(
     config: &Config,
     repo_root: &Path,
     files: &[PathBuf],
-    check: bool,
+    options: FormatOptions,
     outcome: &mut FormatOutcome,
 ) -> Result<()> {
     if config.rustfmt.is_none() {
         return Ok(());
     }
-    let scopes = ToolScopes::build(config, repo_root)?;
+    let scopes = ToolScopes::build(config, repo_root, options.ignore_excludes)?;
     let rust_files: Vec<PathBuf> = files
         .iter()
         .filter(|p| scopes.matches_rustfmt(p))
@@ -938,9 +965,9 @@ fn apply_rustfmt(
         return Ok(());
     }
 
-    if check {
+    if options.check {
         for rel in rust_files {
-            let output = cargo_fmt(repo_root, check, std::slice::from_ref(&rel))?;
+            let output = cargo_fmt(repo_root, options.check, std::slice::from_ref(&rel))?;
             if !output.status.success() {
                 outcome.check_failed = true;
                 outcome.changed.insert(rel);
@@ -950,7 +977,7 @@ fn apply_rustfmt(
     } else {
         let abs_files: Vec<PathBuf> = rust_files.iter().map(|p| repo_root.join(p)).collect();
         let before = snapshot_files(&abs_files)?;
-        let output = cargo_fmt(repo_root, check, &rust_files)?;
+        let output = cargo_fmt(repo_root, options.check, &rust_files)?;
         if !output.status.success() {
             return Err(formatter_failure("cargo fmt", output));
         }
@@ -1009,7 +1036,7 @@ fn partial_formatter_targets(
     files: &[PathBuf],
     options: PartialFormattingOptions,
 ) -> Result<Vec<(PartialFormatter, Vec<PathBuf>)>> {
-    let scopes = ToolScopes::build(config, repo_root)?;
+    let scopes = ToolScopes::build(config, repo_root, false)?;
     Ok(options
         .enabled_formatters()
         .filter_map(|formatter| {
@@ -1312,6 +1339,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn explicit_targets_respect_global_excludes() {
+        let config = Config::parse(
+            r#"
+            [paths]
+            exclude = ["generated/**"]
+        "#,
+        )
+        .unwrap();
+        let git = FakeGit::new("/repo");
+        let scope = Scope::Explicit {
+            files: vec![
+                PathBuf::from("src/Foo.kt"),
+                PathBuf::from("generated/Generated.kt"),
+            ],
+            force: false,
+        };
+
+        let out = collect_candidates(&git, &scope, &config).unwrap();
+
+        assert_eq!(out, vec![PathBuf::from("src/Foo.kt")]);
+    }
+
+    #[test]
+    fn forced_explicit_targets_bypass_global_excludes() {
+        let config = Config::parse(
+            r#"
+            [paths]
+            exclude = ["generated/**"]
+        "#,
+        )
+        .unwrap();
+        let git = FakeGit::new("/repo");
+        let files = vec![
+            PathBuf::from("src/Foo.kt"),
+            PathBuf::from("generated/Generated.kt"),
+        ];
+        let scope = Scope::Explicit {
+            files: files.clone(),
+            force: true,
+        };
+
+        let out = collect_candidates(&git, &scope, &config).unwrap();
+
+        assert_eq!(out, files);
+    }
+
+    #[test]
+    fn forced_targets_bypass_per_tool_excludes_but_not_includes() {
+        let config = Config::parse(
+            r#"
+            [ktfmt]
+            version = "0.64"
+
+            [ktfmt.paths]
+            include = ["src/**/*.kt"]
+            exclude = ["src/generated/**"]
+
+            [whitespace.paths]
+            include = ["src/**/*.kt"]
+            exclude = ["src/generated/**"]
+        "#,
+        )
+        .unwrap();
+        let excluded = Path::new("src/generated/Generated.kt");
+        let outside_include = Path::new("other/Other.kt");
+
+        let normal = ToolScopes::build(&config, Path::new("/repo"), false).unwrap();
+        assert!(!normal.matches_ktfmt(excluded));
+        assert!(!normal.matches_whitespace(excluded));
+
+        let forced = ToolScopes::build(&config, Path::new("/repo"), true).unwrap();
+        assert!(forced.matches_ktfmt(excluded));
+        assert!(forced.matches_whitespace(excluded));
+        assert!(!forced.matches_ktfmt(outside_include));
+        assert!(!forced.matches_whitespace(outside_include));
+    }
+
     #[cfg(unix)]
     fn fake_gjf_appending_reformatted(root: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -1542,6 +1647,63 @@ diff --git a/Foo.java b/Foo.java\n\
         let out = run_format(&cfg, &git, &cache, &dl, Scope::All, false, 2026).unwrap();
         assert!(out.changed.is_empty());
         assert!(!out.check_failed);
+    }
+
+    #[test]
+    fn forced_explicit_target_runs_tool_that_excludes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = PathBuf::from("generated/Foo.kt");
+        write(root, "generated/Foo.kt", "package foo   \n");
+        let config = Config::parse(
+            r#"
+            [whitespace.paths]
+            include = ["**/*.kt"]
+            exclude = ["generated/**"]
+        "#,
+        )
+        .unwrap();
+        let git = FakeGit::new(root);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let unforced = run_format(
+            &config,
+            &git,
+            &cache,
+            &dl,
+            Scope::Explicit {
+                files: vec![path.clone()],
+                force: false,
+            },
+            false,
+            2026,
+        )
+        .unwrap();
+        assert!(unforced.changed.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join(&path)).unwrap(),
+            "package foo   \n"
+        );
+
+        let forced = run_format(
+            &config,
+            &git,
+            &cache,
+            &dl,
+            Scope::Explicit {
+                files: vec![path.clone()],
+                force: true,
+            },
+            false,
+            2026,
+        )
+        .unwrap();
+        assert_eq!(forced.changed, BTreeSet::from([path.clone()]));
+        assert_eq!(
+            std::fs::read_to_string(root.join(path)).unwrap(),
+            "package foo\n"
+        );
     }
 
     #[cfg(unix)]

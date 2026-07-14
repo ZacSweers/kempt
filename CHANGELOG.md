@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Support files, recursive directories, and glob patterns as explicit
+  `format` and `check` targets. These respect global and per-tool path
+  exclusions unless `--force` is passed.
+
 ## [0.2.1]
 
 _2026-07-07_
