@@ -153,7 +153,15 @@ impl GitContext for RealGit {
     }
 
     fn staged_files(&self) -> Result<Vec<PathBuf>> {
-        self.run(&["diff", "--cached", "--name-only", "--diff-filter=ACMR"])
+        self.run(&[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--cached",
+            "--name-only",
+            "--diff-filter=ACMR",
+        ])
     }
 
     fn touched_files(&self, base: Option<&str>) -> Result<Vec<PathBuf>> {
@@ -162,7 +170,15 @@ impl GitContext for RealGit {
             None => self.infer_touched_base()?,
         };
         let out = Command::new("git")
-            .args(["diff", "--name-only", "--diff-filter=ACMR", "--merge-base"])
+            .args([
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--name-only",
+                "--diff-filter=ACMR",
+                "--merge-base",
+            ])
             .arg(&base)
             .arg("--")
             .current_dir(&self.root)
@@ -187,7 +203,14 @@ impl GitContext for RealGit {
     }
 
     fn unstaged_modified_files(&self) -> Result<Vec<PathBuf>> {
-        self.run(&["diff", "--name-only", "--diff-filter=ACMR"])
+        self.run(&[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--name-only",
+            "--diff-filter=ACMR",
+        ])
     }
 
     fn add(&self, paths: &[PathBuf]) -> Result<()> {
@@ -213,7 +236,15 @@ impl GitContext for RealGit {
     fn staged_diff(&self, path: &Path, context: u32) -> Result<String> {
         let unified = format!("-U{context}");
         let out = Command::new("git")
-            .args(["diff", "--cached", &unified, "--"])
+            .args([
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--cached",
+                &unified,
+                "--",
+            ])
             .arg(path)
             .current_dir(&self.root)
             .output()
@@ -464,6 +495,46 @@ mod tests {
         let err = git.touched_files(None).unwrap_err();
 
         assert!(format!("{err:#}").contains("pass --base <ref>"));
+    }
+
+    #[test]
+    fn parsed_diffs_ignore_external_diff_textconv_and_color_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root, "main");
+        write(root, ".gitattributes", "*.txt diff=hostile\n");
+        write(root, "staged.txt", "before\n");
+        write(root, "unstaged.txt", "before\n");
+        git_cmd(root, &["add", "."]);
+        git_cmd(root, &["commit", "-m", "initial"]);
+
+        write(root, "staged.txt", "after\n");
+        git_cmd(root, &["add", "staged.txt"]);
+        write(root, "unstaged.txt", "after\n");
+        git_cmd(root, &["config", "diff.external", "false"]);
+        git_cmd(root, &["config", "diff.hostile.textconv", "false"]);
+        git_cmd(root, &["config", "color.ui", "always"]);
+
+        let git = RealGit::discover(root).unwrap();
+
+        assert_eq!(
+            git.staged_files().unwrap(),
+            vec![PathBuf::from("staged.txt")]
+        );
+        assert_eq!(
+            git.unstaged_modified_files().unwrap(),
+            vec![PathBuf::from("unstaged.txt")]
+        );
+        assert_eq!(
+            git.touched_files(Some("main")).unwrap(),
+            vec![PathBuf::from("staged.txt"), PathBuf::from("unstaged.txt")]
+        );
+        let diff = git.staged_diff(Path::new("staged.txt"), 0).unwrap();
+        assert!(diff.contains("@@ -1 +1 @@"), "got: {diff}");
+        assert!(
+            !diff.contains('\u{1b}'),
+            "diff contained ANSI escapes: {diff:?}"
+        );
     }
 }
 

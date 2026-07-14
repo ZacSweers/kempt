@@ -133,13 +133,19 @@ pub fn run(tool: &str, invoker: &Invoker, args: Vec<OsString>) -> Result<()> {
     }
 }
 
-/// Drop JVM "WARNING:" lines (e.g. sun.misc.Unsafe deprecations) from
+/// Drop known JVM warning and environment-option announcement lines from
 /// captured stderr. Those are noise on every invocation and crowd out the
 /// actual formatter diagnostic.
 fn filter_jvm_noise(stderr: &str) -> String {
     stderr
         .lines()
-        .filter(|l| !l.trim_start().starts_with("WARNING:"))
+        .filter(|line| {
+            let line = line.trim_start();
+            !line.starts_with("WARNING:")
+                && !line.starts_with("Picked up JAVA_TOOL_OPTIONS:")
+                && !line.starts_with("Picked up _JAVA_OPTIONS:")
+                && !line.starts_with("NOTE: Picked up JDK_JAVA_OPTIONS:")
+        })
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
@@ -539,6 +545,25 @@ mod tests {
         assert_eq!(
             filter_jvm_noise(raw),
             "error: thing went wrong (WARNING: do not retry)"
+        );
+    }
+
+    #[test]
+    fn filter_jvm_noise_strips_environment_option_announcements() {
+        let raw = "Picked up JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8\n\
+                   Picked up _JAVA_OPTIONS: -Xmx1g\n\
+                   NOTE: Picked up JDK_JAVA_OPTIONS: --enable-preview\n";
+        assert_eq!(filter_jvm_noise(raw), "");
+    }
+
+    #[test]
+    fn filter_jvm_noise_preserves_errors_alongside_environment_announcements() {
+        let raw = "Picked up JAVA_TOOL_OPTIONS: -XX:BadOption\n\
+                   Unrecognized VM option 'BadOption'\n\
+                   Error: Could not create the Java Virtual Machine.\n";
+        assert_eq!(
+            filter_jvm_noise(raw),
+            "Unrecognized VM option 'BadOption'\nError: Could not create the Java Virtual Machine."
         );
     }
 }
