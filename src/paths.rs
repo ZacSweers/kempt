@@ -16,7 +16,8 @@ use crate::config::ResolvedPaths;
 use crate::git::GitContext;
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
@@ -27,9 +28,120 @@ pub enum Scope {
     /// Filesystem walk from the repo root. Ignore files (`.gitignore` etc.)
     /// are NOT consulted. The `.git/` directory is always pruned.
     Walk,
-    /// User-supplied list of paths. Bypasses every filter; the literal list
-    /// is what gets processed.
-    Explicit(Vec<PathBuf>),
+    /// Files expanded from user-supplied positional targets. Global and
+    /// per-tool path excludes apply unless `force` is set; per-tool includes
+    /// always apply later.
+    Explicit { files: Vec<PathBuf>, force: bool },
+}
+
+/// Resolve positional CLI targets to repo-relative files.
+///
+/// Literal files are kept as-is, directories are walked recursively, and
+/// glob patterns are matched against the working tree. Relative targets are
+/// interpreted against `cwd`; targets outside `repo_root` are rejected.
+pub fn resolve_explicit_targets(
+    targets: &[PathBuf],
+    cwd: &Path,
+    repo_root: &Path,
+) -> Result<Vec<PathBuf>> {
+    let canonical_root = repo_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", repo_root.display()))?;
+    let canonical_cwd = cwd
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", cwd.display()))?;
+    canonical_cwd
+        .strip_prefix(&canonical_root)
+        .with_context(|| {
+            format!(
+                "current directory {} is outside the repo root",
+                cwd.display()
+            )
+        })?;
+
+    let mut resolved = BTreeSet::new();
+    let mut working_tree_files: Option<Vec<PathBuf>> = None;
+
+    for target in targets {
+        let absolute = if target.is_absolute() {
+            target.clone()
+        } else {
+            canonical_cwd.join(target)
+        };
+
+        if absolute.exists() {
+            let canonical = absolute
+                .canonicalize()
+                .with_context(|| format!("canonicalize {}", target.display()))?;
+            let relative = canonical
+                .strip_prefix(&canonical_root)
+                .with_context(|| format!("path {} is outside the repo root", target.display()))?
+                .to_path_buf();
+
+            if canonical.is_file() {
+                resolved.insert(relative);
+            } else if canonical.is_dir() {
+                resolved.extend(walk_tree(&canonical, &canonical_root)?);
+            } else {
+                anyhow::bail!("path is not a file or directory: {}", target.display());
+            }
+            continue;
+        }
+
+        if !contains_glob_meta(target) {
+            anyhow::bail!("path not found: {}", target.display());
+        }
+
+        let normalized = normalize_pattern(&absolute)?;
+        let relative_pattern = normalized
+            .strip_prefix(&canonical_root)
+            .with_context(|| format!("pattern {} is outside the repo root", target.display()))?;
+        let pattern = relative_pattern
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("pattern is not valid UTF-8: {}", target.display()))?;
+        let matcher = Glob::new(pattern)
+            .with_context(|| format!("invalid target pattern: {}", target.display()))?
+            .compile_matcher();
+        let files = match &working_tree_files {
+            Some(files) => files,
+            None => working_tree_files.insert(walk_tree(&canonical_root, &canonical_root)?),
+        };
+        let mut matched = false;
+        for file in files {
+            if matcher.is_match(file) {
+                matched = true;
+                resolved.insert(file.clone());
+            }
+        }
+        if !matched {
+            anyhow::bail!("pattern matched no files: {}", target.display());
+        }
+    }
+
+    Ok(resolved.into_iter().collect())
+}
+
+fn contains_glob_meta(path: &Path) -> bool {
+    path.to_string_lossy()
+        .chars()
+        .any(|c| matches!(c, '*' | '?' | '[' | '{'))
+}
+
+/// Normalize `.` and `..` without requiring the globbed path to exist.
+fn normalize_pattern(path: &Path) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    anyhow::bail!("pattern escapes the filesystem root: {}", path.display());
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
 }
 
 /// Collect the candidate file set for `scope` without applying any filters.
@@ -37,8 +149,8 @@ pub fn collect_universe(git: &dyn GitContext, scope: Scope) -> Result<Vec<PathBu
     match scope {
         Scope::All => git.ls_files(),
         Scope::Staged => git.staged_files(),
-        Scope::Walk => walk_tree(git.root()),
-        Scope::Explicit(files) => Ok(files),
+        Scope::Walk => walk_tree(git.root(), git.root()),
+        Scope::Explicit { files, .. } => Ok(files),
     }
 }
 
@@ -55,12 +167,12 @@ pub fn tool_globset(rp: &ResolvedPaths) -> Result<(GlobSet, GlobSet)> {
     Ok((include, exclude))
 }
 
-/// Walk the working tree below `root`, returning paths relative to `root`.
+/// Walk below `root`, returning paths relative to `repo_root`.
 /// Always prunes `.git/` to avoid descending into git internals.
-fn walk_tree(root: &Path) -> Result<Vec<PathBuf>> {
+fn walk_tree(root: &Path, repo_root: &Path) -> Result<Vec<PathBuf>> {
     let walker = walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
         // Hardcoded structural prune; never user-overridable.
-        !(e.depth() > 0 && e.file_type().is_dir() && e.file_name() == std::ffi::OsStr::new(".git"))
+        !(e.file_type().is_dir() && e.file_name() == std::ffi::OsStr::new(".git"))
     });
     let mut out = Vec::new();
     for entry in walker {
@@ -70,7 +182,7 @@ fn walk_tree(root: &Path) -> Result<Vec<PathBuf>> {
         }
         let rel = entry
             .path()
-            .strip_prefix(root)
+            .strip_prefix(repo_root)
             .with_context(|| format!("strip_prefix on {}", entry.path().display()))?;
         out.push(rel.to_path_buf());
     }
@@ -124,7 +236,14 @@ mod tests {
     fn collect_universe_returns_explicit_unmodified() {
         let git = FakeGit::new("/repo");
         let explicit = vec![PathBuf::from("a.kt"), PathBuf::from("not-source.txt")];
-        let out = collect_universe(&git, Scope::Explicit(explicit.clone())).unwrap();
+        let out = collect_universe(
+            &git,
+            Scope::Explicit {
+                files: explicit.clone(),
+                force: false,
+            },
+        )
+        .unwrap();
         assert_eq!(out, explicit);
     }
 
@@ -215,5 +334,92 @@ mod tests {
         // Both Bar.kt and ignored/Foo.kt are present (gitignore not consulted).
         assert!(out.iter().any(|p| p == &PathBuf::from("Bar.kt")));
         assert!(out.iter().any(|p| p == &PathBuf::from("ignored/Foo.kt")));
+    }
+
+    #[test]
+    fn explicit_directory_recurses_and_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "src/Foo.kt");
+        write_file(dir.path(), "src/nested/Bar.java");
+        write_file(dir.path(), "src/.git/Hidden.kt");
+        write_file(dir.path(), "other/Baz.kt");
+
+        let out = resolve_explicit_targets(
+            &[PathBuf::from("src"), PathBuf::from("src/Foo.kt")],
+            dir.path(),
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                PathBuf::from("src/Foo.kt"),
+                PathBuf::from("src/nested/Bar.java")
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_file_resolves_relative_to_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "src/Foo.kt");
+
+        let out = resolve_explicit_targets(
+            &[PathBuf::from("Foo.kt")],
+            &dir.path().join("src"),
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(out, vec![PathBuf::from("src/Foo.kt")]);
+    }
+
+    #[test]
+    fn explicit_pattern_matches_files_relative_to_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "src/Foo.kt");
+        write_file(dir.path(), "src/nested/Bar.kt");
+        write_file(dir.path(), "src/nested/Bar.java");
+        std::fs::create_dir_all(dir.path().join("module")).unwrap();
+
+        let out = resolve_explicit_targets(
+            &[PathBuf::from("../src/**/*.kt")],
+            &dir.path().join("module"),
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            out,
+            vec![
+                PathBuf::from("src/Foo.kt"),
+                PathBuf::from("src/nested/Bar.kt")
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_pattern_errors_when_nothing_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "src/Foo.kt");
+
+        let err =
+            resolve_explicit_targets(&[PathBuf::from("src/**/*.java")], dir.path(), dir.path())
+                .unwrap_err();
+
+        assert!(format!("{err:#}").contains("pattern matched no files"));
+    }
+
+    #[test]
+    fn explicit_target_rejects_paths_outside_repo() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+
+        let err =
+            resolve_explicit_targets(&[outside.path().to_path_buf()], repo.path(), repo.path())
+                .unwrap_err();
+
+        assert!(format!("{err:#}").contains("outside the repo root"));
     }
 }

@@ -109,10 +109,14 @@ pub struct FormatArgs {
     /// File discovery mode.
     #[arg(long, value_enum, default_value_t = Discovery::Vcs)]
     pub discovery: Discovery,
-    /// Optional explicit list of files to process. When provided, scope
-    /// flags are not allowed and `[paths].include` / `[paths].exclude`
-    /// don't apply. Paths are resolved relative to the current directory.
-    #[arg(value_name = "FILE")]
+    /// Process explicitly targeted paths even when they match global or
+    /// per-tool `paths.exclude`. Requires at least one positional target.
+    #[arg(long, requires = "paths")]
+    pub force: bool,
+    /// Optional files, directories, or glob patterns to process. Directories
+    /// are recursive and patterns are resolved relative to the current
+    /// directory. When provided, scope flags are not allowed.
+    #[arg(value_name = "PATH_OR_PATTERN")]
     pub paths: Vec<PathBuf>,
 }
 
@@ -129,9 +133,14 @@ pub struct CheckArgs {
     /// File discovery mode.
     #[arg(long, value_enum, default_value_t = Discovery::Vcs)]
     pub discovery: Discovery,
-    /// Optional explicit list of files to check. When provided, scope flags
-    /// are not allowed.
-    #[arg(value_name = "FILE")]
+    /// Check explicitly targeted paths even when they match global or
+    /// per-tool `paths.exclude`. Requires at least one positional target.
+    #[arg(long, requires = "paths")]
+    pub force: bool,
+    /// Optional files, directories, or glob patterns to check. Directories
+    /// are recursive and patterns are resolved relative to the current
+    /// directory. When provided, scope flags are not allowed.
+    #[arg(value_name = "PATH_OR_PATTERN")]
     pub paths: Vec<PathBuf>,
 }
 
@@ -140,4 +149,17 @@ pub struct InstallHookArgs {
     /// Overwrite an existing pre-commit hook.
     #[arg(long)]
     pub force: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn force_requires_an_explicit_target() {
+        assert!(Cli::try_parse_from(["kempt", "format", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["kempt", "check", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["kempt", "format", "--force", "src"]).is_ok());
+        assert!(Cli::try_parse_from(["kempt", "check", "--force", "src"]).is_ok());
+    }
 }

@@ -222,12 +222,12 @@ File paths are resolved relative to the repo root. The format is:
 `kempt format` and `kempt check` default to every **tracked** file matching
 the include globs (via `git ls-files`). Two flags adjust the file set:
 
-| Flag                     | Effect                                                                                                                                                                      |
-|--------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| (none) or `--all`        | All tracked files. The default "format everything" mode. `--all` exists as an explicit alias for symmetry with the other scope flags and so suggestions can be unambiguous. |
-| `--staged`               | Files in the index only. Used by the pre-commit hook.                                                                                                                       |
-| `--discovery=walk`       | Filesystem walk from the repo root. Includes untracked files. Does NOT consult `.gitignore`. `[paths].exclude` is the only filter.                                          |
-| `<file>...` (positional) | Operate on exactly the listed files. Bypasses scope flags and `[paths].include` / `[paths].exclude`. Useful for targeted runs (e.g. `kempt format src/Foo.kt`).             |
+| Flag                   | Effect                                                                                                                                                                      |
+|------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| (none) or `--all`      | All tracked files. The default "format everything" mode. `--all` exists as an explicit alias for symmetry with the other scope flags and so suggestions can be unambiguous. |
+| `--staged`             | Files in the index only. Used by the pre-commit hook.                                                                                                                       |
+| `--discovery=walk`     | Filesystem walk from the repo root. Includes untracked files. Does NOT consult `.gitignore`. `[paths].exclude` is the only filter.                                          |
+| `<path-or-pattern>...` | Operate on files, recursive directories, or glob patterns relative to the current directory. Respects configured path exclusions.                                           |
 
 `--all`, `--staged`, `--discovery=walk`, and explicit positional paths are
 all mutually exclusive.
@@ -303,17 +303,24 @@ Omitting a section disables that step. `[paths]`, `[whitespace]`, and
 
 `kempt format` and `kempt check` share the same flag set:
 
-| Flag                        | Default                        | Effect                                                                        |
-|-----------------------------|--------------------------------|-------------------------------------------------------------------------------|
-| `--all`                     | (the implicit default)         | All tracked files. Explicit alias of the default for unambiguous suggestions. |
-| `--staged`                  | off                            | Only files in the git index.                                                  |
-| `--discovery=<vcs\|walk>`   | `vcs`                          | `walk` walks the filesystem; doesn't consult `.gitignore`.                    |
-| `--dry-run` (`format` only) | off                            | Preview without writing. Equivalent to `kempt check`.                         |
-| `<file>...` (positional)    | -                              | Process exactly the listed files. Bypasses scope flags and `[paths]` filters. |
-| `--config <PATH>`           | `.kempt.toml` in the repo root | Override the config file path.                                                |
+| Flag                        | Default                        | Effect                                                                                    |
+|-----------------------------|--------------------------------|-------------------------------------------------------------------------------------------|
+| `--all`                     | (the implicit default)         | All tracked files. Explicit alias of the default for unambiguous suggestions.             |
+| `--staged`                  | off                            | Only files in the git index.                                                              |
+| `--discovery=<vcs\|walk>`   | `vcs`                          | `walk` walks the filesystem; doesn't consult `.gitignore`.                                |
+| `--dry-run` (`format` only) | off                            | Preview without writing. Equivalent to `kempt check`.                                     |
+| `--force`                   | off                            | Allow positional targets to bypass global and per-tool `paths.exclude`.                   |
+| `<path-or-pattern>...`      | -                              | Process files, recursive directories, or glob patterns relative to the current directory. |
+| `--config <PATH>`           | `.kempt.toml` in the repo root | Override the config file path.                                                            |
 
 `--all`, `--staged`, `--discovery=walk`, and explicit positional paths are
 mutually exclusive.
+
+Positional glob patterns use the same syntax as Kempt's configured path
+patterns. Quote them when the shell would otherwise expand them first, for
+example `kempt format 'src/**/*.kt'`. Positional targets respect global and
+per-tool path exclusions by default; pass `--force` to override them. Tool
+`paths.include` filters and `license-header.excludes` still apply.
 
 `kempt init` takes `--license-header` to add `[license-header]` and write a
 starter `config/license-header.txt`.

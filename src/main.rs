@@ -59,6 +59,7 @@ fn run() -> Result<ExitCode> {
             args.staged,
             args.discovery,
             args.paths,
+            args.force,
             args.dry_run,
         ),
         Cmd::Check(args) => format_or_check(
@@ -67,6 +68,7 @@ fn run() -> Result<ExitCode> {
             args.staged,
             args.discovery,
             args.paths,
+            args.force,
             true,
         ),
         Cmd::Hook => run_hook_subcommand(cli.config),
@@ -172,6 +174,7 @@ fn format_or_check(
     staged: bool,
     discovery: Discovery,
     explicit_paths: Vec<PathBuf>,
+    force: bool,
     check: bool,
 ) -> Result<ExitCode> {
     let cwd = std::env::current_dir().context("read current dir")?;
@@ -194,7 +197,10 @@ fn format_or_check(
     }
 
     let scope = if has_explicit {
-        Scope::Explicit(resolve_explicit_paths(&explicit_paths, &cwd, git.root())?)
+        Scope::Explicit {
+            files: paths::resolve_explicit_targets(&explicit_paths, &cwd, git.root())?,
+            force,
+        }
     } else {
         match (discovery, staged) {
             (Discovery::Walk, _) => Scope::Walk,
@@ -213,36 +219,6 @@ fn format_or_check(
     } else {
         Ok(ExitCode::SUCCESS)
     }
-}
-
-/// Resolve user-supplied paths to repo-relative form. Paths are interpreted
-/// against `cwd` first, then made relative to `repo_root`. Errors out if any
-/// path falls outside the repo.
-fn resolve_explicit_paths(
-    paths: &[PathBuf],
-    cwd: &std::path::Path,
-    repo_root: &std::path::Path,
-) -> Result<Vec<PathBuf>> {
-    let canonical_root = repo_root
-        .canonicalize()
-        .with_context(|| format!("canonicalize {}", repo_root.display()))?;
-    let mut out = Vec::with_capacity(paths.len());
-    for p in paths {
-        let abs = if p.is_absolute() {
-            p.clone()
-        } else {
-            cwd.join(p)
-        };
-        let canonical = abs
-            .canonicalize()
-            .with_context(|| format!("path not found: {}", p.display()))?;
-        let rel = canonical
-            .strip_prefix(&canonical_root)
-            .with_context(|| format!("path {} is outside the repo root", p.display()))?
-            .to_path_buf();
-        out.push(rel);
-    }
-    Ok(out)
 }
 
 fn run_hook_subcommand(config_path: Option<PathBuf>) -> Result<ExitCode> {
@@ -355,7 +331,7 @@ fn check_context_for_scope(scope: &Scope) -> commands::CheckContext {
         Scope::All => commands::CheckContext::All,
         Scope::Staged => commands::CheckContext::Staged,
         Scope::Walk => commands::CheckContext::Walk,
-        Scope::Explicit(_) => commands::CheckContext::Explicit,
+        Scope::Explicit { .. } => commands::CheckContext::Explicit,
     }
 }
 
