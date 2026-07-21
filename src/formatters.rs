@@ -136,7 +136,7 @@ pub fn run(tool: &str, invoker: &Invoker, args: Vec<OsString>) -> Result<()> {
 /// Drop known JVM warning and environment-option announcement lines from
 /// captured stderr. Those are noise on every invocation and crowd out the
 /// actual formatter diagnostic.
-fn filter_jvm_noise(stderr: &str) -> String {
+pub(crate) fn filter_jvm_noise(stderr: &str) -> String {
     stderr
         .lines()
         .filter(|line| {
@@ -150,6 +150,23 @@ fn filter_jvm_noise(stderr: &str) -> String {
         .join("\n")
         .trim()
         .to_string()
+}
+
+/// Run an invoker with captured output from `current_dir`. This is used by
+/// formatters whose exit status and diagnostics need tool-specific handling.
+pub(crate) fn run_output(
+    tool: &str,
+    invoker: &Invoker,
+    args: &[OsString],
+    current_dir: &std::path::Path,
+) -> Result<std::process::Output> {
+    let mut cmd = build_command(invoker)?;
+    cmd.args(args)
+        .current_dir(current_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("spawn {tool} failed"))
 }
 
 /// Run `tool` against `files` in batches. `base_args` is the static argument
@@ -331,7 +348,7 @@ fn write_argfile(files: &[PathBuf]) -> Result<(OsString, tempfile::NamedTempFile
 /// plus a separator). A single path larger than `budget` is still emitted as
 /// its own chunk; the OS will reject it if too large, but that's preferable
 /// to silently skipping.
-fn chunk_files(files: &[PathBuf], budget: usize) -> Vec<&[PathBuf]> {
+pub(crate) fn chunk_files(files: &[PathBuf], budget: usize) -> Vec<&[PathBuf]> {
     let mut out = Vec::new();
     let mut start = 0;
     let mut size = 0usize;

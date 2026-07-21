@@ -34,6 +34,7 @@ pub struct Change {
 pub trait VersionFetcher {
     fn latest_ktfmt(&self) -> Result<String>;
     fn latest_gjf(&self) -> Result<String>;
+    fn latest_gradle_dependencies_sorter(&self) -> Result<String>;
 }
 
 pub struct UreqVersionFetcher;
@@ -64,6 +65,21 @@ impl VersionFetcher for UreqVersionFetcher {
         let tag = extract_json_string_field(&body, "tag_name")
             .ok_or_else(|| anyhow!("could not find `tag_name` in GitHub response from {url}"))?;
         Ok(tag.trim_start_matches('v').to_string())
+    }
+
+    fn latest_gradle_dependencies_sorter(&self) -> Result<String> {
+        let url = "https://repo1.maven.org/maven2/com/squareup/sort-gradle-dependencies-app/maven-metadata.xml";
+        let body = ureq::get(url)
+            .call()
+            .with_context(|| format!("GET {url}"))?
+            .into_body()
+            .read_to_string()
+            .context("read maven metadata body")?;
+        extract_xml_tag(&body, "release").ok_or_else(|| {
+            anyhow!(
+                "could not find <release> in Gradle Dependencies Sorter maven-metadata.xml at {url}"
+            )
+        })
     }
 }
 
@@ -104,6 +120,9 @@ pub fn run_upgrade(
 
     upgrade_section(&mut doc, "ktfmt", &mut outcome, || fetcher.latest_ktfmt())?;
     upgrade_section(&mut doc, "gjf", &mut outcome, || fetcher.latest_gjf())?;
+    upgrade_section(&mut doc, "gradle-dependencies-sorter", &mut outcome, || {
+        fetcher.latest_gradle_dependencies_sorter()
+    })?;
 
     if !dry_run && !outcome.changes.is_empty() {
         std::fs::write(config_path, doc.to_string())
@@ -175,6 +194,7 @@ mod tests {
     struct FakeFetcher {
         ktfmt: Result<String>,
         gjf: Result<String>,
+        gradle_dependencies_sorter: Result<String>,
     }
 
     impl FakeFetcher {
@@ -182,6 +202,7 @@ mod tests {
             Self {
                 ktfmt: Ok(ktfmt.to_string()),
                 gjf: Ok(gjf.to_string()),
+                gradle_dependencies_sorter: Ok("0.20.0".to_string()),
             }
         }
     }
@@ -195,6 +216,13 @@ mod tests {
         }
         fn latest_gjf(&self) -> Result<String> {
             self.gjf
+                .as_ref()
+                .map(String::clone)
+                .map_err(|e| anyhow!("{e}"))
+        }
+
+        fn latest_gradle_dependencies_sorter(&self) -> Result<String> {
+            self.gradle_dependencies_sorter
                 .as_ref()
                 .map(String::clone)
                 .map_err(|e| anyhow!("{e}"))
@@ -220,6 +248,24 @@ mod tests {
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(body.contains("version = \"0.62\""));
         assert!(body.contains("version = \"1.35.0\""));
+    }
+
+    #[test]
+    fn upgrades_gradle_dependencies_sorter_when_outdated() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_config(
+            dir.path(),
+            "[gradle-dependencies-sorter]\nversion = \"0.19.0\"\n",
+        );
+        let fetcher = FakeFetcher::new("0.62", "1.35.0");
+
+        let outcome = run_upgrade(&p, &fetcher, false).unwrap();
+
+        assert_eq!(outcome.changes.len(), 1);
+        assert_eq!(outcome.changes[0].tool, "gradle-dependencies-sorter");
+        assert!(std::fs::read_to_string(p)
+            .unwrap()
+            .contains("version = \"0.20.0\""));
     }
 
     #[test]

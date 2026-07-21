@@ -6,11 +6,12 @@ whitespace. Configured per repo via `.kempt.toml`.
 
 Supported targets:
 
-| Language | Extensions    | Formatter                                                          | Config section |
-|----------|---------------|--------------------------------------------------------------------|----------------|
-| Kotlin   | `.kt`, `.kts` | [ktfmt](https://github.com/facebook/ktfmt)                         | `[ktfmt]`      |
-| Java     | `.java`       | [google-java-format](https://github.com/google/google-java-format) | `[gjf]`        |
-| Rust     | `.rs`         | `cargo fmt`                                                        | `[rustfmt]`    |
+| Target              | Extensions                | Formatter                                                                            | Config section                   |
+|---------------------|---------------------------|--------------------------------------------------------------------------------------|----------------------------------|
+| Kotlin              | `.kt`, `.kts`             | [ktfmt](https://github.com/facebook/ktfmt)                                           | `[ktfmt]`                        |
+| Java                | `.java`                   | [google-java-format](https://github.com/google/google-java-format)                   | `[gjf]`                          |
+| Gradle dependencies | `.gradle`, `.gradle.kts` | [Gradle Dependencies Sorter](https://github.com/square/gradle-dependencies-sorter) | `[gradle-dependencies-sorter]`   |
+| Rust                | `.rs`                     | `cargo fmt`                                                                          | `[rustfmt]`                      |
 
 ## Install
 
@@ -39,7 +40,8 @@ cargo install kempt-fmt
 
 ### Notes
 
-A working `java` (JDK 17+) on `PATH` is required to run ktfmt and gjf (unless using `native`).
+A working `java` (JDK 17+) on `PATH` is required to run ktfmt, the Gradle
+Dependencies Sorter, and gjf unless gjf uses `native`.
 A working `cargo fmt` on `PATH` is required when `[rustfmt]` is enabled.
 
 ## Quick start
@@ -52,12 +54,14 @@ kempt install-hook     # writes .git/hooks/pre-commit
 kempt format           # format everything once
 ```
 
-`kempt init` walks the repo root looking for `.kt`/`.kts`, `.java`, and `.rs`
-source files, skipping gen/vcs dirs like `.git`, `build`, `target`, and
-`node_modules`. It tailors the starter config based on what it finds:
+`kempt init` walks the repo root looking for `.kt`/`.kts`, `.java`, `.rs`,
+`.gradle`, and `.gradle.kts` files, skipping generated/VCS directories like
+`.git`, `build`, `target`, and `node_modules`. It tailors the starter config
+based on what it finds:
 
 - `[ktfmt]` is emitted only when Kotlin files exist
 - `[gjf]` only when Java files exist
+- `[gradle-dependencies-sorter]` only when Gradle scripts exist
 - `[rustfmt]` only when Rust files exist.
 
 An empty repo gets all formatter sections. The versions
@@ -85,6 +89,10 @@ style = "google"           # google | kotlinlang | meta
 version = "1.35.0"
 style = "google"           # google | aosp
 native = "auto"            # auto | always | never
+
+[gradle-dependencies-sorter]
+version = "0.20.0"
+insert-blank-lines = true
 
 [rustfmt]
 
@@ -120,6 +128,9 @@ exclude = "config/ktfmt-skip.txt"   # polymorphic: array or file path
 # defaults: include = ["**/*.java"], exclude = []
 exclude = ["**/*Generated.java"]
 
+[gradle-dependencies-sorter.paths]
+# defaults: include = ["**/*.gradle", "**/*.gradle.kts"], exclude = []
+
 [rustfmt.paths]
 # defaults: include = ["**/*.rs"], exclude = []
 
@@ -147,6 +158,17 @@ header is inserted for that language.
 
 The exclude files are plain text, one glob per line, `#` comments allowed.
 
+### Gradle dependency sorting
+
+`[gradle-dependencies-sorter]` runs Square's standalone CLI fat JAR directly.
+Kempt does not apply the companion Gradle plugin or invoke Gradle tasks. It
+passes only the build scripts selected by the normal Kempt scope and path
+filters. `insert-blank-lines = true` matches the upstream default; set it to
+`false` to keep dependency configurations adjacent.
+
+`kempt check` sorts temporary copies and compares them with the originals, so
+the check remains read-only while reporting the exact scripts that need work.
+
 ### Two kinds of excludes
 
 kempt has two exclude mechanisms because they answer different questions:
@@ -173,6 +195,7 @@ defaults so you only configure these when you need to narrow further:
 |----------------------|---------------------------------------------------|-----------------|
 | `[ktfmt.paths]`      | `["**/*.kt", "**/*.kts"]`                         | `[]`            |
 | `[gjf.paths]`        | `["**/*.java"]`                                   | `[]`            |
+| `[gradle-dependencies-sorter.paths]` | `["**/*.gradle", "**/*.gradle.kts"]` | `[]` |
 | `[rustfmt.paths]`    | `["**/*.rs"]`                                     | `[]`            |
 | `[whitespace.paths]` | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | `[]`            |
 
@@ -273,6 +296,11 @@ default; the section that contains it is what enables the feature."
 | `[gjf.paths].exclude`               | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
 | `[gjf.license-header].file`         | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
 | `[gjf.license-header].excludes`     | none                                              | Path to a glob list.                                                                                                     |
+| `[gradle-dependencies-sorter].version` | -                                              | Maven Central CLI version. Either a literal or a catalog reference `{ file, key }`. Mutually exclusive with `path`.      |
+| `[gradle-dependencies-sorter].path` | -                                                 | Path to a checked-in fat JAR or executable CLI. Mutually exclusive with `version`.                                       |
+| `[gradle-dependencies-sorter].insert-blank-lines` | `true`                               | Insert blank lines between different dependency configurations.                                                          |
+| `[gradle-dependencies-sorter.paths].include` | `["**/*.gradle", "**/*.gradle.kts"]`       | Inline array or path to a glob-list file.                                                                                |
+| `[gradle-dependencies-sorter.paths].exclude` | `[]`                                        | Inline array or path to a glob-list file.                                                                                |
 | `[rustfmt.paths].include`           | `["**/*.rs"]`                                     | Inline array or path to a glob-list file.                                                                                |
 | `[rustfmt.paths].exclude`           | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
 | `[rustfmt.license-header].file`     | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
@@ -285,7 +313,8 @@ default; the section that contains it is what enables the feature."
 | `[whitespace.paths].exclude`        | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
 | `[hook].mode`                       | `"format"`                                        | `format` formats and re-stages. `check` fails the commit if changes are needed.                                          |
 
-Sections that are entirely optional: `[ktfmt]`, `[gjf]`, `[rustfmt]`,
+Sections that are entirely optional: `[ktfmt]`, `[gjf]`,
+`[gradle-dependencies-sorter]`, `[rustfmt]`,
 `[license-header]`, `[ktfmt.license-header]`, `[gjf.license-header]`,
 `[rustfmt.license-header]`.
 Omitting a section disables that step. `[paths]`, `[whitespace]`, and
@@ -297,7 +326,7 @@ Omitting a section disables that step. `[paths]`, `[whitespace]`, and
 |----------------------|------------------------------------------------------------------------------------------------------------------------------------------|
 | `kempt format`       | Format files in place.                                                                                                                   |
 | `kempt check`        | Dry-run; exits non-zero if changes are needed. Suitable for CI.                                                                          |
-| `kempt init`         | Scaffold `.kempt.toml`. Detects `.kt`/`.java`/`.rs` to decide which sections to write.                                                   |
+| `kempt init`         | Scaffold `.kempt.toml`. Detects source files and Gradle scripts to decide which sections to write.                                      |
 | `kempt install-hook` | Write a `.git/hooks/pre-commit` that calls `kempt hook`.                                                                                 |
 | `kempt hook`         | Run as the pre-commit hook. Not normally invoked manually.                                                                               |
 | `kempt update`       | Download formatter artifacts per config. Pre-warms the cache.                                                                            |
@@ -358,8 +387,8 @@ followed by an actionable trailer that's tailored to scope and content:
 - Pure parse errors: trailer says formatting can't proceed until they're
   fixed.
 
-ktfmt/gjf parse errors are surfaced with their file:line:col message; JVM
-deprecation warnings are filtered out, so the actual error is what you read.
+ktfmt, gjf, and Gradle Dependencies Sorter parse errors are surfaced while JVM
+warning noise is filtered out, so the actual error is what you read.
 
 ## Pre-commit hook
 
@@ -394,7 +423,8 @@ The hook does, in order:
    1. Stage the rest
    2. `git stash --keep-index`
    3. Commit with `--no-verify`.
-3. Run the full pipeline (license headers, whitespace, ktfmt, gjf, cargo fmt).
+3. Run the full pipeline (license headers, whitespace, Gradle dependency
+   sorting, ktfmt, gjf, cargo fmt).
 4. `git add --force` the formatted files back to the index (--force so tracked files
    inside ignored directories can still be re-staged).
 
@@ -414,7 +444,8 @@ be enabled explicitly:
 - set the `KEMPT_EXPERIMENTAL_PARTIAL_GJF` env flag to allow partially staged GJF-managed Java files
 
 kempt formats the staged content and updates the index directly, without
-staging unrelated worktree hunks. Other partially staged files still use the
+staging unrelated worktree hunks. Gradle Dependencies Sorter does not support
+partial-file formatting, so partially staged Gradle scripts still use the
 refusal path above.
 
 ## CI
@@ -534,10 +565,14 @@ version = { file = "gradle/libs.versions.toml", key = "ktfmt" }
 
 [gjf]
 version = { file = "gradle/libs.versions.toml" }   # key defaults to "gjf"
+
+[gradle-dependencies-sorter]
+version = { file = "gradle/libs.versions.toml" }
+# key defaults to "gradle-dependencies-sorter"
 ```
 
 kempt resolves the reference by reading the catalog's `[versions]` table
-at startup. The `key` field defaults to the tool name (`ktfmt` or `gjf`)
+at startup. The `key` field defaults to the tool's config-section name
 so the common case is even shorter:
 
 ```toml
@@ -551,7 +586,7 @@ Resolution rules:
   versions (`{ strictly = "1.0", require = "..." }`) error with a clear
   message.
 - The catalog file is parsed at most once per kempt invocation, even if
-  both `[ktfmt]` and `[gjf]` reference the same file.
+  multiple tools reference the same file.
 
 This works well with **Dependabot**, which doesn't natively understand
 `.kempt.toml`: keep a dummy `[libraries]` entry in `libs.versions.toml`
@@ -584,13 +619,23 @@ manager covers it cleanly. Add this to your `renovate.json`:
       "datasourceTemplate": "maven",
       "registryUrlTemplate": "https://repo1.maven.org/maven2",
       "depNameTemplate": "com.google.googlejavaformat:google-java-format"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": ["(^|/)\\.kempt\\.toml$"],
+      "matchStrings": [
+        "\\[gradle-dependencies-sorter\\][^\\[]*?version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "maven",
+      "registryUrlTemplate": "https://repo1.maven.org/maven2",
+      "depNameTemplate": "com.squareup:sort-gradle-dependencies-app"
     }
   ]
 }
 ```
 
 Each manager scans `.kempt.toml`, finds the first `version = "..."` after a
-matching tool section header (`[ktfmt]` or `[gjf]`), and tracks the
+matching tool section header, and tracks the
 corresponding Maven Central coordinate. Renovate opens a PR per upstream
 release.
 
@@ -623,7 +668,8 @@ and no native ktfmt at all.
 - `always`: native always; errors if not published for the host.
 - `never`: jar always.
 
-ktfmt is unaffected (always JVM).
+ktfmt and version-managed Gradle Dependencies Sorter installations always use
+the JVM.
 
 ### Checking in the binaries (hermetic / offline builds)
 
@@ -645,6 +691,9 @@ path = "config/bin/ktfmt-0.62.jar"
 
 [gjf]
 path = "config/bin/gjf-1.35.0.jar"
+
+[gradle-dependencies-sorter]
+path = "config/bin/gradle-dependencies-sorter-0.20.0.jar"
 ```
 
 `path` and `version` are mutually exclusive; exactly one must be set per

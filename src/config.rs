@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE: &str = ".kempt.toml";
 
-/// Where a tool's binary comes from after applying the rules in `[ktfmt]` /
-/// `[gjf]`.
+/// Where a tool's binary comes from after applying its `version` / `path`
+/// rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolSource {
     /// Download `version` into the user cache.
@@ -32,7 +32,7 @@ pub struct VersionRef {
     /// Path to a catalog TOML, relative to repo root or absolute.
     pub file: PathBuf,
     /// Lookup key under the catalog's `[versions]` table. Defaults to the
-    /// tool name (`ktfmt` or `gjf`).
+    /// tool's config-section name.
     pub key: Option<String>,
 }
 
@@ -133,6 +133,7 @@ impl VersionSpec {
 pub struct Config {
     pub ktfmt: Option<Ktfmt>,
     pub gjf: Option<Gjf>,
+    pub gradle_dependencies_sorter: Option<GradleDependenciesSorter>,
     pub rustfmt: Option<Rustfmt>,
     pub license_header: Option<LicenseHeader>,
     #[serde(default)]
@@ -209,6 +210,31 @@ impl Gjf {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct GradleDependenciesSorter {
+    /// Maven Central version. Mutually exclusive with `path`. Accepts either
+    /// a literal string or a catalog reference (see [`VersionSpec`]).
+    pub version: Option<VersionSpec>,
+    /// Path to a checked-in CLI artifact (relative to the repo root, or
+    /// absolute). `.jar` files run via `java -jar`; anything else runs
+    /// directly, such as the executable from the upstream distribution.
+    pub path: Option<PathBuf>,
+    /// Insert blank lines between different dependency configurations.
+    #[serde(default = "default_true")]
+    pub insert_blank_lines: bool,
+    /// Tool-specific path scope. Defaults to `**/*.gradle` and
+    /// `**/*.gradle.kts`.
+    pub paths: Option<ToolPaths>,
+}
+
+impl GradleDependenciesSorter {
+    pub fn resolve_paths(&self, repo_root: &Path) -> Result<ResolvedPaths> {
+        let p = self.paths.clone().unwrap_or_default();
+        p.resolve_with_defaults(repo_root, &["**/*.gradle", "**/*.gradle.kts"], &[])
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Rustfmt {
@@ -268,7 +294,8 @@ pub struct ResolvedHeader {
 
 /// Universal path filter applied before any tool-specific scope. Currently
 /// only excludes are configurable here; per-language inclusion lives in
-/// `[ktfmt.paths]`, `[gjf.paths]`, `[rustfmt.paths]`, and
+/// `[ktfmt.paths]`, `[gjf.paths]`, `[gradle-dependencies-sorter.paths]`,
+/// `[rustfmt.paths]`, and
 /// `[whitespace.paths]`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -395,12 +422,19 @@ impl Config {
         if let Some(g) = &self.gjf {
             validate_source_xor(g.version.as_ref(), g.path.as_deref(), "gjf")?;
         }
+        if let Some(g) = &self.gradle_dependencies_sorter {
+            validate_source_xor(
+                g.version.as_ref(),
+                g.path.as_deref(),
+                "gradle-dependencies-sorter",
+            )?;
+        }
         Ok(())
     }
 
     /// Resolve any [`VersionSpec::Ref`] entries against the filesystem.
-    /// After this returns Ok, every `Ktfmt::version` / `Gjf::version` is
-    /// either `None` or `Some(VersionSpec::Literal(_))`.
+    /// After this returns Ok, every tool version is either `None` or
+    /// `Some(VersionSpec::Literal(_))`.
     ///
     /// The same catalog file is parsed at most once per call.
     pub fn resolve_catalogs(mut self, repo_root: &Path) -> Result<Self> {
@@ -414,6 +448,13 @@ impl Config {
         if let Some(g) = &mut self.gjf {
             if let Some(VersionSpec::Ref(r)) = g.version.clone() {
                 let v = resolve_catalog_ref(&r, repo_root, "gjf", &mut cache)?;
+                g.version = Some(VersionSpec::Literal(v));
+            }
+        }
+        if let Some(g) = &mut self.gradle_dependencies_sorter {
+            if let Some(VersionSpec::Ref(r)) = g.version.clone() {
+                let v =
+                    resolve_catalog_ref(&r, repo_root, "gradle-dependencies-sorter", &mut cache)?;
                 g.version = Some(VersionSpec::Literal(v));
             }
         }
@@ -432,6 +473,16 @@ impl Ktfmt {
 }
 
 impl Gjf {
+    pub fn source(&self, repo_root: &Path) -> ToolSource {
+        resolve_source(
+            self.version.as_ref().map(|v| v.as_literal()),
+            self.path.as_deref(),
+            repo_root,
+        )
+    }
+}
+
+impl GradleDependenciesSorter {
     pub fn source(&self, repo_root: &Path) -> ToolSource {
         resolve_source(
             self.version.as_ref().map(|v| v.as_literal()),
@@ -557,6 +608,7 @@ mod tests {
         let c = Config::parse("").unwrap();
         assert!(c.ktfmt.is_none());
         assert!(c.gjf.is_none());
+        assert!(c.gradle_dependencies_sorter.is_none());
         assert!(c.rustfmt.is_none());
         assert!(c.license_header.is_none());
         assert!(c.whitespace.strip_trailing);
@@ -626,6 +678,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.gjf.unwrap().style, GjfStyle::Aosp);
+    }
+
+    #[test]
+    fn gradle_dependencies_sorter_defaults_match_upstream_cli() {
+        let c = Config::parse(
+            r#"
+            [gradle-dependencies-sorter]
+            version = "0.20.0"
+        "#,
+        )
+        .unwrap();
+        let sorter = c.gradle_dependencies_sorter.unwrap();
+        assert!(sorter.insert_blank_lines);
+        let paths = sorter.resolve_paths(Path::new("/repo")).unwrap();
+        assert_eq!(
+            paths.include,
+            vec!["**/*.gradle".to_string(), "**/*.gradle.kts".to_string()]
+        );
+        assert!(paths.exclude.is_empty());
+    }
+
+    #[test]
+    fn gradle_dependencies_sorter_can_disable_blank_lines() {
+        let c = Config::parse(
+            r#"
+            [gradle-dependencies-sorter]
+            version = "0.20.0"
+            insert-blank-lines = false
+        "#,
+        )
+        .unwrap();
+        assert!(!c.gradle_dependencies_sorter.unwrap().insert_blank_lines);
     }
 
     #[test]
@@ -1124,6 +1208,22 @@ mod tests {
     }
 
     #[test]
+    fn gradle_dependencies_sorter_requires_one_source() {
+        let missing = Config::parse("[gradle-dependencies-sorter]\n").unwrap_err();
+        assert!(format!("{missing:#}").contains("must set either"));
+
+        let both = Config::parse(
+            r#"
+            [gradle-dependencies-sorter]
+            version = "0.20.0"
+            path = "config/bin/gradle-dependencies-sorter.jar"
+        "#,
+        )
+        .unwrap_err();
+        assert!(format!("{both:#}").contains("pick one"));
+    }
+
+    #[test]
     fn ktfmt_path_only_is_valid() {
         let c = Config::parse(
             r#"
@@ -1193,6 +1293,22 @@ mod tests {
         .unwrap();
         let src = c.gjf.as_ref().unwrap().source(Path::new("/r"));
         assert_eq!(src, ToolSource::Local(PathBuf::from("/r/tools/gjf.jar")));
+    }
+
+    #[test]
+    fn gradle_dependencies_sorter_source_resolves_against_repo_root() {
+        let c = Config::parse(
+            r#"
+            [gradle-dependencies-sorter]
+            path = "tools/sort"
+        "#,
+        )
+        .unwrap();
+        let source = c
+            .gradle_dependencies_sorter
+            .unwrap()
+            .source(Path::new("/repo"));
+        assert_eq!(source, ToolSource::Local(PathBuf::from("/repo/tools/sort")));
     }
 
     #[test]
@@ -1283,6 +1399,33 @@ mod tests {
         .unwrap();
         assert_eq!(c.ktfmt.unwrap().version.unwrap().as_literal(), "0.62");
         assert_eq!(c.gjf.unwrap().version.unwrap().as_literal(), "1.35.0");
+    }
+
+    #[test]
+    fn gradle_dependencies_sorter_catalog_uses_section_name_as_default_key() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "gradle/libs.versions.toml",
+            "[versions]\ngradle-dependencies-sorter = \"0.20.0\"\n",
+        );
+        let c = Config::parse(
+            r#"
+            [gradle-dependencies-sorter]
+            version = { file = "gradle/libs.versions.toml" }
+        "#,
+        )
+        .unwrap()
+        .resolve_catalogs(dir.path())
+        .unwrap();
+        assert_eq!(
+            c.gradle_dependencies_sorter
+                .unwrap()
+                .version
+                .unwrap()
+                .as_literal(),
+            "0.20.0"
+        );
     }
 
     #[test]
