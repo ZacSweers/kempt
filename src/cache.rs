@@ -3,7 +3,8 @@
 //! Binary cache management.
 //!
 //! Cached files are version-suffixed so repos with different pins coexist:
-//! `ktfmt-<version>.jar`, `gjf-<version>.jar`, and native gjf binaries named
+//! `ktfmt-<version>.jar`, `gjf-<version>.jar`,
+//! `gradle-dependencies-sorter-<version>.jar`, and native gjf binaries named
 //! `gjf-<version>-<asset>[.exe]`.
 //!
 //! Downloads are abstracted behind [`Downloader`] so tests can fake them.
@@ -21,6 +22,9 @@ pub const GJF_URL: &str =
 
 pub const GJF_NATIVE_URL: &str =
     "https://github.com/google/google-java-format/releases/download/v{v}/google-java-format_{asset}{ext}";
+
+pub const GRADLE_DEPENDENCIES_SORTER_URL: &str =
+    "https://repo1.maven.org/maven2/com/squareup/sort-gradle-dependencies-app/{v}/sort-gradle-dependencies-app-{v}-all.jar";
 
 /// gjf's published native asset for a particular `(os, arch)` combo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +164,11 @@ impl Cache {
         self.root.join(format!("gjf-{version}.jar"))
     }
 
+    pub fn gradle_dependencies_sorter_path(&self, version: &str) -> PathBuf {
+        self.root
+            .join(format!("gradle-dependencies-sorter-{version}.jar"))
+    }
+
     /// Path for the gjf native binary on the given platform asset.
     pub fn gjf_native_path(&self, version: &str, asset: &NativeAsset) -> PathBuf {
         self.root
@@ -177,6 +186,17 @@ impl Cache {
     pub fn ensure_gjf_jar(&self, version: &str, downloader: &dyn Downloader) -> Result<PathBuf> {
         let dest = self.gjf_jar_path(version);
         let url = GJF_URL.replace("{v}", version);
+        self.ensure(&dest, &url, downloader)
+    }
+
+    /// Ensure the Gradle Dependencies Sorter CLI jar for `version` is present.
+    pub fn ensure_gradle_dependencies_sorter(
+        &self,
+        version: &str,
+        downloader: &dyn Downloader,
+    ) -> Result<PathBuf> {
+        let dest = self.gradle_dependencies_sorter_path(version);
+        let url = GRADLE_DEPENDENCIES_SORTER_URL.replace("{v}", version);
         self.ensure(&dest, &url, downloader)
     }
 
@@ -262,6 +282,9 @@ impl Cache {
 
 fn is_kempt_artifact_name(name: &str) -> bool {
     if let Some(rest) = name.strip_prefix("ktfmt-") {
+        return starts_with_digit(rest) && rest.ends_with(".jar");
+    }
+    if let Some(rest) = name.strip_prefix("gradle-dependencies-sorter-") {
         return starts_with_digit(rest) && rest.ends_with(".jar");
     }
     let Some(rest) = name.strip_prefix("gjf-") else {
@@ -367,6 +390,10 @@ mod tests {
         let c = Cache::new(PathBuf::from("/c"));
         assert_eq!(c.ktfmt_path("0.56"), PathBuf::from("/c/ktfmt-0.56.jar"));
         assert_eq!(c.gjf_jar_path("1.28.0"), PathBuf::from("/c/gjf-1.28.0.jar"));
+        assert_eq!(
+            c.gradle_dependencies_sorter_path("0.20.0"),
+            PathBuf::from("/c/gradle-dependencies-sorter-0.20.0.jar")
+        );
     }
 
     #[test]
@@ -408,6 +435,24 @@ mod tests {
         assert!(calls[0]
             .0
             .contains("google-java-format-1.28.0-all-deps.jar"));
+    }
+
+    #[test]
+    fn ensure_gradle_dependencies_sorter_uses_cli_fat_jar_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        let dl = FakeDownloader::new(b"sorter".to_vec());
+
+        let path = cache
+            .ensure_gradle_dependencies_sorter("0.20.0", &dl)
+            .unwrap();
+
+        assert!(path.ends_with("gradle-dependencies-sorter-0.20.0.jar"));
+        let calls = dl.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].0.ends_with(
+            "/com/squareup/sort-gradle-dependencies-app/0.20.0/sort-gradle-dependencies-app-0.20.0-all.jar"
+        ));
     }
 
     #[test]
@@ -538,8 +583,11 @@ mod tests {
         let dl = FakeDownloader::new(b"abcdef".to_vec());
         cache.ensure_ktfmt("0.56", &dl).unwrap();
         cache.ensure_gjf_jar("1.28.0", &dl).unwrap();
+        cache
+            .ensure_gradle_dependencies_sorter("0.20.0", &dl)
+            .unwrap();
         let entries = cache.list_entries().unwrap();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         for e in &entries {
             assert_eq!(e.size, 6);
         }
@@ -598,8 +646,11 @@ mod tests {
         let dl = FakeDownloader::new(b"x".to_vec());
         cache.ensure_ktfmt("0.56", &dl).unwrap();
         cache.ensure_gjf_jar("1.28.0", &dl).unwrap();
+        cache
+            .ensure_gradle_dependencies_sorter("0.20.0", &dl)
+            .unwrap();
         let removed = cache.prune(&[]).unwrap();
-        assert_eq!(removed.len(), 2);
+        assert_eq!(removed.len(), 3);
         assert!(cache.list_entries().unwrap().is_empty());
     }
 

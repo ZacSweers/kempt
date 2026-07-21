@@ -6,6 +6,7 @@ mod commands;
 mod config;
 mod formatters;
 mod git;
+mod gradle_dependencies;
 mod hook;
 mod license;
 mod paths;
@@ -100,7 +101,7 @@ fn run_vendor_subcommand(config_path: Option<PathBuf>, dir: PathBuf) -> Result<E
     let outcome = commands::run_vendor(&config, git.root(), &cache, &dl, &dir)?;
 
     if outcome.entries.is_empty() && outcome.skipped.is_empty() {
-        println!("kempt: nothing to vendor (no [ktfmt] or [gjf] in config)");
+        println!("kempt: nothing to vendor (no downloadable formatters in config)");
         return Ok(ExitCode::SUCCESS);
     }
 

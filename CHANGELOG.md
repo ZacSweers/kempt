@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Add Gradle dependency sorting for `.gradle` and `.gradle.kts` files through
+  Square's standalone Gradle Dependencies Sorter CLI.
+
 ## [0.3.0]
 
 _2026-07-14_

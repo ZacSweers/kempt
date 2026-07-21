@@ -1,9 +1,10 @@
 name: Bump starter versions
 
-# Runs weekly. Scrapes the latest ktfmt and gjf releases, edits the version
-# constants in `src/commands.rs`, runs the test suite, and opens a PR if
-# anything changed. The constants kempt init writes into a fresh
-# .kempt.toml track upstream this way without making init a network call.
+# Runs weekly. Scrapes the latest ktfmt, gjf, and Gradle Dependencies Sorter
+# releases, edits the version constants in `src/commands.rs`, runs the test
+# suite, and opens a PR if anything changed. The constants kempt init writes
+# into a fresh .kempt.toml track upstream this way without making init a
+# network call.
 
 on:
   schedule:
@@ -28,10 +29,14 @@ jobs:
           set -euo pipefail
           KTFMT=$(gh release view --repo facebook/ktfmt --json tagName --jq '.tagName' | sed 's/^v//')
           GJF=$(gh release view --repo google/google-java-format --json tagName --jq '.tagName' | sed 's/^v//')
+          GRADLE_SORTER=$(curl -fsSL https://repo1.maven.org/maven2/com/squareup/sort-gradle-dependencies-app/maven-metadata.xml | sed -n 's:.*<release>\([^<]*\)</release>.*:\1:p' | head -1)
+          test -n "$GRADLE_SORTER"
           echo "ktfmt=$KTFMT" >> "$GITHUB_OUTPUT"
           echo "gjf=$GJF" >> "$GITHUB_OUTPUT"
+          echo "gradle_sorter=$GRADLE_SORTER" >> "$GITHUB_OUTPUT"
           echo "Latest ktfmt: $KTFMT"
           echo "Latest gjf:   $GJF"
+          echo "Latest Gradle Dependencies Sorter: $GRADLE_SORTER"
 
       - name: Read current values
         id: current
@@ -39,8 +44,10 @@ jobs:
           set -euo pipefail
           KTFMT=$(grep -oE 'STARTER_KTFMT_VERSION: &str = "[0-9.]+"' src/commands.rs | grep -oE '[0-9.]+')
           GJF=$(grep -oE 'STARTER_GJF_VERSION: &str = "[0-9.]+"' src/commands.rs | grep -oE '[0-9.]+')
+          GRADLE_SORTER=$(grep -oE 'STARTER_GRADLE_DEPENDENCIES_SORTER_VERSION: &str = "[0-9.]+"' src/commands.rs | grep -oE '[0-9.]+')
           echo "ktfmt=$KTFMT" >> "$GITHUB_OUTPUT"
           echo "gjf=$GJF" >> "$GITHUB_OUTPUT"
+          echo "gradle_sorter=$GRADLE_SORTER" >> "$GITHUB_OUTPUT"
 
       - name: Decide whether to bump
         id: decide
@@ -62,6 +69,13 @@ jobs:
             commit_lines+=("gjf: ${{ steps.current.outputs.gjf }} -> ${{ steps.latest.outputs.gjf }}")
             body_lines+=("- gjf: \`${{ steps.current.outputs.gjf }}\` -> \`${{ steps.latest.outputs.gjf }}\`")
             body_lines+=("  <https://github.com/google/google-java-format/releases>")
+          fi
+
+          if [ "${{ steps.current.outputs.gradle_sorter }}" != "${{ steps.latest.outputs.gradle_sorter }}" ]; then
+            title_parts+=("Gradle Dependencies Sorter ${{ steps.latest.outputs.gradle_sorter }}")
+            commit_lines+=("Gradle Dependencies Sorter: ${{ steps.current.outputs.gradle_sorter }} -> ${{ steps.latest.outputs.gradle_sorter }}")
+            body_lines+=("- Gradle Dependencies Sorter: \`${{ steps.current.outputs.gradle_sorter }}\` -> \`${{ steps.latest.outputs.gradle_sorter }}\`")
+            body_lines+=("  <https://github.com/square/gradle-dependencies-sorter/releases>")
           fi
 
           if [ ${#title_parts[@]} -eq 0 ]; then
@@ -98,6 +112,8 @@ jobs:
           set -euo pipefail
           sed -i -E "s/(STARTER_KTFMT_VERSION: &str = \")[0-9.]+(\")/\\1${{ steps.latest.outputs.ktfmt }}\\2/" src/commands.rs
           sed -i -E "s/(STARTER_GJF_VERSION: &str = \")[0-9.]+(\")/\\1${{ steps.latest.outputs.gjf }}\\2/" src/commands.rs
+
+          sed -i -E 's/(STARTER_GRADLE_DEPENDENCIES_SORTER_VERSION: &str = ")[0-9.]+(")/\1${{ steps.latest.outputs.gradle_sorter }}\2/' src/commands.rs
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.decide.outputs.changed == 'true'
