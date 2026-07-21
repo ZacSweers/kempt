@@ -6,12 +6,12 @@ whitespace. Configured per repo via `.kempt.toml`.
 
 Supported targets:
 
-| Target              | Extensions                | Formatter                                                                            | Config section                   |
-|---------------------|---------------------------|--------------------------------------------------------------------------------------|----------------------------------|
-| Kotlin              | `.kt`, `.kts`             | [ktfmt](https://github.com/facebook/ktfmt)                                           | `[ktfmt]`                        |
-| Java                | `.java`                   | [google-java-format](https://github.com/google/google-java-format)                   | `[gjf]`                          |
-| Gradle dependencies | `.gradle`, `.gradle.kts` | [Gradle Dependencies Sorter](https://github.com/square/gradle-dependencies-sorter) | `[gradle-dependencies-sorter]`   |
-| Rust                | `.rs`                     | `cargo fmt`                                                                          | `[rustfmt]`                      |
+| Target              | Extensions               | Formatter                                                                          | Config section                 |
+|---------------------|--------------------------|------------------------------------------------------------------------------------|--------------------------------|
+| Kotlin              | `.kt`, `.kts`            | [ktfmt](https://github.com/facebook/ktfmt)                                         | `[ktfmt]`                      |
+| Java                | `.java`                  | [google-java-format](https://github.com/google/google-java-format)                 | `[gjf]`                        |
+| Gradle dependencies | `.gradle`, `.gradle.kts` | [Gradle Dependencies Sorter](https://github.com/square/gradle-dependencies-sorter) | `[gradle-dependencies-sorter]` |
+| Rust                | `.rs`                    | `cargo fmt`                                                                        | `[rustfmt]`                    |
 
 ## Install
 
@@ -191,13 +191,13 @@ the formatter should still run on a file that should not receive a header.
 Each tool has its own `paths.include` / `paths.exclude` with language
 defaults so you only configure these when you need to narrow further:
 
-| Tool                 | Default include                                   | Default exclude |
-|----------------------|---------------------------------------------------|-----------------|
-| `[ktfmt.paths]`      | `["**/*.kt", "**/*.kts"]`                         | `[]`            |
-| `[gjf.paths]`        | `["**/*.java"]`                                   | `[]`            |
-| `[gradle-dependencies-sorter.paths]` | `["**/*.gradle", "**/*.gradle.kts"]` | `[]` |
-| `[rustfmt.paths]`    | `["**/*.rs"]`                                     | `[]`            |
-| `[whitespace.paths]` | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | `[]`            |
+| Tool                                 | Default include                                   | Default exclude |
+|--------------------------------------|---------------------------------------------------|-----------------|
+| `[ktfmt.paths]`                      | `["**/*.kt", "**/*.kts"]`                         | `[]`            |
+| `[gjf.paths]`                        | `["**/*.java"]`                                   | `[]`            |
+| `[gradle-dependencies-sorter.paths]` | `["**/*.gradle", "**/*.gradle.kts"]`              | `[]`            |
+| `[rustfmt.paths]`                    | `["**/*.rs"]`                                     | `[]`            |
+| `[whitespace.paths]`                 | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | `[]`            |
 
 The global `[paths].exclude` is applied first as a universal filter; each
 tool's own `include` / `exclude` then narrows further. A file is processed
@@ -279,39 +279,39 @@ before config filters are applied.
 Every option, with its default. A `-` in the default column means "no built-in
 default; the section that contains it is what enables the feature."
 
-| Key                                 | Default                                           | Notes                                                                                                                    |
-|-------------------------------------|---------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
-| `[ktfmt].version`                   | -                                                 | Maven Central version. Either a literal `"0.62"` or a catalog reference `{ file, key }`. Mutually exclusive with `path`. |
-| `[ktfmt].path`                      | -                                                 | Path to a checked-in jar. Mutually exclusive with `version`.                                                             |
-| `[ktfmt].style`                     | `"google"`                                        | `google` / `kotlinlang` / `meta`                                                                                         |
-| `[ktfmt.paths].include`             | `["**/*.kt", "**/*.kts"]`                         | Inline array or path to a glob-list file.                                                                                |
-| `[ktfmt.paths].exclude`             | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
-| `[ktfmt.license-header].file`       | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
-| `[ktfmt.license-header].excludes`   | none                                              | Path to a glob list (one per line, `#` comments).                                                                        |
-| `[gjf].version`                     | -                                                 | GitHub release version. Either a literal or a catalog reference `{ file, key }`. Mutually exclusive with `path`.         |
-| `[gjf].path`                        | -                                                 | Path to a checked-in jar or native binary. Mutually exclusive with `version`.                                            |
-| `[gjf].style`                       | `"google"`                                        | `google` / `aosp`                                                                                                        |
-| `[gjf].native`                      | `"auto"`                                          | `auto` / `always` / `never`. See "Native gjf".                                                                           |
-| `[gjf.paths].include`               | `["**/*.java"]`                                   | Inline array or path to a glob-list file.                                                                                |
-| `[gjf.paths].exclude`               | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
-| `[gjf.license-header].file`         | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
-| `[gjf.license-header].excludes`     | none                                              | Path to a glob list.                                                                                                     |
-| `[gradle-dependencies-sorter].version` | -                                              | Maven Central CLI version. Either a literal or a catalog reference `{ file, key }`. Mutually exclusive with `path`.      |
-| `[gradle-dependencies-sorter].path` | -                                                 | Path to a checked-in fat JAR or executable CLI. Mutually exclusive with `version`.                                       |
-| `[gradle-dependencies-sorter].insert-blank-lines` | `true`                               | Insert blank lines between different dependency configurations.                                                          |
-| `[gradle-dependencies-sorter.paths].include` | `["**/*.gradle", "**/*.gradle.kts"]`       | Inline array or path to a glob-list file.                                                                                |
-| `[gradle-dependencies-sorter.paths].exclude` | `[]`                                        | Inline array or path to a glob-list file.                                                                                |
-| `[rustfmt.paths].include`           | `["**/*.rs"]`                                     | Inline array or path to a glob-list file.                                                                                |
-| `[rustfmt.paths].exclude`           | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
-| `[rustfmt.license-header].file`     | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
-| `[rustfmt.license-header].excludes` | none                                              | Path to a glob list.                                                                                                     |
-| `[license-header].file`             | -                                                 | Default license header template, `${YEAR}` expanded at write time. Section absence = no header insertion.                |
-| `[paths].exclude`                   | `["**/build/**", "**/target/**"]`                 | Global exclude, applied before any tool's filter. Inline array or path to a glob-list file.                              |
-| `[whitespace].strip-trailing`       | `true`                                            | Strip trailing space/tab/CR on every line.                                                                               |
-| `[whitespace].final-newline`        | `true`                                            | Ensure files end with exactly one `\n`.                                                                                  |
-| `[whitespace.paths].include`        | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | Inline array or path to a glob-list file.                                                                                |
-| `[whitespace.paths].exclude`        | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
-| `[hook].mode`                       | `"format"`                                        | `format` formats and re-stages. `check` fails the commit if changes are needed.                                          |
+| Key                                               | Default                                           | Notes                                                                                                                    |
+|---------------------------------------------------|---------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| `[ktfmt].version`                                 | -                                                 | Maven Central version. Either a literal `"0.62"` or a catalog reference `{ file, key }`. Mutually exclusive with `path`. |
+| `[ktfmt].path`                                    | -                                                 | Path to a checked-in jar. Mutually exclusive with `version`.                                                             |
+| `[ktfmt].style`                                   | `"google"`                                        | `google` / `kotlinlang` / `meta`                                                                                         |
+| `[ktfmt.paths].include`                           | `["**/*.kt", "**/*.kts"]`                         | Inline array or path to a glob-list file.                                                                                |
+| `[ktfmt.paths].exclude`                           | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
+| `[ktfmt.license-header].file`                     | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
+| `[ktfmt.license-header].excludes`                 | none                                              | Path to a glob list (one per line, `#` comments).                                                                        |
+| `[gjf].version`                                   | -                                                 | GitHub release version. Either a literal or a catalog reference `{ file, key }`. Mutually exclusive with `path`.         |
+| `[gjf].path`                                      | -                                                 | Path to a checked-in jar or native binary. Mutually exclusive with `version`.                                            |
+| `[gjf].style`                                     | `"google"`                                        | `google` / `aosp`                                                                                                        |
+| `[gjf].native`                                    | `"auto"`                                          | `auto` / `always` / `never`. See "Native gjf".                                                                           |
+| `[gjf.paths].include`                             | `["**/*.java"]`                                   | Inline array or path to a glob-list file.                                                                                |
+| `[gjf.paths].exclude`                             | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
+| `[gjf.license-header].file`                       | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
+| `[gjf.license-header].excludes`                   | none                                              | Path to a glob list.                                                                                                     |
+| `[gradle-dependencies-sorter].version`            | -                                                 | Maven Central CLI version. Either a literal or a catalog reference `{ file, key }`. Mutually exclusive with `path`.      |
+| `[gradle-dependencies-sorter].path`               | -                                                 | Path to a checked-in fat JAR or executable CLI. Mutually exclusive with `version`.                                       |
+| `[gradle-dependencies-sorter].insert-blank-lines` | `true`                                            | Insert blank lines between different dependency configurations.                                                          |
+| `[gradle-dependencies-sorter.paths].include`      | `["**/*.gradle", "**/*.gradle.kts"]`              | Inline array or path to a glob-list file.                                                                                |
+| `[gradle-dependencies-sorter.paths].exclude`      | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
+| `[rustfmt.paths].include`                         | `["**/*.rs"]`                                     | Inline array or path to a glob-list file.                                                                                |
+| `[rustfmt.paths].exclude`                         | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
+| `[rustfmt.license-header].file`                   | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
+| `[rustfmt.license-header].excludes`               | none                                              | Path to a glob list.                                                                                                     |
+| `[license-header].file`                           | -                                                 | Default license header template, `${YEAR}` expanded at write time. Section absence = no header insertion.                |
+| `[paths].exclude`                                 | `["**/build/**", "**/target/**"]`                 | Global exclude, applied before any tool's filter. Inline array or path to a glob-list file.                              |
+| `[whitespace].strip-trailing`                     | `true`                                            | Strip trailing space/tab/CR on every line.                                                                               |
+| `[whitespace].final-newline`                      | `true`                                            | Ensure files end with exactly one `\n`.                                                                                  |
+| `[whitespace.paths].include`                      | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | Inline array or path to a glob-list file.                                                                                |
+| `[whitespace.paths].exclude`                      | `[]`                                              | Inline array or path to a glob-list file.                                                                                |
+| `[hook].mode`                                     | `"format"`                                        | `format` formats and re-stages. `check` fails the commit if changes are needed.                                          |
 
 Sections that are entirely optional: `[ktfmt]`, `[gjf]`,
 `[gradle-dependencies-sorter]`, `[rustfmt]`,
@@ -326,7 +326,7 @@ Omitting a section disables that step. `[paths]`, `[whitespace]`, and
 |----------------------|------------------------------------------------------------------------------------------------------------------------------------------|
 | `kempt format`       | Format files in place.                                                                                                                   |
 | `kempt check`        | Dry-run; exits non-zero if changes are needed. Suitable for CI.                                                                          |
-| `kempt init`         | Scaffold `.kempt.toml`. Detects source files and Gradle scripts to decide which sections to write.                                      |
+| `kempt init`         | Scaffold `.kempt.toml`. Detects source files and Gradle scripts to decide which sections to write.                                       |
 | `kempt install-hook` | Write a `.git/hooks/pre-commit` that calls `kempt hook`.                                                                                 |
 | `kempt hook`         | Run as the pre-commit hook. Not normally invoked manually.                                                                               |
 | `kempt update`       | Download formatter artifacts per config. Pre-warms the cache.                                                                            |
