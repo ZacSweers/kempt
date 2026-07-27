@@ -6,7 +6,8 @@
 //! 1. [`collect_universe`] returns every candidate path for the chosen
 //!    [`Scope`] (git tracked, staged, walk, or an explicit list). No
 //!    filtering yet.
-//! 2. [`apply_global_excludes`] applies the universal `[paths].exclude`,
+//! 2. [`apply_global_excludes`] applies the resolved universal `[paths]`
+//!    exclusions,
 //!    yielding the set of paths kempt is allowed to touch.
 //!
 //! Per-tool include/exclude is then applied at the use site via
@@ -158,7 +159,7 @@ pub fn collect_universe(git: &dyn GitContext, scope: Scope) -> Result<Vec<PathBu
     }
 }
 
-/// Apply the universal `[paths].exclude` globset, returning the surviving
+/// Apply the universal `[paths]` exclusion globset, returning the surviving
 /// paths.
 pub fn apply_global_excludes(files: Vec<PathBuf>, exclude: &GlobSet) -> Vec<PathBuf> {
     files.into_iter().filter(|p| !exclude.is_match(p)).collect()

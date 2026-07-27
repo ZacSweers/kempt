@@ -732,8 +732,8 @@ const STARTER_HEADER: &str =
     "// Copyright (C) ${YEAR} <author>\n// SPDX-License-Identifier: Apache-2.0\n";
 
 /// Compute the candidate file set: universe (per scope) minus the global
-/// `[paths].exclude`. Per-tool include/exclude is applied later, at use
-/// site.
+/// the resolved `[paths]` exclusions. Per-tool include/exclude is applied
+/// later, at use site.
 fn collect_candidates(
     git: &dyn GitContext,
     scope: &Scope,
@@ -743,9 +743,9 @@ fn collect_candidates(
     if matches!(scope, Scope::Explicit { force: true, .. }) {
         return Ok(universe);
     }
-    let global_exclude_globs = config.paths.exclude.resolve(git.root())?;
+    let global_exclude_globs = config.paths.resolve_excludes(git.root())?;
     let global_exclude =
-        paths::build_globset(&global_exclude_globs).context("invalid [paths].exclude glob")?;
+        paths::build_globset(&global_exclude_globs).context("invalid [paths] exclusion glob")?;
     Ok(paths::apply_global_excludes(universe, &global_exclude))
 }
 
@@ -849,9 +849,7 @@ fn apply_pipeline(
 
     for rel in files {
         let abs = repo_root.join(rel);
-        let Some(kind) = SourceKind::from_path(rel) else {
-            continue;
-        };
+        let kind = SourceKind::from_path(rel);
 
         // License-header insertion is determined by file kind (extension)
         // plus the per-tool excludes list. Tool path scope (e.g. ktfmt's
@@ -859,12 +857,14 @@ fn apply_pipeline(
         // formatter routing are separate concerns. A user can configure a
         // global `[license-header]` without configuring `[ktfmt]` and
         // still get headers in their kt files.
-        let header_arg = headers.for_kind(kind).and_then(|h| {
-            if h.is_excluded(rel) {
-                None
-            } else {
-                Some((h.rendered.as_str(), h.marker.as_str()))
-            }
+        let header_arg = kind.and_then(|kind| {
+            headers.for_kind(kind).and_then(|h| {
+                if h.is_excluded(rel) {
+                    None
+                } else {
+                    Some((kind, h.rendered.as_str(), h.marker.as_str()))
+                }
+            })
         });
 
         // Whitespace passes only run if the file is in the whitespace tool's
@@ -883,7 +883,7 @@ fn apply_pipeline(
         let content =
             std::fs::read_to_string(&abs).with_context(|| format!("read {}", abs.display()))?;
         let (new_content, file_report) =
-            pipeline::process_content(&content, kind, header_arg, effective_ws);
+            pipeline::process_content(&content, header_arg, effective_ws);
         if file_report.changed() {
             report.record(rel, &file_report);
             if !options.check {
@@ -915,15 +915,15 @@ fn apply_partial_pipeline_to_index(
     let mut changed = BTreeSet::new();
 
     for rel in files {
-        let Some(kind) = SourceKind::from_path(rel) else {
-            continue;
-        };
-        let header_arg = headers.for_kind(kind).and_then(|h| {
-            if h.is_excluded(rel) {
-                None
-            } else {
-                Some((h.rendered.as_str(), h.marker.as_str()))
-            }
+        let kind = SourceKind::from_path(rel);
+        let header_arg = kind.and_then(|kind| {
+            headers.for_kind(kind).and_then(|h| {
+                if h.is_excluded(rel) {
+                    None
+                } else {
+                    Some((kind, h.rendered.as_str(), h.marker.as_str()))
+                }
+            })
         });
         let effective_ws = if scopes.matches_whitespace(rel) {
             ws_opts
@@ -938,7 +938,7 @@ fn apply_partial_pipeline_to_index(
         let content = String::from_utf8(staged_contents)
             .with_context(|| format!("staged file is not utf8: {}", rel.display()))?;
         let (new_content, file_report) =
-            pipeline::process_content(&content, kind, header_arg, effective_ws);
+            pipeline::process_content(&content, header_arg, effective_ws);
         if file_report.changed() {
             git.update_staged_file(rel, new_content.as_bytes())?;
             changed.insert(rel.clone());
@@ -1477,7 +1477,7 @@ mod tests {
                 file: PathBuf::from("config/header.txt"),
             }),
             paths: Paths {
-                exclude: crate::config::GlobList::Inline(vec![]),
+                exclude: crate::config::PathList::Replace(crate::config::GlobList::Inline(vec![])),
             },
             whitespace: Whitespace::default(),
             hook: Default::default(),
@@ -1645,7 +1645,7 @@ mod tests {
             rustfmt: None,
             license_header: None,
             paths: Paths {
-                exclude: crate::config::GlobList::Inline(vec![]),
+                exclude: crate::config::PathList::Replace(crate::config::GlobList::Inline(vec![])),
             },
             whitespace: Whitespace::default(),
             hook: Default::default(),
@@ -1683,7 +1683,7 @@ mod tests {
                 paths: None,
             }),
             paths: Paths {
-                exclude: crate::config::GlobList::Inline(vec![]),
+                exclude: crate::config::PathList::Replace(crate::config::GlobList::Inline(vec![])),
             },
             ..Default::default()
         }
@@ -1693,7 +1693,7 @@ mod tests {
         Config {
             rustfmt: Some(crate::config::Rustfmt::default()),
             paths: Paths {
-                exclude: crate::config::GlobList::Inline(vec![]),
+                exclude: crate::config::PathList::Replace(crate::config::GlobList::Inline(vec![])),
             },
             ..Default::default()
         }
@@ -1702,7 +1702,7 @@ mod tests {
     fn config_whitespace_only() -> Config {
         Config {
             paths: Paths {
-                exclude: crate::config::GlobList::Inline(vec![]),
+                exclude: crate::config::PathList::Replace(crate::config::GlobList::Inline(vec![])),
             },
             whitespace: Whitespace::default(),
             ..Default::default()
@@ -1812,6 +1812,64 @@ diff --git a/Foo.java b/Foo.java\n\
     }
 
     #[test]
+    fn whitespace_nested_extend_formats_additional_text_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "config/header.txt", "// (c) ${YEAR} test\n");
+        write(root, "src/Foo.kt", "package foo   \n");
+        write(root, "README.md", "# Kempt   \n");
+        write(root, ".gitignore", "build/   ");
+        write(root, "notes.txt", "leave this alone   ");
+        let cfg = Config::parse(
+            r#"
+            [license-header]
+            file = "config/header.txt"
+
+            [whitespace.paths]
+            include = { extend = ["**/*.md", "**/.gitignore"] }
+        "#,
+        )
+        .unwrap();
+        let git = FakeGit::new(root).with_tracked(vec![
+            "src/Foo.kt",
+            "README.md",
+            ".gitignore",
+            "notes.txt",
+        ]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_format(&cfg, &git, &cache, &dl, Scope::All, false, 2026).unwrap();
+
+        assert_eq!(
+            out.changed,
+            BTreeSet::from([
+                PathBuf::from(".gitignore"),
+                PathBuf::from("README.md"),
+                PathBuf::from("src/Foo.kt")
+            ])
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "# Kempt\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitignore")).unwrap(),
+            "build/\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "leave this alone   "
+        );
+        let kotlin = std::fs::read_to_string(root.join("src/Foo.kt")).unwrap();
+        assert!(kotlin.starts_with("// (c) 2026 test\n"));
+        assert!(!kotlin.contains("foo   "));
+        assert!(!std::fs::read_to_string(root.join("README.md"))
+            .unwrap()
+            .contains("// (c)"));
+    }
+
+    #[test]
     fn run_format_inserts_kts_header_after_shebang() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1855,6 +1913,32 @@ diff --git a/Foo.java b/Foo.java\n\
 
         let body = std::fs::read_to_string(root.join("src/Foo.kt")).unwrap();
         assert_eq!(body, "package foo   \n", "check mode must not modify files");
+    }
+
+    #[test]
+    fn whitespace_extended_text_file_check_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "README.md", "# Kempt   \n");
+        let cfg = Config::parse(
+            r#"
+            [whitespace.paths]
+            include = { extend = ["**/*.md"] }
+        "#,
+        )
+        .unwrap();
+        let git = FakeGit::new(root).with_tracked(vec!["README.md"]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_format(&cfg, &git, &cache, &dl, Scope::All, true, 2026).unwrap();
+
+        assert_eq!(out.changed, BTreeSet::from([PathBuf::from("README.md")]));
+        assert!(out.check_failed);
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "# Kempt   \n"
+        );
     }
 
     #[test]
@@ -1988,10 +2072,10 @@ diff --git a/Foo.java b/Foo.java\n\
         // It exits unless it observes the sorter's edit first.
         let mut cfg = config_gjf_only(fake_formatter_requiring_sorted_input(root));
         cfg.gjf.as_mut().unwrap().paths = Some(crate::config::ToolPaths {
-            include: Some(crate::config::GlobList::Inline(vec![
-                "**/*.gradle".to_string()
-            ])),
-            exclude: None,
+            include: Some(crate::config::PathList::Replace(
+                crate::config::GlobList::Inline(vec!["**/*.gradle".to_string()]),
+            )),
+            ..Default::default()
         });
         cfg.gradle_dependencies_sorter = Some(crate::config::GradleDependenciesSorter {
             version: None,
@@ -2210,6 +2294,67 @@ diff --git a/Foo.java b/Foo.java\n\
         let worktree = std::fs::read_to_string(root.join("src/Foo.kt")).unwrap();
         assert!(worktree.contains("fun staged() = \"new staged\"   \n"));
         assert!(worktree.contains("fun unstaged() = \"worktree unstaged\"   \n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_hook_partial_extended_whitespace_updates_only_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_cmd(root, &["init"]);
+        git_cmd(root, &["config", "user.email", "test@example.com"]);
+        git_cmd(root, &["config", "user.name", "Test User"]);
+
+        write(
+            root,
+            "README.md",
+            "staged: old\n\
+             unstaged: old\n",
+        );
+        git_cmd(root, &["add", "README.md"]);
+        git_cmd(root, &["commit", "-m", "initial"]);
+
+        write(
+            root,
+            "README.md",
+            "staged: new   \n\
+             unstaged: old\n",
+        );
+        git_cmd(root, &["add", "README.md"]);
+        write(
+            root,
+            "README.md",
+            "staged: new   \n\
+             unstaged: worktree   \n",
+        );
+
+        let cfg = Config::parse(
+            r#"
+            [whitespace.paths]
+            include = { extend = ["**/*.md"] }
+        "#,
+        )
+        .unwrap();
+        let git = RealGit::discover(root).unwrap();
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_hook_inner(
+            &cfg,
+            &git,
+            &cache,
+            &dl,
+            2026,
+            PartialFormattingOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(out.changed, BTreeSet::from([PathBuf::from("README.md")]));
+
+        let staged = git_cmd(root, &["show", ":README.md"]);
+        assert_eq!(staged, "staged: new\nunstaged: old\n");
+
+        let worktree = std::fs::read_to_string(root.join("README.md")).unwrap();
+        assert_eq!(worktree, "staged: new   \nunstaged: worktree   \n");
     }
 
     #[cfg(unix)]

@@ -128,14 +128,13 @@ fn load_excludes(path: Option<&Path>, repo_root: &Path) -> Result<GlobSet> {
 /// Returns the new content (which may equal the old content) and a report.
 pub fn process_content(
     content: &str,
-    kind: SourceKind,
-    header: Option<(&str, &str)>, // (rendered, marker)
+    header: Option<(SourceKind, &str, &str)>, // (kind, rendered, marker)
     ws: whitespace::Options,
 ) -> (String, FileReport) {
     let mut report = FileReport::default();
     let mut current = std::borrow::Cow::Borrowed(content);
 
-    if let Some((rendered, marker)) = header {
+    if let Some((kind, rendered, marker)) = header {
         if !license::has_header(&current, marker) {
             let new = license::insert_header(&current, rendered, kind);
             current = std::borrow::Cow::Owned(new);
@@ -171,8 +170,7 @@ mod tests {
     fn process_inserts_header_when_missing() {
         let (out, r) = process_content(
             "package foo\n",
-            SourceKind::Kotlin,
-            Some(("// (c) 2026\n", "(c)")),
+            Some((SourceKind::Kotlin, "// (c) 2026\n", "(c)")),
             ws_off(),
         );
         assert!(r.header_added);
@@ -183,8 +181,7 @@ mod tests {
     fn process_skips_header_when_present() {
         let (_out, r) = process_content(
             "// (c) 2025\npackage foo\n",
-            SourceKind::Kotlin,
-            Some(("// (c) 2026\n", "(c)")),
+            Some((SourceKind::Kotlin, "// (c) 2026\n", "(c)")),
             ws_off(),
         );
         assert!(!r.header_added);
@@ -192,14 +189,14 @@ mod tests {
 
     #[test]
     fn process_fixes_whitespace_when_dirty() {
-        let (out, r) = process_content("package foo   \n", SourceKind::Kotlin, None, ws_on());
+        let (out, r) = process_content("package foo   \n", None, ws_on());
         assert!(r.whitespace_fixed);
         assert_eq!(out, "package foo\n");
     }
 
     #[test]
     fn process_clean_input_no_changes() {
-        let (out, r) = process_content("package foo\n", SourceKind::Kotlin, None, ws_on());
+        let (out, r) = process_content("package foo\n", None, ws_on());
         assert!(!r.changed());
         assert_eq!(out, "package foo\n");
     }
@@ -208,8 +205,7 @@ mod tests {
     fn process_combines_steps() {
         let (out, r) = process_content(
             "package foo   \n",
-            SourceKind::Kotlin,
-            Some(("// h\n", "// h")),
+            Some((SourceKind::Kotlin, "// h\n", "// h")),
             ws_on(),
         );
         assert!(r.header_added);
@@ -224,7 +220,7 @@ mod tests {
             strip_trailing: true,
             final_newline: false,
         };
-        let (out, r) = process_content("foo   ", SourceKind::Kotlin, None, opts);
+        let (out, r) = process_content("foo   ", None, opts);
         assert!(r.whitespace_fixed);
         // Stripped trailing spaces but did not add a final newline.
         assert_eq!(out, "foo");
@@ -236,7 +232,7 @@ mod tests {
             strip_trailing: false,
             final_newline: true,
         };
-        let (out, r) = process_content("foo   ", SourceKind::Kotlin, None, opts);
+        let (out, r) = process_content("foo   ", None, opts);
         assert!(r.whitespace_fixed);
         // Added newline but kept the trailing whitespace.
         assert_eq!(out, "foo   \n");

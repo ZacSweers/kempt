@@ -56,6 +56,36 @@ impl GlobList {
     }
 }
 
+/// A path list either replaces the built-in defaults or extends them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum PathList {
+    Replace(GlobList),
+    Extend(ExtendedGlobList),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtendedGlobList {
+    pub extend: GlobList,
+}
+
+impl PathList {
+    fn resolve_with_defaults(&self, repo_root: &Path, defaults: &[&str]) -> Result<Vec<String>> {
+        match self {
+            Self::Replace(globs) => globs.resolve(repo_root),
+            Self::Extend(extension) => {
+                let mut resolved = defaults
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<_>>();
+                resolved.extend(extension.extend.resolve(repo_root)?);
+                Ok(resolved)
+            }
+        }
+    }
+}
+
 fn load_glob_file(repo_root: &Path, p: &Path) -> Result<Vec<String>> {
     let abs = if p.is_absolute() {
         p.to_path_buf()
@@ -72,12 +102,12 @@ fn load_glob_file(repo_root: &Path, p: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Per-tool path scope. Both fields polymorphic via [`GlobList`].
+/// Per-tool path scope. Each list can replace or extend its defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ToolPaths {
-    pub include: Option<GlobList>,
-    pub exclude: Option<GlobList>,
+    pub include: Option<PathList>,
+    pub exclude: Option<PathList>,
 }
 
 /// Path scope after defaults have been filled in and any file references
@@ -89,8 +119,7 @@ pub struct ResolvedPaths {
 }
 
 impl ToolPaths {
-    /// Resolve against per-tool defaults. Either field returns the user's
-    /// value when set, otherwise the default.
+    /// Resolve against per-tool defaults.
     pub fn resolve_with_defaults(
         &self,
         repo_root: &Path,
@@ -98,11 +127,11 @@ impl ToolPaths {
         default_exclude: &[&str],
     ) -> Result<ResolvedPaths> {
         let include = match &self.include {
-            Some(g) => g.resolve(repo_root)?,
+            Some(paths) => paths.resolve_with_defaults(repo_root, default_include)?,
             None => default_include.iter().map(|s| (*s).to_string()).collect(),
         };
         let exclude = match &self.exclude {
-            Some(g) => g.resolve(repo_root)?,
+            Some(paths) => paths.resolve_with_defaults(repo_root, default_exclude)?,
             None => default_exclude.iter().map(|s| (*s).to_string()).collect(),
         };
         Ok(ResolvedPaths { include, exclude })
@@ -301,7 +330,7 @@ pub struct ResolvedHeader {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Paths {
     #[serde(default = "default_global_exclude")]
-    pub exclude: GlobList,
+    pub exclude: PathList,
 }
 
 impl Default for Paths {
@@ -312,8 +341,22 @@ impl Default for Paths {
     }
 }
 
-fn default_global_exclude() -> GlobList {
-    GlobList::Inline(vec!["**/build/**".into(), "**/target/**".into()])
+impl Paths {
+    pub fn resolve_excludes(&self, repo_root: &Path) -> Result<Vec<String>> {
+        self.exclude
+            .resolve_with_defaults(repo_root, DEFAULT_GLOBAL_EXCLUDE)
+    }
+}
+
+const DEFAULT_GLOBAL_EXCLUDE: &[&str] = &["**/build/**", "**/target/**"];
+
+fn default_global_exclude() -> PathList {
+    PathList::Replace(GlobList::Inline(
+        DEFAULT_GLOBAL_EXCLUDE
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect(),
+    ))
 }
 
 /// Whitespace normalization knobs. Both pass-toggles default to enabled.
@@ -616,11 +659,11 @@ mod tests {
         assert_eq!(c.hook.mode, HookMode::Format);
         // Default global exclude is built-in (build/, target/).
         match &c.paths.exclude {
-            GlobList::Inline(v) => {
+            PathList::Replace(GlobList::Inline(v)) => {
                 assert!(v.contains(&"**/build/**".to_string()));
                 assert!(v.contains(&"**/target/**".to_string()));
             }
-            GlobList::FromFile(_) => panic!("expected inline list by default"),
+            other => panic!("expected inline replacement by default, got {other:?}"),
         }
     }
 
@@ -897,9 +940,26 @@ mod tests {
         )
         .unwrap();
         match &c.paths.exclude {
-            GlobList::Inline(v) => assert_eq!(v, &vec!["**/generated/**".to_string()]),
-            GlobList::FromFile(_) => panic!(),
+            PathList::Replace(GlobList::Inline(v)) => {
+                assert_eq!(v, &vec!["**/generated/**".to_string()])
+            }
+            other => panic!("expected inline replacement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn paths_nested_extend_appends_to_defaults() {
+        let c = Config::parse(
+            r#"
+            [paths]
+            exclude = { extend = ["**/generated/**"] }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.paths.resolve_excludes(Path::new("/repo")).unwrap(),
+            vec!["**/build/**", "**/target/**", "**/generated/**"]
+        );
     }
 
     #[test]
@@ -912,8 +972,10 @@ mod tests {
         )
         .unwrap();
         match &c.paths.exclude {
-            GlobList::FromFile(p) => assert_eq!(p, &PathBuf::from("config/global-excludes.txt")),
-            GlobList::Inline(_) => panic!("expected file path form"),
+            PathList::Replace(GlobList::FromFile(p)) => {
+                assert_eq!(p, &PathBuf::from("config/global-excludes.txt"))
+            }
+            other => panic!("expected file-path replacement, got {other:?}"),
         }
     }
 
@@ -1005,6 +1067,65 @@ mod tests {
     }
 
     #[test]
+    fn tool_path_extensions_append_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Config::parse(
+            r#"
+            [ktfmt]
+            version = "0.62"
+
+            [ktfmt.paths]
+            include = { extend = ["scripts/**/*.kts"] }
+            exclude = { extend = ["**/Legacy.kt"] }
+        "#,
+        )
+        .unwrap();
+        let resolved = c.ktfmt.unwrap().resolve_paths(dir.path()).unwrap();
+        assert_eq!(
+            resolved.include,
+            vec!["**/*.kt", "**/*.kts", "scripts/**/*.kts"]
+        );
+        assert_eq!(resolved.exclude, vec!["**/Legacy.kt"]);
+    }
+
+    #[test]
+    fn tool_path_extensions_accept_glob_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(
+            dir.path().join("config/extra-includes.txt"),
+            "**/*.md\n**/.gitignore\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config/extra-excludes.txt"),
+            "**/generated/**\n",
+        )
+        .unwrap();
+        let c = Config::parse(
+            r#"
+            [whitespace.paths]
+            include = { extend = "config/extra-includes.txt" }
+            exclude = { extend = "config/extra-excludes.txt" }
+        "#,
+        )
+        .unwrap();
+        let resolved = c.whitespace.resolve_paths(dir.path()).unwrap();
+        assert_eq!(
+            resolved.include,
+            vec![
+                "**/*.kt",
+                "**/*.kts",
+                "**/*.java",
+                "**/*.rs",
+                "**/*.md",
+                "**/.gitignore"
+            ]
+        );
+        assert_eq!(resolved.exclude, vec!["**/generated/**"]);
+    }
+
+    #[test]
     fn glob_list_accepts_inline_array_or_file_path() {
         // Inline.
         let c = Config::parse(
@@ -1018,7 +1139,9 @@ mod tests {
         )
         .unwrap();
         match &c.ktfmt.as_ref().unwrap().paths.as_ref().unwrap().include {
-            Some(GlobList::Inline(v)) => assert_eq!(v, &vec!["**/*.kt".to_string()]),
+            Some(PathList::Replace(GlobList::Inline(v))) => {
+                assert_eq!(v, &vec!["**/*.kt".to_string()])
+            }
             other => panic!("expected inline, got {other:?}"),
         }
 
@@ -1034,7 +1157,7 @@ mod tests {
         )
         .unwrap();
         match &c.ktfmt.as_ref().unwrap().paths.as_ref().unwrap().exclude {
-            Some(GlobList::FromFile(p)) => {
+            Some(PathList::Replace(GlobList::FromFile(p))) => {
                 assert_eq!(p, &PathBuf::from("config/ktfmt-skip.txt"))
             }
             other => panic!("expected file-path form, got {other:?}"),
