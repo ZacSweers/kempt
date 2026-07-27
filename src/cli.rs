@@ -9,7 +9,7 @@ pub enum Discovery {
     #[default]
     Vcs,
     /// Walk the filesystem from the repo root. Ignore files (`.gitignore`)
-    /// are not consulted. Use `[paths].exclude` to filter results. The
+    /// are not consulted. Use `[paths]` exclusions to filter results. The
     /// `.git/` directory is always pruned.
     Walk,
 }

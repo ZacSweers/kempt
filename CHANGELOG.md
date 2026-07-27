@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Support nested `{ extend = ... }` path includes and excludes, allowing whitespace normalization to add other paths without repeating Kempt's defaults.
 - Add Gradle dependency sorting for `.gradle` and `.gradle.kts` files through
   Square's standalone Gradle Dependencies Sorter CLI.
 
