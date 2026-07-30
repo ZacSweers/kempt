@@ -8,7 +8,7 @@ Supported targets:
 
 | Language | Extensions    | Formatter                                                          | Config section |
 |----------|---------------|--------------------------------------------------------------------|----------------|
-| Kotlin   | `.kt`, `.kts` | [ktfmt](https://github.com/facebook/ktfmt)                         | `[ktfmt]`      |
+| Kotlin   | `.kt`, `.kts` | [ktfmt](https://github.com/kotlin/ktfmt)                           | `[ktfmt]`      |
 | Java     | `.java`       | [google-java-format](https://github.com/google/google-java-format) | `[gjf]`        |
 | Rust     | `.rs`         | `cargo fmt`                                                        | `[rustfmt]`    |
 

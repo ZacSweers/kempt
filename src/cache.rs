@@ -17,7 +17,7 @@ pub const KTFMT_URL: &str =
     "https://repo1.maven.org/maven2/com/facebook/ktfmt/{v}/ktfmt-{v}-with-dependencies.jar";
 
 pub const KTFMT_NATIVE_URL: &str =
-    "https://github.com/facebook/ktfmt/releases/download/v{v}/ktfmt_{asset}{ext}";
+    "https://github.com/kotlin/ktfmt/releases/download/v{v}/ktfmt_{asset}{ext}";
 
 pub const GJF_URL: &str =
     "https://github.com/google/google-java-format/releases/download/v{v}/google-java-format-{v}-all-deps.jar";
@@ -486,7 +486,7 @@ mod tests {
         let calls = dl.calls.borrow();
         assert_eq!(
             calls[0].0,
-            "https://github.com/facebook/ktfmt/releases/download/v0.65/ktfmt_darwin-arm64"
+            "https://github.com/kotlin/ktfmt/releases/download/v0.65/ktfmt_darwin-arm64"
         );
         assert!(path.ends_with("ktfmt-0.65-darwin-arm64"));
         #[cfg(unix)]
