@@ -204,7 +204,7 @@ impl PartialFormatter {
                 };
                 Ok(Some((
                     resolve_ktfmt_invoker(kt, git.root(), cache, downloader)?,
-                    formatters::ktfmt_args(kt.style, false),
+                    formatters::ktfmt_args(kt.style, false, kt.editorconfig),
                 )))
             }
             Self::Gjf => {
@@ -1037,7 +1037,7 @@ fn apply_jvm_formatters(
     if let Some(kt) = &config.ktfmt {
         if !kt_files.is_empty() {
             let invoker = resolve_ktfmt_invoker(kt, repo_root, cache, downloader)?;
-            let base = formatters::ktfmt_args(kt.style, options.check);
+            let base = formatters::ktfmt_args(kt.style, options.check, kt.editorconfig);
             if options.check {
                 let run = formatters::run_ktfmt_argfile_check("ktfmt", &invoker, base, &kt_files)?;
                 merge_jvm_check_run(outcome, repo_root, run);
@@ -1255,32 +1255,36 @@ fn apply_partial_formatter_invocation_to_index(
         }
 
         let staged_contents = git.read_staged_file(rel)?;
-        let mut tmp = tempfile::Builder::new()
-            .prefix(&format!("kempt-partial-{tool}-"))
-            .suffix(partial_temp_suffix(rel))
-            .tempfile()
-            .with_context(|| format!("create partial {tool} tempfile"))?;
-        tmp.write_all(&staged_contents)
-            .with_context(|| format!("write staged contents for {}", rel.display()))?;
-        tmp.flush()
-            .with_context(|| format!("flush staged contents for {}", rel.display()))?;
-
         let mut args = base_args.clone();
         for (start, end) in line_ranges {
             args.push("--lines".into());
             args.push(format!("{start}:{end}").into());
         }
-        let temp_file = [tmp.path().to_path_buf()];
-        match formatter {
+        let formatted = match formatter {
             PartialFormatter::Ktfmt => {
-                formatters::run_ktfmt_argfile(tool, invoker, args, &temp_file)
+                let mut stdin_name = OsString::from("--stdin-name=");
+                stdin_name.push(git.root().join(rel));
+                args.push(stdin_name);
+                args.push("-".into());
+                formatters::run_ktfmt_argfile_stdin(tool, invoker, args, &staged_contents)
             }
-            PartialFormatter::Gjf => formatters::run_argfile(tool, invoker, args, &temp_file),
+            PartialFormatter::Gjf => (|| {
+                let mut tmp = tempfile::Builder::new()
+                    .prefix(&format!("kempt-partial-{tool}-"))
+                    .suffix(partial_temp_suffix(rel))
+                    .tempfile()
+                    .with_context(|| format!("create partial {tool} tempfile"))?;
+                tmp.write_all(&staged_contents)
+                    .with_context(|| format!("write staged contents for {}", rel.display()))?;
+                tmp.flush()
+                    .with_context(|| format!("flush staged contents for {}", rel.display()))?;
+                let temp_file = [tmp.path().to_path_buf()];
+                formatters::run_argfile(tool, invoker, args, &temp_file)?;
+                std::fs::read(tmp.path())
+                    .with_context(|| format!("read partial {tool} output for {}", rel.display()))
+            })(),
         }
         .with_context(|| format!("partial {tool} failed for {}", rel.display()))?;
-
-        let formatted = std::fs::read(tmp.path())
-            .with_context(|| format!("read partial {tool} output for {}", rel.display()))?;
         if formatted != staged_contents {
             git.update_staged_file(rel, &formatted)?;
             changed.insert(rel.clone());
@@ -1778,19 +1782,74 @@ mod tests {
         std::fs::write(
             &fake_ktfmt,
             "#!/bin/sh\n\
-             file=\"\"\n\
+             has_lines=\"\"\n\
+             has_stdin=\"\"\n\
+             physical_file=\"\"\n\
              for arg in \"$@\"; do\n\
                case \"$arg\" in\n\
                  @*)\n\
                    while IFS= read -r nested; do\n\
-                     case \"$nested\" in *.kt|*.kts) file=\"$nested\" ;; esac\n\
+                     case \"$nested\" in\n\
+                       --lines) has_lines=1 ;;\n\
+                       --stdin-name=*) ;;\n\
+                       -) has_stdin=1 ;;\n\
+                       *.kt|*.kts) physical_file=1 ;;\n\
+                     esac\n\
                    done < \"${arg#@}\"\n\
                    ;;\n\
+                 *) exit 6 ;;\n\
                esac\n\
              done\n\
-             [ -n \"$file\" ] || exit 2\n\
-             awk '{ if ($0 ~ /new staged/) print $0 \" // formatted\"; else print }' \"$file\" > \"$file.out\"\n\
-             mv \"$file.out\" \"$file\"\n",
+             [ -n \"$has_lines\" ] || exit 5\n\
+             [ -n \"$has_stdin\" ] || exit 4\n\
+             [ -z \"$physical_file\" ] || exit 3\n\
+             awk '{ if ($0 ~ /new staged/) print $0 \" // formatted\"; else print }'\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_ktfmt).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_ktfmt, perms).unwrap();
+        fake_ktfmt
+    }
+
+    #[cfg(unix)]
+    fn fake_ktfmt_editorconfig_marking_new_line(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake_ktfmt = root.join("fake-partial-ktfmt-editorconfig");
+        std::fs::write(
+            &fake_ktfmt,
+            "#!/bin/sh\n\
+             has_editorconfig=\"\"\n\
+             has_lines=\"\"\n\
+             has_stdin=\"\"\n\
+             stdin_name=\"\"\n\
+             physical_file=\"\"\n\
+             for arg in \"$@\"; do\n\
+               case \"$arg\" in\n\
+                 @*)\n\
+                   while IFS= read -r nested; do\n\
+                     case \"$nested\" in\n\
+                       --enable-editorconfig) has_editorconfig=1 ;;\n\
+                       --lines) has_lines=1 ;;\n\
+                       --stdin-name=*) stdin_name=\"${nested#--stdin-name=}\" ;;\n\
+                       -) has_stdin=1 ;;\n\
+                       *.kt|*.kts) physical_file=1 ;;\n\
+                     esac\n\
+                   done < \"${arg#@}\"\n\
+                   ;;\n\
+                 *) exit 9 ;;\n\
+               esac\n\
+             done\n\
+             [ -n \"$has_editorconfig\" ] || exit 8\n\
+             [ -n \"$has_lines\" ] || exit 7\n\
+             [ -n \"$has_stdin\" ] || exit 6\n\
+             [ -z \"$physical_file\" ] || exit 5\n\
+             case \"$stdin_name\" in /*/src/Foo.kt) ;; *) exit 4 ;; esac\n\
+             repo_root=\"${stdin_name%/src/Foo.kt}\"\n\
+             grep -Fqx -- '[src/Foo.kt]' \"$repo_root/.editorconfig\" || exit 3\n\
+             grep -Fqx -- 'indent_size = 4' \"$repo_root/.editorconfig\" || exit 2\n\
+             awk '{ if ($0 ~ /new staged/) print $0 \" // formatted\"; else print }'\n",
         )
         .unwrap();
         let mut perms = std::fs::metadata(&fake_ktfmt).unwrap().permissions();
@@ -2540,7 +2599,120 @@ diff --git a/Foo.java b/Foo.java\n\
             &[PathBuf::from("src/Foo.kt")],
             PartialFormatter::Ktfmt,
             &invoker,
-            formatters::ktfmt_args(crate::config::KtfmtStyle::Google, false),
+            formatters::ktfmt_args(crate::config::KtfmtStyle::Google, false, false),
+        )
+        .unwrap();
+        assert_eq!(changed, BTreeSet::from([PathBuf::from("src/Foo.kt")]));
+
+        let staged = git_cmd(root, &["show", ":src/Foo.kt"]);
+        assert_eq!(staged, expected_staged);
+        assert_eq!(
+            std::fs::read(root.join("src/Foo.kt")).unwrap(),
+            worktree_before
+        );
+    }
+
+    #[test]
+    fn partial_ktfmt_editorconfig_is_a_supported_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cfg = Config::parse(
+            r#"
+            [ktfmt]
+            path = "missing.jar"
+            editorconfig = true
+        "#,
+        )
+        .unwrap();
+        let targets = partial_formatter_targets(
+            &cfg,
+            root,
+            &[PathBuf::from("src/Foo.kt")],
+            PartialFormattingOptions {
+                ktfmt: true,
+                gjf: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            targets,
+            vec![(PartialFormatter::Ktfmt, vec![PathBuf::from("src/Foo.kt")])]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_ktfmt_editorconfig_uses_source_path_without_staging_unstaged_hunks() {
+        let dir = tempfile::Builder::new()
+            .prefix("kempt partial ")
+            .tempdir()
+            .unwrap();
+        let root = dir.path();
+        git_cmd(root, &["init"]);
+        git_cmd(root, &["config", "user.email", "test@example.com"]);
+        git_cmd(root, &["config", "user.name", "Test User"]);
+        write(
+            root,
+            ".editorconfig",
+            "root = true\n\n[src/Foo.kt]\nindent_size = 4\n",
+        );
+
+        write(
+            root,
+            "src/Foo.kt",
+            "class Foo {\n\
+             fun staged() {\n\
+               println(\"old staged\")\n\
+             }\n\
+             fun unstaged() {\n\
+               println(\"old unstaged\")\n\
+             }\n\
+             }\n",
+        );
+        git_cmd(root, &["add", "src/Foo.kt"]);
+        git_cmd(root, &["commit", "-m", "initial"]);
+
+        write(
+            root,
+            "src/Foo.kt",
+            "class Foo {\n\
+             fun staged() {\n\
+               println(\"new staged\")\n\
+             }\n\
+             fun unstaged() {\n\
+               println(\"old unstaged\")\n\
+             }\n\
+             }\n",
+        );
+        git_cmd(root, &["add", "src/Foo.kt"]);
+        write(
+            root,
+            "src/Foo.kt",
+            "class Foo {\n\
+             fun staged() {\n\
+               println(\"new staged\")\n\
+             }\n\
+             fun unstaged() {\n\
+               println(\"worktree unstaged\")\n\
+             }\n\
+             }\n",
+        );
+
+        let staged_before = git_cmd(root, &["show", ":src/Foo.kt"]);
+        let expected_staged = staged_before.replace(
+            "println(\"new staged\")",
+            "println(\"new staged\") // formatted",
+        );
+        let worktree_before = std::fs::read(root.join("src/Foo.kt")).unwrap();
+        let git = RealGit::discover(root).unwrap();
+        let invoker = formatters::Invoker::Native(fake_ktfmt_editorconfig_marking_new_line(root));
+        let changed = apply_partial_formatter_invocation_to_index(
+            &git,
+            &[PathBuf::from("src/Foo.kt")],
+            PartialFormatter::Ktfmt,
+            &invoker,
+            formatters::ktfmt_args(crate::config::KtfmtStyle::Google, false, true),
         )
         .unwrap();
         assert_eq!(changed, BTreeSet::from([PathBuf::from("src/Foo.kt")]));
@@ -2823,6 +2995,7 @@ diff --git a/Foo.java b/Foo.java\n\
                 version: Some(crate::config::VersionSpec::literal("0.56")),
                 path: None,
                 style: Default::default(),
+                editorconfig: false,
                 license_header: None,
                 native: NativeMode::Never,
                 paths: None,
@@ -2848,6 +3021,7 @@ diff --git a/Foo.java b/Foo.java\n\
                 version: Some(crate::config::VersionSpec::literal("0.65")),
                 path: None,
                 style: Default::default(),
+                editorconfig: false,
                 license_header: None,
                 native: NativeMode::Always,
                 paths: None,
@@ -2874,6 +3048,7 @@ diff --git a/Foo.java b/Foo.java\n\
                 version: None,
                 path: Some(PathBuf::from("config/bin/ktfmt.jar")),
                 style: Default::default(),
+                editorconfig: false,
                 license_header: None,
                 native: Default::default(),
                 paths: None,
@@ -2917,6 +3092,7 @@ diff --git a/Foo.java b/Foo.java\n\
                 version: None,
                 path: Some(PathBuf::from("config/bin/ktfmt.jar")),
                 style: Default::default(),
+                editorconfig: false,
                 license_header: None,
                 native: Default::default(),
                 paths: None,
@@ -2976,6 +3152,7 @@ diff --git a/Foo.java b/Foo.java\n\
                 version: Some(crate::config::VersionSpec::literal("0.65")),
                 path: None,
                 style: Default::default(),
+                editorconfig: false,
                 license_header: None,
                 native: NativeMode::Auto,
                 paths: None,
@@ -3028,6 +3205,7 @@ diff --git a/Foo.java b/Foo.java\n\
                 version: Some(crate::config::VersionSpec::literal("0.56")),
                 path: None,
                 style: Default::default(),
+                editorconfig: false,
                 license_header: None,
                 native: NativeMode::Never,
                 paths: None,
@@ -3098,6 +3276,7 @@ diff --git a/Foo.java b/Foo.java\n\
                 version: None,
                 path: Some(PathBuf::from("config/bin/ktfmt.jar")),
                 style: Default::default(),
+                editorconfig: false,
                 license_header: None,
                 native: Default::default(),
                 paths: None,
@@ -3196,6 +3375,7 @@ diff --git a/Foo.java b/Foo.java\n\
                 version: Some(crate::config::VersionSpec::literal("0.65")),
                 path: None,
                 style: Default::default(),
+                editorconfig: false,
                 license_header: None,
                 native: NativeMode::Always,
                 paths: None,
