@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Gradle Dependencies Sorter CLI integration.
 
+use crate::command_args;
 use crate::formatters::{self, Invoker};
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeSet;
@@ -96,11 +97,9 @@ fn run_cli(
     files: &[PathBuf],
 ) -> Result<String> {
     let base = args(insert_blank_lines);
-    let base_size: usize = base.iter().map(|a| a.len() + 1).sum();
-    let budget = formatters::MAX_ARG_BYTES.saturating_sub(base_size).max(1);
     let mut errors = Vec::new();
 
-    for chunk in formatters::chunk_files(files, budget) {
+    for chunk in command_args::path_chunks(&base, files) {
         let mut invocation = base.clone();
         invocation.extend(chunk.iter().map(|p| p.as_os_str().to_os_string()));
         let output = formatters::run_output(TOOL, invoker, &invocation, current_dir)?;

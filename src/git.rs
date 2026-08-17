@@ -5,6 +5,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -217,15 +218,18 @@ impl GitContext for RealGit {
         if paths.is_empty() {
             return Ok(());
         }
-        let mut cmd = Command::new("git");
-        cmd.arg("add")
+        let pathspec_file = write_pathspec_file(paths)?;
+        let mut pathspec_arg = OsString::from("--pathspec-from-file=");
+        pathspec_arg.push(pathspec_file.path());
+        let out = Command::new("git")
+            .arg("--literal-pathspecs")
+            .arg("add")
             .arg("--force")
-            .arg("--")
-            .current_dir(&self.root);
-        for p in paths {
-            cmd.arg(p);
-        }
-        let out = cmd.output().context("git add failed to spawn")?;
+            .arg(pathspec_arg)
+            .arg("--pathspec-file-nul")
+            .current_dir(&self.root)
+            .output()
+            .context("git add failed to spawn")?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(anyhow!("git add failed: {}", stderr.trim()));
@@ -328,6 +332,23 @@ impl GitContext for RealGit {
     }
 }
 
+fn write_pathspec_file(paths: &[PathBuf]) -> Result<tempfile::NamedTempFile> {
+    let mut pathspec_file = tempfile::Builder::new()
+        .prefix("kempt-git-pathspecs-")
+        .tempfile()
+        .context("create git pathspec file")?;
+    for path in paths {
+        pathspec_file
+            .write_all(path.as_os_str().as_encoded_bytes())
+            .with_context(|| format!("write {} to git pathspec file", path.display()))?;
+        pathspec_file
+            .write_all(&[0])
+            .context("terminate git pathspec")?;
+    }
+    pathspec_file.flush().context("flush git pathspec file")?;
+    Ok(pathspec_file)
+}
+
 impl RealGit {
     fn index_entry(&self, path: &Path) -> Result<(String, String)> {
         let out = Command::new("git")
@@ -402,17 +423,53 @@ mod tests {
         init_repo(root, "main");
         write(root, ".gitignore", "ignored/\n");
         write(root, "ignored/file.txt", "before\n");
+        write(root, "ignored/other file.txt", "before\n");
         git_cmd(root, &["add", ".gitignore"]);
-        git_cmd(root, &["add", "--force", "ignored/file.txt"]);
+        git_cmd(
+            root,
+            &[
+                "add",
+                "--force",
+                "ignored/file.txt",
+                "ignored/other file.txt",
+            ],
+        );
         git_cmd(root, &["commit", "-m", "initial"]);
 
         write(root, "ignored/file.txt", "after\n");
+        write(root, "ignored/other file.txt", "also after\n");
         let git = RealGit::discover(root).unwrap();
 
-        git.add(&[PathBuf::from("ignored/file.txt")]).unwrap();
+        git.add(&[
+            PathBuf::from("ignored/file.txt"),
+            PathBuf::from("ignored/other file.txt"),
+        ])
+        .unwrap();
 
         let staged = git_cmd(root, &["diff", "--cached", "--name-only"]);
-        assert_eq!(staged, "ignored/file.txt\n");
+        assert_eq!(staged, "ignored/file.txt\nignored/other file.txt\n");
+    }
+
+    #[test]
+    fn add_failure_does_not_partially_update_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_repo(root, "main");
+        write(root, "tracked.txt", "before\n");
+        git_cmd(root, &["add", "tracked.txt"]);
+        git_cmd(root, &["commit", "-m", "initial"]);
+        write(root, "tracked.txt", "after\n");
+        let git = RealGit::discover(root).unwrap();
+
+        let err = git
+            .add(&[
+                PathBuf::from("tracked.txt"),
+                PathBuf::from("does-not-exist.txt"),
+            ])
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("git add failed"));
+        assert!(git_cmd(root, &["diff", "--cached", "--name-only"]).is_empty());
     }
 
     #[test]

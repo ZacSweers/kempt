@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Format and re-stage large file sets without hitting operating-system command-line limits, including on Windows.
+
 ## [0.3.1]
 
 _2026-07-28_
