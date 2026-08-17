@@ -40,6 +40,8 @@ cargo install kempt-fmt
 
 ### Notes
 
+A working Git 2.25 or later is required.
+
 A working `java` (JDK 17+) on `PATH` is required to run ktfmt, the Gradle
 Dependencies Sorter, and gjf unless gjf uses `native`.
 A working `cargo fmt` on `PATH` is required when `[rustfmt]` is enabled.

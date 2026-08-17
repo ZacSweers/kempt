@@ -2,15 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Build java command lines for ktfmt and gjf, and execute them.
 //!
-//! Two helpers handle large file lists:
-//! - [`run_batched`] chunks the argv (used for ktfmt, which doesn't support
-//!   `@file`).
-//! - [`run_argfile`] writes the file list to a tempfile and passes it as
-//!   `@<path>` (used for gjf).
+//! ktfmt and GJF both support argument files, but with different parsing
+//! rules. ktfmt treats each line as one argument. GJF splits on whitespace,
+//! so paths containing whitespace fall back to direct, platform-aware batches.
 //!
 //! The [`Invoker`] enum abstracts over jar-via-JVM and native-binary modes
 //! so callers don't have to branch.
 
+use crate::command_args;
 use crate::config::{GjfStyle, KtfmtStyle};
 use anyhow::{anyhow, Context, Result};
 use std::ffi::OsString;
@@ -34,22 +33,16 @@ fn build_command(invoker: &Invoker) -> Result<Command> {
                 anyhow!("`java` not found on PATH (set JAVA_HOME or install a JDK)")
             })?;
             let mut cmd = Command::new(&java);
-            cmd.args(jvm_flags());
-            cmd.arg("-jar").arg(jar);
+            cmd.args(jar_args(jar));
             Ok(cmd)
         }
         Invoker::Native(bin) => Ok(Command::new(bin)),
     }
 }
 
-/// Conservative argv budget per process. `ARG_MAX` on macOS is 1 MiB, Linux
-/// is 2 MiB+. Picking 100 KiB leaves plenty of headroom for env vars and the
-/// fixed flags. Higher values would mean fewer JVM starts but more risk on
-/// constrained systems.
-pub const MAX_ARG_BYTES: usize = 100 * 1024;
-
 const JVM_FLAGS: &[&str] = &[
     "-Xmx512m",
+    "--disable-@files",
     "--add-opens=java.base/java.lang=ALL-UNNAMED",
     "--add-opens=java.base/java.util=ALL-UNNAMED",
     "--add-opens=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
@@ -68,8 +61,15 @@ pub fn jvm_flags() -> Vec<OsString> {
     JVM_FLAGS.iter().map(OsString::from).collect()
 }
 
+fn jar_args(jar: &std::path::Path) -> Vec<OsString> {
+    let mut args = jvm_flags();
+    args.push("-jar".into());
+    args.push(jar.as_os_str().to_os_string());
+    args
+}
+
 /// Static ktfmt flags (style, check mode). Does NOT include the file list;
-/// callers append files via [`run_batched`].
+/// callers include these with the paths passed to [`run_ktfmt_argfile`].
 pub fn ktfmt_args(style: KtfmtStyle, check: bool) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::with_capacity(4);
     args.push(
@@ -169,27 +169,15 @@ pub(crate) fn run_output(
         .with_context(|| format!("spawn {tool} failed"))
 }
 
-/// Run `tool` against `files` in batches. `base_args` is the static argument
-/// prefix (style, check, etc); each batch appends files until adding another
-/// would exceed `budget` bytes of argv. Suitable for tools that don't support
-/// `@file`.
-pub fn run_batched(
+fn run_batched(
     tool: &str,
     invoker: &Invoker,
     base_args: &[OsString],
     files: &[PathBuf],
-    budget: usize,
 ) -> Result<()> {
-    if files.is_empty() {
-        return Ok(());
-    }
-    let base_size: usize = base_args.iter().map(|a| a.len() + 1).sum();
-    let chunk_budget = budget.saturating_sub(base_size).max(1);
-    for chunk in chunk_files(files, chunk_budget) {
+    for chunk in command_args::path_chunks(base_args, files) {
         let mut args = base_args.to_vec();
-        for f in chunk {
-            args.push(f.into());
-        }
+        args.extend(chunk.iter().map(|path| path.as_os_str().to_os_string()));
         run(tool, invoker, args)?;
     }
     Ok(())
@@ -200,7 +188,7 @@ pub fn run_batched(
 /// because non-zero is expected when `--set-exit-if-changed` finds diffs.
 #[derive(Debug, Default)]
 pub struct CheckRun {
-    /// True if every batch exited zero (nothing to format, no parse errors).
+    /// True if the formatter exited zero (nothing to format, no parse errors).
     pub success: bool,
     /// File paths printed to stdout (one per line, trimmed). For ktfmt/gjf
     /// in `--dry-run` mode, these are the files that need reformatting.
@@ -211,9 +199,7 @@ pub struct CheckRun {
 
 impl CheckRun {
     fn merge(&mut self, other: CheckRun) {
-        if !other.success {
-            self.success = false;
-        }
+        self.success &= other.success;
         self.paths.extend(other.paths);
         if !other.stderr.is_empty() {
             if !self.stderr.is_empty() {
@@ -254,33 +240,58 @@ pub fn run_check(tool: &str, invoker: &Invoker, args: Vec<OsString>) -> Result<C
     })
 }
 
-/// Check-mode counterpart to [`run_batched`]. Aggregates captured output
-/// across all chunks.
-pub fn run_batched_check(
+fn run_batched_check(
     tool: &str,
     invoker: &Invoker,
     base_args: &[OsString],
     files: &[PathBuf],
-    budget: usize,
 ) -> Result<CheckRun> {
-    let mut acc = CheckRun {
+    let mut result = CheckRun {
         success: true,
         ..Default::default()
     };
-    if files.is_empty() {
-        return Ok(acc);
-    }
-    let base_size: usize = base_args.iter().map(|a| a.len() + 1).sum();
-    let chunk_budget = budget.saturating_sub(base_size).max(1);
-    for chunk in chunk_files(files, chunk_budget) {
+    for chunk in command_args::path_chunks(base_args, files) {
         let mut args = base_args.to_vec();
-        for f in chunk {
-            args.push(f.into());
-        }
-        let run = run_check(tool, invoker, args)?;
-        acc.merge(run);
+        args.extend(chunk.iter().map(|path| path.as_os_str().to_os_string()));
+        result.merge(run_check(tool, invoker, args)?);
     }
-    Ok(acc)
+    Ok(result)
+}
+
+/// Run ktfmt once with every option and source path in an argument file.
+/// ktfmt requires `@<path>` to be its only command-line argument.
+pub fn run_ktfmt_argfile(
+    tool: &str,
+    invoker: &Invoker,
+    base_args: Vec<OsString>,
+    files: &[PathBuf],
+) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let argfile = write_argfile(&base_args, files)?;
+    let result = run(tool, invoker, vec![argfile.0]);
+    drop(argfile.1);
+    result
+}
+
+/// Check-mode counterpart to [`run_ktfmt_argfile`].
+pub fn run_ktfmt_argfile_check(
+    tool: &str,
+    invoker: &Invoker,
+    base_args: Vec<OsString>,
+    files: &[PathBuf],
+) -> Result<CheckRun> {
+    if files.is_empty() {
+        return Ok(CheckRun {
+            success: true,
+            ..Default::default()
+        });
+    }
+    let argfile = write_argfile(&base_args, files)?;
+    let result = run_check(tool, invoker, vec![argfile.0]);
+    drop(argfile.1);
+    result
 }
 
 /// Check-mode counterpart to [`run_argfile`].
@@ -296,17 +307,18 @@ pub fn run_argfile_check(
             ..Default::default()
         });
     }
-    let argfile_arg = write_argfile(files)?;
-    let mut args = base_args;
-    args.push(argfile_arg.0);
-    let result = run_check(tool, invoker, args);
+    if files.iter().any(|path| path_requires_direct_args(path)) {
+        return run_batched_check(tool, invoker, &base_args, files);
+    }
+    let argfile_arg = write_argfile(&base_args, files)?;
+    let result = run_check(tool, invoker, vec![argfile_arg.0]);
     drop(argfile_arg.1); // keep tempfile alive until run_check returns
     result
 }
 
-/// Run `tool` once with the file list passed via `@<tempfile>`. The tempfile
-/// is auto-deleted when the function returns. Suitable for tools that support
-/// the `@file` argument syntax (gjf does, ktfmt does not).
+/// Run GJF once with its options and files passed via `@<tempfile>`. GJF
+/// splits argument-file contents on whitespace, so paths that cannot be
+/// represented safely use direct, platform-aware batches instead.
 pub fn run_argfile(
     tool: &str,
     invoker: &Invoker,
@@ -316,23 +328,37 @@ pub fn run_argfile(
     if files.is_empty() {
         return Ok(());
     }
-    let argfile_arg = write_argfile(files)?;
-    let mut args = base_args;
-    args.push(argfile_arg.0);
-    let result = run(tool, invoker, args);
+    if files.iter().any(|path| path_requires_direct_args(path)) {
+        return run_batched(tool, invoker, &base_args, files);
+    }
+    let argfile_arg = write_argfile(&base_args, files)?;
+    let result = run(tool, invoker, vec![argfile_arg.0]);
     drop(argfile_arg.1);
     result
 }
 
-/// Write `files` to a tempfile (one per line). Returns the `@<path>`
-/// argument and the keep-alive `NamedTempFile` (must be held by the caller
-/// until the subprocess finishes, otherwise the file is deleted).
-fn write_argfile(files: &[PathBuf]) -> Result<(OsString, tempfile::NamedTempFile)> {
+fn path_requires_direct_args(path: &std::path::Path) -> bool {
+    match path.to_str() {
+        Some(path) => path.chars().any(char::is_whitespace),
+        None => true,
+    }
+}
+
+/// Write `args` and `files` to a tempfile, one item per line. ktfmt preserves
+/// line boundaries. GJF callers ensure no item contains whitespace because
+/// its parser treats all breaking whitespace as a separator.
+fn write_argfile(
+    args: &[OsString],
+    files: &[PathBuf],
+) -> Result<(OsString, tempfile::NamedTempFile)> {
     let mut tmp = tempfile::Builder::new()
         .prefix("kempt-files-")
         .suffix(".txt")
         .tempfile()
         .context("create argfile tempfile")?;
+    for arg in args {
+        writeln!(tmp, "{}", arg.to_string_lossy()).context("write option to argfile")?;
+    }
     for f in files {
         writeln!(tmp, "{}", f.display())
             .with_context(|| format!("write {} to argfile", f.display()))?;
@@ -341,30 +367,6 @@ fn write_argfile(files: &[PathBuf]) -> Result<(OsString, tempfile::NamedTempFile
     let mut at_arg = OsString::from("@");
     at_arg.push(tmp.path().as_os_str());
     Ok((at_arg, tmp))
-}
-
-/// Split `files` into contiguous chunks whose serialized argv size stays
-/// under `budget` bytes. Each path contributes `path.len() + 1` (path bytes
-/// plus a separator). A single path larger than `budget` is still emitted as
-/// its own chunk; the OS will reject it if too large, but that's preferable
-/// to silently skipping.
-pub(crate) fn chunk_files(files: &[PathBuf], budget: usize) -> Vec<&[PathBuf]> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut size = 0usize;
-    for (i, f) in files.iter().enumerate() {
-        let s = f.as_os_str().len() + 1;
-        if size + s > budget && i > start {
-            out.push(&files[start..i]);
-            start = i;
-            size = 0;
-        }
-        size += s;
-    }
-    if start < files.len() {
-        out.push(&files[start..]);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -446,73 +448,50 @@ mod tests {
             .any(|x| x.contains("jdk.compiler/com.sun.tools.javac.api")));
     }
 
-    // --- chunker ---
+    #[test]
+    fn jar_invocation_disables_java_launcher_argfile_expansion() {
+        let args = jar_args(std::path::Path::new("formatter.jar"));
+        let strs: Vec<&str> = args.iter().map(s).collect();
+        let disable_argfiles = strs
+            .iter()
+            .position(|arg| *arg == "--disable-@files")
+            .unwrap();
+        let jar = strs.iter().position(|arg| *arg == "-jar").unwrap();
 
-    fn paths(items: &[&str]) -> Vec<PathBuf> {
-        items.iter().map(PathBuf::from).collect()
+        assert!(disable_argfiles < jar);
+        assert_eq!(strs[jar + 1], "formatter.jar");
     }
 
     #[test]
-    fn chunk_files_empty_input_yields_no_chunks() {
-        let v: Vec<PathBuf> = vec![];
-        assert!(chunk_files(&v, 100).is_empty());
-    }
-
-    #[test]
-    fn chunk_files_fits_in_one_chunk_under_budget() {
-        let v = paths(&["a.kt", "b.kt", "c.kt"]); // ~5 bytes each
-        let chunks = chunk_files(&v, 100);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 3);
-    }
-
-    #[test]
-    fn chunk_files_splits_when_budget_exceeded() {
-        // Each path is "aaaaaaaaaa" (10 chars) -> 11 bytes per file.
-        // Budget 22 bytes fits 2 paths per chunk.
-        let v: Vec<PathBuf> = (0..5).map(|_| PathBuf::from("aaaaaaaaaa")).collect();
-        let chunks = chunk_files(&v, 22);
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].len(), 2);
-        assert_eq!(chunks[1].len(), 2);
-        assert_eq!(chunks[2].len(), 1);
-    }
-
-    #[test]
-    fn chunk_files_single_file_larger_than_budget_gets_own_chunk() {
-        let v = paths(&["this/is/a/very/long/path/that/exceeds/budget.kt"]);
-        let chunks = chunk_files(&v, 5); // budget smaller than the path
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), 1);
-    }
-
-    #[test]
-    fn chunk_files_preserves_order_across_chunks() {
-        let v = paths(&["a", "b", "c", "d", "e"]);
-        // Each path is 2 bytes. Budget 4 fits 2 paths per chunk.
-        let chunks = chunk_files(&v, 4);
-        let flat: Vec<&PathBuf> = chunks.iter().flat_map(|c| c.iter()).collect();
-        assert_eq!(flat.len(), 5);
-        assert_eq!(flat[0].as_os_str(), "a");
-        assert_eq!(flat[4].as_os_str(), "e");
-    }
-
-    // --- batched runner short-circuit ---
-
-    #[test]
-    fn run_batched_with_no_files_does_not_spawn() {
+    fn run_ktfmt_argfile_with_no_files_does_not_spawn() {
         // Pass a jar path that doesn't exist. If the function spawned, we'd
         // get a different error; with empty files it should return Ok(())
         // without touching the JVM.
         let invoker = Invoker::Jar(PathBuf::from("/definitely/not/a/jar.jar"));
-        let result = run_batched(
+        let result = run_ktfmt_argfile(
             "ktfmt",
             &invoker,
-            &[OsString::from("--google-style")],
+            vec![OsString::from("--google-style")],
             &[],
-            MAX_ARG_BYTES,
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn ktfmt_argfile_contains_options_and_paths() {
+        let args = vec![OsString::from("--google-style"), OsString::from("--quiet")];
+        let files = vec![
+            PathBuf::from("src/Foo.kt"),
+            PathBuf::from("src/Foo Bar.kts"),
+        ];
+
+        let (at_arg, tempfile) = write_argfile(&args, &files).unwrap();
+
+        assert!(at_arg.to_string_lossy().starts_with('@'));
+        assert_eq!(
+            std::fs::read_to_string(tempfile.path()).unwrap(),
+            "--google-style\n--quiet\nsrc/Foo.kt\nsrc/Foo Bar.kts\n"
+        );
     }
 
     #[test]
@@ -527,6 +506,44 @@ mod tests {
         let invoker = Invoker::Native(PathBuf::from("/definitely/not/a/binary"));
         let result = run_argfile("gjf", &invoker, vec![OsString::from("--replace")], &[]);
         assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gjf_path_with_whitespace_uses_direct_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Foo Bar.java");
+        std::fs::write(&source, "class Foo {}\n").unwrap();
+        let formatter = dir.path().join("fake-gjf");
+        std::fs::write(
+            &formatter,
+            "#!/bin/sh\n\
+             for arg in \"$@\"; do\n\
+               case \"$arg\" in\n\
+                 @*) exit 9 ;;\n\
+                 *.java) printf '// formatted\\n' >> \"$arg\" ;;\n\
+               esac\n\
+             done\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&formatter).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&formatter, permissions).unwrap();
+
+        run_argfile(
+            "gjf",
+            &Invoker::Native(formatter),
+            vec![OsString::from("--replace")],
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(source).unwrap(),
+            "class Foo {}\n// formatted\n"
+        );
     }
 
     // --- jvm noise filter ---

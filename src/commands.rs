@@ -3,6 +3,7 @@
 //! Subcommand implementations. Glue between the lower-level modules.
 
 use crate::cache::{Cache, Downloader, GjfFlavor};
+use crate::command_args;
 use crate::config::{Config, Gjf, HookMode, NativeMode, ToolSource};
 use crate::formatters;
 use crate::git::GitContext;
@@ -996,23 +997,11 @@ fn apply_jvm_formatters(
             let invoker = formatters::Invoker::Jar(jar);
             let base = formatters::ktfmt_args(kt.style, options.check);
             if options.check {
-                let run = formatters::run_batched_check(
-                    "ktfmt",
-                    &invoker,
-                    &base,
-                    &kt_files,
-                    formatters::MAX_ARG_BYTES,
-                )?;
+                let run = formatters::run_ktfmt_argfile_check("ktfmt", &invoker, base, &kt_files)?;
                 merge_jvm_check_run(outcome, repo_root, run);
             } else {
                 let before = snapshot_files(&kt_files)?;
-                formatters::run_batched(
-                    "ktfmt",
-                    &invoker,
-                    &base,
-                    &kt_files,
-                    formatters::MAX_ARG_BYTES,
-                )?;
+                formatters::run_ktfmt_argfile("ktfmt", &invoker, base, &kt_files)?;
                 merge_format_changes(outcome, repo_root, before)?;
             }
         }
@@ -1111,9 +1100,12 @@ fn apply_rustfmt(
     } else {
         let abs_files: Vec<PathBuf> = rust_files.iter().map(|p| repo_root.join(p)).collect();
         let before = snapshot_files(&abs_files)?;
-        let output = cargo_fmt(repo_root, options.check, &rust_files)?;
-        if !output.status.success() {
-            return Err(formatter_failure("cargo fmt", output));
+        let fixed_args = cargo_fmt_args(false);
+        for chunk in command_args::path_chunks(&fixed_args, &rust_files) {
+            let output = cargo_fmt(repo_root, false, chunk)?;
+            if !output.status.success() {
+                return Err(formatter_failure("cargo fmt", output));
+            }
         }
         merge_format_changes(outcome, repo_root, before)?;
     }
@@ -1122,11 +1114,8 @@ fn apply_rustfmt(
 
 fn cargo_fmt(repo_root: &Path, check: bool, files: &[PathBuf]) -> Result<std::process::Output> {
     let mut cmd = Command::new("cargo");
-    cmd.arg("fmt");
-    if check {
-        cmd.arg("--check");
-    }
-    cmd.arg("--").current_dir(repo_root);
+    cmd.args(cargo_fmt_args(check));
+    cmd.current_dir(repo_root);
     for file in files {
         cmd.arg(file);
     }
@@ -1134,6 +1123,15 @@ fn cargo_fmt(repo_root: &Path, check: bool, files: &[PathBuf]) -> Result<std::pr
         .stderr(Stdio::piped())
         .output()
         .context("spawn cargo fmt failed")
+}
+
+fn cargo_fmt_args(check: bool) -> Vec<OsString> {
+    let mut args = vec![OsString::from("fmt")];
+    if check {
+        args.push(OsString::from("--check"));
+    }
+    args.push(OsString::from("--"));
+    args
 }
 
 fn append_rustfmt_stderr(outcome: &mut FormatOutcome, stderr: &[u8]) {
@@ -1195,16 +1193,17 @@ fn apply_partial_formatter_to_index(
     let Some((invoker, base_args)) = formatter.invocation(config, git, cache, downloader)? else {
         return Ok(BTreeSet::new());
     };
-    apply_partial_formatter_invocation_to_index(git, files, formatter.tool(), &invoker, base_args)
+    apply_partial_formatter_invocation_to_index(git, files, formatter, &invoker, base_args)
 }
 
 fn apply_partial_formatter_invocation_to_index(
     git: &dyn GitContext,
     files: &[PathBuf],
-    tool: &str,
+    formatter: PartialFormatter,
     invoker: &formatters::Invoker,
     base_args: Vec<OsString>,
 ) -> Result<BTreeSet<PathBuf>> {
+    let tool = formatter.tool();
     let mut changed = BTreeSet::new();
     for rel in files {
         let diff = git.staged_diff(rel, 0)?;
@@ -1229,9 +1228,14 @@ fn apply_partial_formatter_invocation_to_index(
             args.push("--lines".into());
             args.push(format!("{start}:{end}").into());
         }
-        args.push(tmp.path().into());
-        formatters::run(tool, invoker, args)
-            .with_context(|| format!("partial {tool} failed for {}", rel.display()))?;
+        let temp_file = [tmp.path().to_path_buf()];
+        match formatter {
+            PartialFormatter::Ktfmt => {
+                formatters::run_ktfmt_argfile(tool, invoker, args, &temp_file)
+            }
+            PartialFormatter::Gjf => formatters::run_argfile(tool, invoker, args, &temp_file),
+        }
+        .with_context(|| format!("partial {tool} failed for {}", rel.display()))?;
 
         let formatted = std::fs::read(tmp.path())
             .with_context(|| format!("read partial {tool} output for {}", rel.display()))?;
@@ -1588,6 +1592,7 @@ mod tests {
                    argfile=\"${arg#@}\"\n\
                    while IFS= read -r f; do\n\
                      [ -n \"$f\" ] || continue\n\
+                     case \"$f\" in -*) continue ;; esac\n\
                      printf 'reformatted\\n' >> \"$f\"\n\
                    done < \"$argfile\"\n\
                    ;;\n\
@@ -1615,6 +1620,7 @@ mod tests {
                    argfile=\"${arg#@}\"\n\
                    while IFS= read -r file; do\n\
                      [ -n \"$file\" ] || continue\n\
+                     case \"$file\" in -*) continue ;; esac\n\
                      grep -q '// sorted' \"$file\" || exit 9\n\
                      printf '// formatted after sorting\\n' >> \"$file\"\n\
                    done < \"$argfile\"\n\
@@ -1720,6 +1726,11 @@ mod tests {
              file=\"\"\n\
              for arg in \"$@\"; do\n\
                case \"$arg\" in\n\
+                 @*)\n\
+                   while IFS= read -r nested; do\n\
+                     case \"$nested\" in *.java) file=\"$nested\" ;; esac\n\
+                   done < \"${arg#@}\"\n\
+                   ;;\n\
                  *.java) file=\"$arg\" ;;\n\
                esac\n\
              done\n\
@@ -1745,7 +1756,11 @@ mod tests {
              file=\"\"\n\
              for arg in \"$@\"; do\n\
                case \"$arg\" in\n\
-                 *.kt|*.kts) file=\"$arg\" ;;\n\
+                 @*)\n\
+                   while IFS= read -r nested; do\n\
+                     case \"$nested\" in *.kt|*.kts) file=\"$nested\" ;; esac\n\
+                   done < \"${arg#@}\"\n\
+                   ;;\n\
                esac\n\
              done\n\
              [ -n \"$file\" ] || exit 2\n\
@@ -2487,12 +2502,18 @@ diff --git a/Foo.java b/Foo.java\n\
              }\n",
         );
 
+        let staged_before = git_cmd(root, &["show", ":src/Foo.kt"]);
+        let expected_staged = staged_before.replace(
+            "println(\"new staged\")",
+            "println(\"new staged\") // formatted",
+        );
+        let worktree_before = std::fs::read(root.join("src/Foo.kt")).unwrap();
         let git = RealGit::discover(root).unwrap();
         let invoker = formatters::Invoker::Native(fake_ktfmt_marking_new_line(root));
         let changed = apply_partial_formatter_invocation_to_index(
             &git,
             &[PathBuf::from("src/Foo.kt")],
-            "ktfmt",
+            PartialFormatter::Ktfmt,
             &invoker,
             formatters::ktfmt_args(crate::config::KtfmtStyle::Google, false),
         )
@@ -2500,14 +2521,11 @@ diff --git a/Foo.java b/Foo.java\n\
         assert_eq!(changed, BTreeSet::from([PathBuf::from("src/Foo.kt")]));
 
         let staged = git_cmd(root, &["show", ":src/Foo.kt"]);
-        assert!(staged.contains("new staged\") // formatted"));
-        assert!(staged.contains("old unstaged"));
-        assert!(!staged.contains("worktree unstaged"));
-
-        let worktree = std::fs::read_to_string(root.join("src/Foo.kt")).unwrap();
-        assert!(worktree.contains("new staged\")"));
-        assert!(worktree.contains("worktree unstaged"));
-        assert!(!worktree.contains("// formatted"));
+        assert_eq!(staged, expected_staged);
+        assert_eq!(
+            std::fs::read(root.join("src/Foo.kt")).unwrap(),
+            worktree_before
+        );
     }
 
     #[test]
