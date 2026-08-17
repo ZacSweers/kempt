@@ -726,7 +726,7 @@ fn copy_into(
 /// `pub const NAME: &str = "x.y.z";` exactly so the workflow's regex hits.
 pub const STARTER_KTFMT_VERSION: &str = "0.64";
 pub const STARTER_GJF_VERSION: &str = "1.36.1";
-pub const STARTER_GRADLE_DEPENDENCIES_SORTER_VERSION: &str = "0.20.0";
+pub const STARTER_GRADLE_DEPENDENCIES_SORTER_VERSION: &str = "0.21.0";
 
 const STARTER_HEADER: &str =
     "// Copyright (C) ${YEAR} <author>\n// SPDX-License-Identifier: Apache-2.0\n";
