@@ -4,7 +4,7 @@
 
 - Support ktfmt 0.65 native release archives on macOS ARM64, Linux x86-64, and Windows x86-64, with automatic JVM jar fallback on other platforms.
 - Format and re-stage large file sets without hitting operating-system command-line limits, including on Windows.
-- Add opt-in ktfmt EditorConfig support with per-file configuration lookup, including for partially staged files, and IDE alignment guidance.
+- Add opt-in ktfmt EditorConfig support, including for partially staged files, and explain how to use the same settings in IntelliJ IDEA and Android Studio.
 
 ## [0.3.1]
 
