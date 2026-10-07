@@ -176,17 +176,24 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Ktfmt {
-    /// Maven Central version. Mutually exclusive with `path`. Accepts either
-    /// a literal string (`"0.62"`) or a catalog reference table
+    /// GitHub release version. Mutually exclusive with `path`. Accepts either a
+    /// literal string (`"0.65"`) or a catalog reference table
     /// (`{ file = "gradle/libs.versions.toml", key = "ktfmt" }`).
     pub version: Option<VersionSpec>,
     /// Path to a checked-in formatter binary (relative to the repo root, or
-    /// absolute). Mutually exclusive with `version`. Use this when you commit
-    /// the formatter into the repo for hermetic / offline builds.
+    /// absolute). Mutually exclusive with `version`. The file extension
+    /// determines how kempt invokes it: `.jar` runs via `java -jar`, anything
+    /// else is run directly (e.g. a GraalVM native build).
     pub path: Option<PathBuf>,
     #[serde(default)]
     pub style: KtfmtStyle,
     pub license_header: Option<ToolLicenseHeader>,
+    /// Whether to use ktfmt's GraalVM-native executable instead of the JVM
+    /// jar. `auto` (default) uses native when available for this platform +
+    /// version, `always` requires it, and `never` always uses the jar. Ignored
+    /// when `path` is set.
+    #[serde(default)]
+    pub native: NativeMode,
     /// Tool-specific path scope. Defaults to `**/*.kt` and `**/*.kts`.
     pub paths: Option<ToolPaths>,
 }
@@ -680,6 +687,7 @@ mod tests {
         assert_eq!(kt.version.as_ref().unwrap().as_literal(), "0.56");
         assert!(kt.path.is_none());
         assert_eq!(kt.style, KtfmtStyle::Google);
+        assert_eq!(kt.native, NativeMode::Auto);
     }
 
     #[test]
@@ -693,6 +701,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.ktfmt.unwrap().style, KtfmtStyle::Kotlinlang);
+    }
+
+    #[test]
+    fn ktfmt_explicit_native_mode() {
+        let c = Config::parse(
+            r#"
+            [ktfmt]
+            version = "0.65"
+            native = "never"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(c.ktfmt.unwrap().native, NativeMode::Never);
     }
 
     #[test]

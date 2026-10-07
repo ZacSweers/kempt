@@ -27,7 +27,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          KTFMT=$(gh release view --repo facebook/ktfmt --json tagName --jq '.tagName' | sed 's/^v//')
+          KTFMT=$(gh release view --repo kotlin/ktfmt --json tagName --jq '.tagName' | sed 's/^v//')
           GJF=$(gh release view --repo google/google-java-format --json tagName --jq '.tagName' | sed 's/^v//')
           GRADLE_SORTER=$(curl -fsSL https://repo1.maven.org/maven2/com/squareup/sort-gradle-dependencies-app/maven-metadata.xml | sed -n 's:.*<release>\([^<]*\)</release>.*:\1:p' | head -1)
           test -n "$GRADLE_SORTER"
@@ -61,7 +61,7 @@ jobs:
             title_parts+=("ktfmt ${{ steps.latest.outputs.ktfmt }}")
             commit_lines+=("ktfmt: ${{ steps.current.outputs.ktfmt }} -> ${{ steps.latest.outputs.ktfmt }}")
             body_lines+=("- ktfmt: \`${{ steps.current.outputs.ktfmt }}\` -> \`${{ steps.latest.outputs.ktfmt }}\`")
-            body_lines+=("  <https://github.com/facebook/ktfmt/releases>")
+            body_lines+=("  <https://github.com/kotlin/ktfmt/releases>")
           fi
 
           if [ "${{ steps.current.outputs.gjf }}" != "${{ steps.latest.outputs.gjf }}" ]; then

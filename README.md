@@ -8,7 +8,7 @@ Supported targets:
 
 | Target              | Extensions               | Formatter                                                                          | Config section                 |
 |---------------------|--------------------------|------------------------------------------------------------------------------------|--------------------------------|
-| Kotlin              | `.kt`, `.kts`            | [ktfmt](https://github.com/facebook/ktfmt)                                         | `[ktfmt]`                      |
+| Kotlin              | `.kt`, `.kts`            | [ktfmt](https://github.com/kotlin/ktfmt)                                           | `[ktfmt]`                      |
 | Java                | `.java`                  | [google-java-format](https://github.com/google/google-java-format)                 | `[gjf]`                        |
 | Gradle dependencies | `.gradle`, `.gradle.kts` | [Gradle Dependencies Sorter](https://github.com/square/gradle-dependencies-sorter) | `[gradle-dependencies-sorter]` |
 | Rust                | `.rs`                    | `cargo fmt`                                                                        | `[rustfmt]`                    |
@@ -42,8 +42,8 @@ cargo install kempt-fmt
 
 A working Git 2.25 or later is required.
 
-A working `java` (JDK 17+) on `PATH` is required to run ktfmt, the Gradle
-Dependencies Sorter, and gjf unless gjf uses `native`.
+A working `java` (JDK 17+) on `PATH` is required to run the Gradle Dependencies
+Sorter and any ktfmt or gjf configuration that does not use `native`.
 A working `cargo fmt` on `PATH` is required when `[rustfmt]` is enabled.
 
 ## Quick start
@@ -84,8 +84,9 @@ disable that step.
 
 ```toml
 [ktfmt]
-version = "0.63"
+version = "0.65"
 style = "google"           # google | kotlinlang | meta
+native = "auto"            # auto | always | never
 
 [gjf]
 version = "1.35.0"
@@ -278,9 +279,10 @@ default; the section that contains it is what enables the feature."
 
 | Key                                               | Default                                           | Notes                                                                                                                    |
 |---------------------------------------------------|---------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
-| `[ktfmt].version`                                 | -                                                 | Maven Central version. Either a literal `"0.62"` or a catalog reference `{ file, key }`. Mutually exclusive with `path`. |
-| `[ktfmt].path`                                    | -                                                 | Path to a checked-in jar. Mutually exclusive with `version`.                                                             |
+| `[ktfmt].version`                                 | -                                                 | Release version. Either a literal `"0.65"` or a catalog reference `{ file, key }`. Mutually exclusive with `path`.      |
+| `[ktfmt].path`                                    | -                                                 | Path to a checked-in jar or native binary. Mutually exclusive with `version`.                                            |
 | `[ktfmt].style`                                   | `"google"`                                        | `google` / `kotlinlang` / `meta`                                                                                         |
+| `[ktfmt].native`                                  | `"auto"`                                          | `auto` / `always` / `never`. See "Native formatter binaries".                                                            |
 | `[ktfmt.paths].include`                           | `["**/*.kt", "**/*.kts"]`                         | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
 | `[ktfmt.paths].exclude`                           | `[]`                                              | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
 | `[ktfmt.license-header].file`                     | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
@@ -602,9 +604,8 @@ manager covers it cleanly. Add this to your `renovate.json`:
       "matchStrings": [
         "\\[ktfmt\\][^\\[]*?version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
       ],
-      "datasourceTemplate": "maven",
-      "registryUrlTemplate": "https://repo1.maven.org/maven2",
-      "depNameTemplate": "com.facebook:ktfmt"
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "Kotlin/ktfmt"
     },
     {
       "customType": "regex",
@@ -632,8 +633,7 @@ manager covers it cleanly. Add this to your `renovate.json`:
 
 Each manager scans `.kempt.toml`, finds the first `version = "..."` after a
 matching tool section header, and tracks the
-corresponding Maven Central coordinate. Renovate opens a PR per upstream
-release.
+corresponding upstream release. Renovate opens a PR per release.
 
 `[^\[]*?` in the match string keeps the lookahead within the current
 section, so a later section's `version` value isn't matched by the wrong
@@ -648,24 +648,24 @@ the workaround is to keep the version pin in a file Dependabot already
 understands (e.g., a Gradle `libs.versions.toml`) and copy it into
 `.kempt.toml` manually or via a small CI step.
 
-### Native gjf
+### Native formatter binaries
 
-Starting with gjf 1.20.0, Google publishes GraalVM-native binaries alongside
-the JVM jar. They start in roughly 20ms instead of ~500ms (JVM warmup),
-don't need a JDK, and avoid the JVM `--add-opens` flags. Native builds
-exist for `darwin-arm64`, `linux-x86-64`, `linux-arm64` (1.26.0+), and
-`windows-x86-64`. There is no Intel macOS (`darwin-x86-64`) native build,
-and no native ktfmt at all.
+ktfmt 0.65+ and gjf 1.20.0+ publish GraalVM-native binaries alongside their JVM
+jars. They start without JVM warmup, don't need a JDK, and avoid the JVM
+`--add-opens` flags. ktfmt 0.65 publishes compressed archives for macOS ARM64,
+Linux x86-64, and Windows x86-64. gjf publishes raw `darwin-arm64`,
+`linux-x86-64`, `linux-arm64` (1.26.0+), and `windows-x86-64` executables.
+Neither formatter publishes an Intel macOS binary, and ktfmt 0.65 does not
+publish a Linux ARM64 binary.
 
-`[gjf].native` controls which artifact kempt downloads:
+`[ktfmt].native` and `[gjf].native` control which artifact kempt downloads:
 
 - `auto` (default): native when published for this platform + version, jar
   otherwise.
 - `always`: native always; errors if not published for the host.
 - `never`: jar always.
 
-ktfmt and version-managed Gradle Dependencies Sorter installations always use
-the JVM.
+Version-managed Gradle Dependencies Sorter installations always use the JVM.
 
 ### Checking in the binaries (hermetic / offline builds)
 

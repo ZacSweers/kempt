@@ -41,15 +41,18 @@ pub struct UreqVersionFetcher;
 
 impl VersionFetcher for UreqVersionFetcher {
     fn latest_ktfmt(&self) -> Result<String> {
-        let url = "https://repo1.maven.org/maven2/com/facebook/ktfmt/maven-metadata.xml";
+        let url = "https://api.github.com/repos/kotlin/ktfmt/releases/latest";
         let body = ureq::get(url)
+            .header("User-Agent", "kempt")
+            .header("Accept", "application/vnd.github+json")
             .call()
             .with_context(|| format!("GET {url}"))?
             .into_body()
             .read_to_string()
-            .context("read maven metadata body")?;
-        extract_xml_tag(&body, "release")
-            .ok_or_else(|| anyhow!("could not find <release> in ktfmt maven-metadata.xml at {url}"))
+            .context("read github releases body")?;
+        let tag = extract_json_string_field(&body, "tag_name")
+            .ok_or_else(|| anyhow!("could not find `tag_name` in GitHub response from {url}"))?;
+        Ok(tag.trim_start_matches('v').to_string())
     }
 
     fn latest_gjf(&self) -> Result<String> {
@@ -360,14 +363,14 @@ style = \"google\"
     fn extract_release_tag_from_maven_metadata() {
         let body = "\
 <metadata>
-  <groupId>com.facebook</groupId>
-  <artifactId>ktfmt</artifactId>
+  <groupId>com.squareup</groupId>
+  <artifactId>sort-gradle-dependencies-app</artifactId>
   <versioning>
-    <release>0.62</release>
-    <versions><version>0.61</version><version>0.62</version></versions>
+    <release>0.20.0</release>
+    <versions><version>0.19.0</version><version>0.20.0</version></versions>
   </versioning>
 </metadata>";
-        assert_eq!(extract_xml_tag(body, "release").as_deref(), Some("0.62"));
+        assert_eq!(extract_xml_tag(body, "release").as_deref(), Some("0.20.0"));
     }
 
     #[test]

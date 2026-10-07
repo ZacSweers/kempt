@@ -4,8 +4,8 @@
 //!
 //! Cached files are version-suffixed so repos with different pins coexist:
 //! `ktfmt-<version>.jar`, `gjf-<version>.jar`,
-//! `gradle-dependencies-sorter-<version>.jar`, and native gjf binaries named
-//! `gjf-<version>-<asset>[.exe]`.
+//! `gradle-dependencies-sorter-<version>.jar`, and native binaries named
+//! `<tool>-<version>-<asset>[.exe]`.
 //!
 //! Downloads are abstracted behind [`Downloader`] so tests can fake them.
 
@@ -15,7 +15,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const KTFMT_URL: &str =
-    "https://repo1.maven.org/maven2/com/facebook/ktfmt/{v}/ktfmt-{v}-with-dependencies.jar";
+    "https://github.com/kotlin/ktfmt/releases/download/v{v}/ktfmt-{v}-with-dependencies.jar";
+
+pub const KTFMT_NATIVE_URL: &str =
+    "https://github.com/kotlin/ktfmt/releases/download/v{v}/ktfmt-{asset}-{v}.{archive_ext}";
 
 pub const GJF_URL: &str =
     "https://github.com/google/google-java-format/releases/download/v{v}/google-java-format-{v}-all-deps.jar";
@@ -26,6 +29,56 @@ pub const GJF_NATIVE_URL: &str =
 pub const GRADLE_DEPENDENCIES_SORTER_URL: &str =
     "https://repo1.maven.org/maven2/com/squareup/sort-gradle-dependencies-app/{v}/sort-gradle-dependencies-app-{v}-all.jar";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KtfmtArchiveFormat {
+    TarGz,
+    Zip,
+}
+
+/// ktfmt's published native archive for a particular `(os, arch)` combo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KtfmtNativeAsset {
+    /// The platform segment in the release asset name.
+    pub asset: &'static str,
+    archive_ext: &'static str,
+    executable_name: &'static str,
+    exe_suffix: &'static str,
+    format: KtfmtArchiveFormat,
+}
+
+fn ktfmt_native_asset_for(os: &str, arch: &str) -> Option<KtfmtNativeAsset> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some(KtfmtNativeAsset {
+            asset: "macos-aarch64",
+            archive_ext: "tar.gz",
+            executable_name: "ktfmt",
+            exe_suffix: "",
+            format: KtfmtArchiveFormat::TarGz,
+        }),
+        ("linux", "x86_64") => Some(KtfmtNativeAsset {
+            asset: "linux-x86_64",
+            archive_ext: "tar.gz",
+            executable_name: "ktfmt",
+            exe_suffix: "",
+            format: KtfmtArchiveFormat::TarGz,
+        }),
+        ("windows", "x86_64") => Some(KtfmtNativeAsset {
+            asset: "windows-x86_64",
+            archive_ext: "zip",
+            executable_name: "ktfmt.exe",
+            exe_suffix: ".exe",
+            format: KtfmtArchiveFormat::Zip,
+        }),
+        _ => None,
+    }
+}
+
+/// Native ktfmt asset for the current host. ktfmt 0.65 publishes macOS ARM64,
+/// Linux x86-64, and Windows x86-64 archives.
+pub fn current_ktfmt_native_asset() -> Option<KtfmtNativeAsset> {
+    ktfmt_native_asset_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
 /// gjf's published native asset for a particular `(os, arch)` combo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeAsset {
@@ -35,7 +88,7 @@ pub struct NativeAsset {
     pub exe_suffix: &'static str,
 }
 
-/// Native asset for the current host, if gjf publishes one for this combo.
+/// Native gjf asset for the current host, if it publishes one for this combo.
 /// Returns `None` for Intel macOS and unknown platforms.
 pub fn current_native_asset() -> Option<NativeAsset> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -59,9 +112,14 @@ pub fn current_native_asset() -> Option<NativeAsset> {
     }
 }
 
+/// Whether ktfmt publishes native assets for `version`.
+pub fn ktfmt_native_supported_for_version(version: &str) -> bool {
+    parse_version(version).is_some_and(|(maj, min, _)| (maj, min) >= (0, 65))
+}
+
 /// Whether gjf publishes the given native asset for `version`. Native builds
 /// started in 1.20.0; linux-arm64 was added in 1.26.0.
-pub fn native_supported_for_version(version: &str, asset: &NativeAsset) -> bool {
+pub fn gjf_native_supported_for_version(version: &str, asset: &NativeAsset) -> bool {
     let Some((maj, min, _)) = parse_version(version) else {
         return false;
     };
@@ -81,6 +139,35 @@ pub enum GjfFlavor {
     Native(NativeAsset),
 }
 
+/// Outcome of choosing between native and jar for a particular ktfmt install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KtfmtFlavor {
+    Jar,
+    Native(KtfmtNativeAsset),
+}
+
+/// Decide whether to use the native binary or the jar for `version`,
+/// considering the user's preference and what ktfmt publishes for this host.
+pub fn resolve_ktfmt_flavor(
+    version: &str,
+    prefer_native: bool,
+    require_native: bool,
+) -> Result<KtfmtFlavor> {
+    if prefer_native {
+        if let Some(asset) = current_ktfmt_native_asset() {
+            if ktfmt_native_supported_for_version(version) {
+                return Ok(KtfmtFlavor::Native(asset));
+            }
+        }
+        if require_native {
+            return Err(anyhow!(
+                "native ktfmt is not available for version {version} on this platform"
+            ));
+        }
+    }
+    Ok(KtfmtFlavor::Jar)
+}
+
 /// Decide whether to use the native binary or the jar for `version`,
 /// considering the user's preference and what gjf publishes for this host.
 ///
@@ -94,7 +181,7 @@ pub fn resolve_gjf_flavor(
 ) -> Result<GjfFlavor> {
     if prefer_native {
         if let Some(asset) = current_native_asset() {
-            if native_supported_for_version(version, &asset) {
+            if gjf_native_supported_for_version(version, &asset) {
                 return Ok(GjfFlavor::Native(asset));
             }
         }
@@ -159,6 +246,14 @@ impl Cache {
         self.root.join(format!("ktfmt-{version}.jar"))
     }
 
+    /// Path for the ktfmt native binary on the given platform asset.
+    pub fn ktfmt_native_path(&self, version: &str, asset: &KtfmtNativeAsset) -> PathBuf {
+        self.root.join(format!(
+            "ktfmt-{version}-{}{}",
+            asset.asset, asset.exe_suffix
+        ))
+    }
+
     /// Path for the gjf JVM jar (no platform/arch suffix).
     pub fn gjf_jar_path(&self, version: &str) -> PathBuf {
         self.root.join(format!("gjf-{version}.jar"))
@@ -182,6 +277,39 @@ impl Cache {
         self.ensure(&dest, &url, downloader)
     }
 
+    /// Ensure the ktfmt native binary for `version` + `asset` is present and executable.
+    /// Release assets are compressed, so only the extracted executable is retained.
+    pub fn ensure_ktfmt_native(
+        &self,
+        version: &str,
+        asset: &KtfmtNativeAsset,
+        downloader: &dyn Downloader,
+    ) -> Result<PathBuf> {
+        let dest = self.ktfmt_native_path(version, asset);
+        if dest.exists() {
+            return Ok(dest);
+        }
+        fs::create_dir_all(&self.root)
+            .with_context(|| format!("create cache dir {}", self.root.display()))?;
+        let temp_dir = tempfile::tempdir_in(&self.root)
+            .with_context(|| format!("create extraction dir in {}", self.root.display()))?;
+        let archive_name = format!("ktfmt-{}-{version}.{}", asset.asset, asset.archive_ext);
+        let archive_path = temp_dir.path().join(&archive_name);
+        let url = KTFMT_NATIVE_URL
+            .replace("{v}", version)
+            .replace("{asset}", asset.asset)
+            .replace("{archive_ext}", asset.archive_ext);
+        downloader.download(&url, &archive_path)?;
+
+        let extracted = temp_dir.path().join(asset.executable_name);
+        extract_ktfmt_executable(&archive_path, asset, &extracted)
+            .with_context(|| format!("extract {archive_name}"))?;
+        ensure_executable(&extracted)?;
+        fs::rename(&extracted, &dest)
+            .with_context(|| format!("rename {} -> {}", extracted.display(), dest.display()))?;
+        Ok(dest)
+    }
+
     /// Ensure the gjf jar for `version` is present.
     pub fn ensure_gjf_jar(&self, version: &str, downloader: &dyn Downloader) -> Result<PathBuf> {
         let dest = self.gjf_jar_path(version);
@@ -202,7 +330,7 @@ impl Cache {
 
     /// Ensure the gjf native binary for `version` + `asset` is present and
     /// executable. Caller is responsible for checking that the combo is
-    /// supported (see [`native_supported_for_version`]).
+    /// supported (see [`gjf_native_supported_for_version`]).
     pub fn ensure_gjf_native(
         &self,
         version: &str,
@@ -280,9 +408,59 @@ impl Cache {
     }
 }
 
+fn extract_ktfmt_executable(
+    archive_path: &Path,
+    asset: &KtfmtNativeAsset,
+    dest: &Path,
+) -> Result<()> {
+    match asset.format {
+        KtfmtArchiveFormat::TarGz => {
+            let file = fs::File::open(archive_path)
+                .with_context(|| format!("open {}", archive_path.display()))?;
+            let decoder = flate2::read::GzDecoder::new(file);
+            let mut archive = tar::Archive::new(decoder);
+            for entry in archive.entries().context("read tar entries")? {
+                let mut entry = entry.context("read tar entry")?;
+                let path = entry.path().context("read tar entry path")?;
+                if entry.header().entry_type().is_file()
+                    && path.file_name().and_then(|name| name.to_str())
+                        == Some(asset.executable_name)
+                {
+                    entry
+                        .unpack(dest)
+                        .with_context(|| format!("extract {}", dest.display()))?;
+                    return Ok(());
+                }
+            }
+        }
+        KtfmtArchiveFormat::Zip => {
+            let file = fs::File::open(archive_path)
+                .with_context(|| format!("open {}", archive_path.display()))?;
+            let mut archive = zip::ZipArchive::new(file).context("open zip archive")?;
+            for index in 0..archive.len() {
+                let mut entry = archive.by_index(index).context("read zip entry")?;
+                let is_executable = entry
+                    .enclosed_name()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    == Some(asset.executable_name);
+                if is_executable && !entry.is_dir() {
+                    let mut output = fs::File::create(dest)
+                        .with_context(|| format!("create {}", dest.display()))?;
+                    std::io::copy(&mut entry, &mut output)
+                        .with_context(|| format!("extract {}", dest.display()))?;
+                    output.flush()?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Err(anyhow!("archive did not contain {}", asset.executable_name))
+}
+
 fn is_kempt_artifact_name(name: &str) -> bool {
     if let Some(rest) = name.strip_prefix("ktfmt-") {
-        return starts_with_digit(rest) && rest.ends_with(".jar");
+        return starts_with_digit(rest) && has_managed_artifact_suffix(rest);
     }
     if let Some(rest) = name.strip_prefix("gradle-dependencies-sorter-") {
         return starts_with_digit(rest) && rest.ends_with(".jar");
@@ -290,12 +468,21 @@ fn is_kempt_artifact_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("gjf-") else {
         return false;
     };
-    starts_with_digit(rest)
-        && (rest.ends_with(".jar")
-            || rest.ends_with(".exe")
-            || ["-darwin-arm64", "-linux-x86-64", "-linux-arm64"]
-                .iter()
-                .any(|suffix| rest.ends_with(suffix)))
+    starts_with_digit(rest) && has_managed_artifact_suffix(rest)
+}
+
+fn has_managed_artifact_suffix(name: &str) -> bool {
+    name.ends_with(".jar")
+        || name.ends_with(".exe")
+        || [
+            "-darwin-arm64",
+            "-linux-x86-64",
+            "-linux-arm64",
+            "-macos-aarch64",
+            "-linux-x86_64",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
 }
 
 fn starts_with_digit(s: &str) -> bool {
@@ -354,6 +541,7 @@ where
 pub mod testing {
     use super::*;
     use std::cell::RefCell;
+    use std::io::Cursor;
 
     pub struct FakeDownloader {
         pub payload: Vec<u8>,
@@ -378,17 +566,63 @@ pub mod testing {
             Ok(())
         }
     }
+
+    pub fn fake_ktfmt_archive(asset: &KtfmtNativeAsset, payload: &[u8]) -> Vec<u8> {
+        match asset.format {
+            KtfmtArchiveFormat::TarGz => {
+                let encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                let mut archive = tar::Builder::new(encoder);
+                let mut header = tar::Header::new_gnu();
+                header.set_size(payload.len() as u64);
+                header.set_mode(0o755);
+                header.set_cksum();
+                archive
+                    .append_data(
+                        &mut header,
+                        format!("ktfmt-{}/{}", asset.asset, asset.executable_name),
+                        payload,
+                    )
+                    .unwrap();
+                archive.into_inner().unwrap().finish().unwrap()
+            }
+            KtfmtArchiveFormat::Zip => {
+                let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+                archive
+                    .start_file(
+                        format!("ktfmt-{}/{}", asset.asset, asset.executable_name),
+                        zip::write::FileOptions::default().unix_permissions(0o755),
+                    )
+                    .unwrap();
+                archive.write_all(payload).unwrap();
+                archive.finish().unwrap().into_inner()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::FakeDownloader;
+    use super::testing::{fake_ktfmt_archive, FakeDownloader};
     use super::*;
 
     #[test]
     fn paths_are_version_suffixed() {
         let c = Cache::new(PathBuf::from("/c"));
         assert_eq!(c.ktfmt_path("0.56"), PathBuf::from("/c/ktfmt-0.56.jar"));
+        assert_eq!(
+            c.ktfmt_native_path(
+                "0.65",
+                &KtfmtNativeAsset {
+                    asset: "macos-aarch64",
+                    archive_ext: "tar.gz",
+                    executable_name: "ktfmt",
+                    exe_suffix: "",
+                    format: KtfmtArchiveFormat::TarGz,
+                }
+            ),
+            PathBuf::from("/c/ktfmt-0.65-macos-aarch64")
+        );
         assert_eq!(c.gjf_jar_path("1.28.0"), PathBuf::from("/c/gjf-1.28.0.jar"));
         assert_eq!(
             c.gradle_dependencies_sorter_path("0.20.0"),
@@ -407,8 +641,10 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"jarbytes");
         let calls = dl.calls.borrow();
         assert_eq!(calls.len(), 1);
-        assert!(calls[0].0.contains("0.56"));
-        assert!(calls[0].0.contains("ktfmt"));
+        assert_eq!(
+            calls[0].0,
+            "https://github.com/kotlin/ktfmt/releases/download/v0.56/ktfmt-0.56-with-dependencies.jar"
+        );
     }
 
     #[test]
@@ -421,6 +657,58 @@ mod tests {
         cache.ensure_ktfmt("0.56", &dl).unwrap();
         cache.ensure_ktfmt("0.56", &dl).unwrap();
         assert_eq!(dl.calls.borrow().len(), 1, "should only download once");
+    }
+
+    #[test]
+    fn ensure_ktfmt_native_uses_release_asset_url_and_chmods() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        let asset = KtfmtNativeAsset {
+            asset: "macos-aarch64",
+            archive_ext: "tar.gz",
+            executable_name: "ktfmt",
+            exe_suffix: "",
+            format: KtfmtArchiveFormat::TarGz,
+        };
+        let dl = FakeDownloader::new(fake_ktfmt_archive(&asset, b"native-bytes"));
+
+        let path = cache.ensure_ktfmt_native("0.65", &asset, &dl).unwrap();
+
+        let calls = dl.calls.borrow();
+        assert_eq!(
+            calls[0].0,
+            "https://github.com/kotlin/ktfmt/releases/download/v0.65/ktfmt-macos-aarch64-0.65.tar.gz"
+        );
+        assert!(path.ends_with("ktfmt-0.65-macos-aarch64"));
+        assert_eq!(fs::read(&path).unwrap(), b"native-bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "expected +x");
+        }
+    }
+
+    #[test]
+    fn ensure_ktfmt_native_windows_includes_exe_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        let asset = KtfmtNativeAsset {
+            asset: "windows-x86_64",
+            archive_ext: "zip",
+            executable_name: "ktfmt.exe",
+            exe_suffix: ".exe",
+            format: KtfmtArchiveFormat::Zip,
+        };
+        let dl = FakeDownloader::new(fake_ktfmt_archive(&asset, b"native-bytes"));
+
+        let path = cache.ensure_ktfmt_native("0.65", &asset, &dl).unwrap();
+
+        assert!(path.ends_with("ktfmt-0.65-windows-x86_64.exe"));
+        assert!(dl.calls.borrow()[0]
+            .0
+            .ends_with("ktfmt-windows-x86_64-0.65.zip"));
+        assert_eq!(fs::read(&path).unwrap(), b"native-bytes");
     }
 
     #[test]
@@ -497,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn native_supported_for_version_uses_correct_cutoffs() {
+    fn gjf_native_supported_for_version_uses_correct_cutoffs() {
         let darwin = NativeAsset {
             asset: "darwin-arm64",
             exe_suffix: "",
@@ -507,13 +795,13 @@ mod tests {
             exe_suffix: "",
         };
         // Pre-1.20: nothing.
-        assert!(!native_supported_for_version("1.19.0", &darwin));
+        assert!(!gjf_native_supported_for_version("1.19.0", &darwin));
         // 1.20+: most platforms.
-        assert!(native_supported_for_version("1.20.0", &darwin));
-        assert!(native_supported_for_version("1.28.0", &darwin));
+        assert!(gjf_native_supported_for_version("1.20.0", &darwin));
+        assert!(gjf_native_supported_for_version("1.28.0", &darwin));
         // linux-arm64 only from 1.26.
-        assert!(!native_supported_for_version("1.22.0", &linux_arm));
-        assert!(native_supported_for_version("1.26.0", &linux_arm));
+        assert!(!gjf_native_supported_for_version("1.22.0", &linux_arm));
+        assert!(gjf_native_supported_for_version("1.26.0", &linux_arm));
     }
 
     #[test]
@@ -522,8 +810,52 @@ mod tests {
             asset: "darwin-arm64",
             exe_suffix: "",
         };
-        assert!(!native_supported_for_version("garbage", &asset));
-        assert!(!native_supported_for_version("1", &asset));
+        assert!(!gjf_native_supported_for_version("garbage", &asset));
+        assert!(!gjf_native_supported_for_version("1", &asset));
+    }
+
+    #[test]
+    fn ktfmt_native_supported_from_0_65() {
+        assert!(!ktfmt_native_supported_for_version("0.64"));
+        assert!(ktfmt_native_supported_for_version("0.65"));
+        assert!(ktfmt_native_supported_for_version("0.65.1"));
+        assert!(!ktfmt_native_supported_for_version("garbage"));
+    }
+
+    #[test]
+    fn ktfmt_native_assets_match_the_0_65_release_platforms() {
+        assert_eq!(
+            ktfmt_native_asset_for("macos", "aarch64").unwrap().asset,
+            "macos-aarch64"
+        );
+        assert_eq!(
+            ktfmt_native_asset_for("linux", "x86_64").unwrap().asset,
+            "linux-x86_64"
+        );
+        assert_eq!(
+            ktfmt_native_asset_for("windows", "x86_64").unwrap().asset,
+            "windows-x86_64"
+        );
+        assert!(ktfmt_native_asset_for("linux", "aarch64").is_none());
+        assert!(ktfmt_native_asset_for("macos", "x86_64").is_none());
+    }
+
+    #[test]
+    fn resolve_ktfmt_flavor_returns_jar_when_native_disabled() {
+        let flavor = resolve_ktfmt_flavor("0.65", false, false).unwrap();
+        assert_eq!(flavor, KtfmtFlavor::Jar);
+    }
+
+    #[test]
+    fn resolve_ktfmt_flavor_falls_back_for_old_version() {
+        let flavor = resolve_ktfmt_flavor("0.64", true, false).unwrap();
+        assert_eq!(flavor, KtfmtFlavor::Jar);
+    }
+
+    #[test]
+    fn resolve_ktfmt_flavor_require_errors_when_unavailable() {
+        let err = resolve_ktfmt_flavor("0.64", true, true).unwrap_err();
+        assert!(format!("{err:#}").contains("native ktfmt is not available"));
     }
 
     #[test]
@@ -616,6 +948,17 @@ mod tests {
         fs::create_dir_all(cache.root()).unwrap();
         fs::write(cache.root().join("gjf-1.28.0-darwin-arm64"), b"x").unwrap();
         fs::write(cache.root().join("gjf-1.28.0.jar"), b"x").unwrap();
+        let entries = cache.list_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn list_entries_includes_native_ktfmt_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        fs::create_dir_all(cache.root()).unwrap();
+        fs::write(cache.root().join("ktfmt-0.65-macos-aarch64"), b"x").unwrap();
+        fs::write(cache.root().join("ktfmt-0.65.jar"), b"x").unwrap();
         let entries = cache.list_entries().unwrap();
         assert_eq!(entries.len(), 2);
     }

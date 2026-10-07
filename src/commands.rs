@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Subcommand implementations. Glue between the lower-level modules.
 
-use crate::cache::{Cache, Downloader, GjfFlavor};
+use crate::cache::{Cache, Downloader, GjfFlavor, KtfmtFlavor};
 use crate::command_args;
-use crate::config::{Config, Gjf, HookMode, NativeMode, ToolSource};
+use crate::config::{Config, Gjf, HookMode, Ktfmt, NativeMode, ToolSource};
 use crate::formatters;
 use crate::git::GitContext;
 use crate::gradle_dependencies;
@@ -202,11 +202,8 @@ impl PartialFormatter {
                 let Some(kt) = &config.ktfmt else {
                     return Ok(None);
                 };
-                let jar = resolve_jar(kt.source(git.root()), &|v| {
-                    cache.ensure_ktfmt(v, downloader)
-                })?;
                 Ok(Some((
-                    formatters::Invoker::Jar(jar),
+                    resolve_ktfmt_invoker(kt, git.root(), cache, downloader)?,
                     formatters::ktfmt_args(kt.style, false),
                 )))
             }
@@ -484,6 +481,13 @@ pub fn keep_paths_for_config(config: &Config, repo_root: &Path, cache: &Cache) -
     if let Some(kt) = &config.ktfmt {
         if let ToolSource::Cached(v) = kt.source(repo_root) {
             keep.push(cache.ktfmt_path(&v));
+            if kt.native != NativeMode::Never {
+                if let Some(asset) = crate::cache::current_ktfmt_native_asset() {
+                    if crate::cache::ktfmt_native_supported_for_version(&v) {
+                        keep.push(cache.ktfmt_native_path(&v, &asset));
+                    }
+                }
+            }
         }
     }
     if let Some(g) = &config.gjf {
@@ -495,7 +499,7 @@ pub fn keep_paths_for_config(config: &Config, repo_root: &Path, cache: &Cache) -
             keep.push(cache.gjf_jar_path(&v));
             if g.native != NativeMode::Never {
                 if let Some(asset) = crate::cache::current_native_asset() {
-                    if crate::cache::native_supported_for_version(&v, &asset) {
+                    if crate::cache::gjf_native_supported_for_version(&v, &asset) {
                         keep.push(cache.gjf_native_path(&v, &asset));
                     }
                 }
@@ -520,7 +524,7 @@ pub fn run_update(
 ) -> Result<()> {
     if let Some(kt) = &config.ktfmt {
         if let ToolSource::Cached(v) = kt.source(repo_root) {
-            cache.ensure_ktfmt(&v, downloader)?;
+            ensure_ktfmt_artifact(&v, kt, cache, downloader)?;
         }
     }
     if let Some(g) = &config.gjf {
@@ -534,6 +538,40 @@ pub fn run_update(
         }
     }
     Ok(())
+}
+
+/// Resolve `ktfmt` to a concrete artifact on disk, downloading if needed.
+fn ensure_ktfmt_artifact(
+    version: &str,
+    kt: &Ktfmt,
+    cache: &Cache,
+    downloader: &dyn Downloader,
+) -> Result<formatters::Invoker> {
+    let prefer = !matches!(kt.native, NativeMode::Never);
+    let require = matches!(kt.native, NativeMode::Always);
+    match crate::cache::resolve_ktfmt_flavor(version, prefer, require)? {
+        KtfmtFlavor::Jar => {
+            let path = cache.ensure_ktfmt(version, downloader)?;
+            Ok(formatters::Invoker::Jar(path))
+        }
+        KtfmtFlavor::Native(asset) => {
+            let path = cache.ensure_ktfmt_native(version, &asset, downloader)?;
+            Ok(formatters::Invoker::Native(path))
+        }
+    }
+}
+
+/// Resolve a [`Ktfmt`] config to either a JVM jar or native binary.
+fn resolve_ktfmt_invoker(
+    kt: &Ktfmt,
+    repo_root: &Path,
+    cache: &Cache,
+    downloader: &dyn Downloader,
+) -> Result<formatters::Invoker> {
+    match kt.source(repo_root) {
+        ToolSource::Cached(version) => ensure_ktfmt_artifact(&version, kt, cache, downloader),
+        ToolSource::Local(path) => resolve_local_invoker("ktfmt", path),
+    }
 }
 
 /// Resolve `gjf` to a concrete artifact on disk, downloading if needed.
@@ -568,20 +606,22 @@ fn resolve_gjf_invoker(
 ) -> Result<formatters::Invoker> {
     match g.source(repo_root) {
         ToolSource::Cached(version) => ensure_gjf_artifact(&version, g, cache, downloader),
-        ToolSource::Local(path) => {
-            if !path.exists() {
-                anyhow::bail!("gjf binary not found: {}", path.display());
-            }
-            // Detect by file extension: `.jar` runs via java, anything else
-            // is treated as a native binary.
-            let is_jar = path.extension().and_then(|e| e.to_str()) == Some("jar");
-            Ok(if is_jar {
-                formatters::Invoker::Jar(path)
-            } else {
-                formatters::Invoker::Native(path)
-            })
-        }
+        ToolSource::Local(path) => resolve_local_invoker("gjf", path),
     }
+}
+
+fn resolve_local_invoker(tool: &str, path: PathBuf) -> Result<formatters::Invoker> {
+    if !path.exists() {
+        anyhow::bail!("{tool} binary not found: {}", path.display());
+    }
+    // Detect by file extension: `.jar` runs via java, anything else is
+    // treated as a native binary.
+    let is_jar = path.extension().and_then(|e| e.to_str()) == Some("jar");
+    Ok(if is_jar {
+        formatters::Invoker::Jar(path)
+    } else {
+        formatters::Invoker::Native(path)
+    })
 }
 
 fn resolve_gradle_dependencies_sorter_invoker(
@@ -651,7 +691,10 @@ pub fn run_vendor(
     if let Some(kt) = &config.ktfmt {
         match kt.source(repo_root) {
             ToolSource::Cached(v) => {
-                let src = cache.ensure_ktfmt(&v, downloader)?;
+                let invoker = ensure_ktfmt_artifact(&v, kt, cache, downloader)?;
+                let src = match &invoker {
+                    formatters::Invoker::Jar(p) | formatters::Invoker::Native(p) => p.clone(),
+                };
                 let entry = copy_into("ktfmt", &v, &src, &abs_target, target_dir)?;
                 outcome.entries.push(entry);
             }
@@ -725,7 +768,7 @@ fn copy_into(
 /// `.github/workflows/bump-starter-versions.yml` workflow scrapes the latest
 /// releases weekly and opens a PR bumping these constants. Format must stay
 /// `pub const NAME: &str = "x.y.z";` exactly so the workflow's regex hits.
-pub const STARTER_KTFMT_VERSION: &str = "0.64";
+pub const STARTER_KTFMT_VERSION: &str = "0.65";
 pub const STARTER_GJF_VERSION: &str = "1.37.0";
 pub const STARTER_GRADLE_DEPENDENCIES_SORTER_VERSION: &str = "0.21.0";
 
@@ -993,8 +1036,7 @@ fn apply_jvm_formatters(
 
     if let Some(kt) = &config.ktfmt {
         if !kt_files.is_empty() {
-            let jar = resolve_jar(kt.source(repo_root), &|v| cache.ensure_ktfmt(v, downloader))?;
-            let invoker = formatters::Invoker::Jar(jar);
+            let invoker = resolve_ktfmt_invoker(kt, repo_root, cache, downloader)?;
             let base = formatters::ktfmt_args(kt.style, options.check);
             if options.check {
                 let run = formatters::run_ktfmt_argfile_check("ktfmt", &invoker, base, &kt_files)?;
@@ -1437,27 +1479,10 @@ fn merge_format_changes(
     Ok(())
 }
 
-/// Resolve a [`ToolSource`] to a concrete jar path. `Cached` delegates to the
-/// download/cache helper; `Local` checks that the jar exists.
-fn resolve_jar(
-    source: ToolSource,
-    ensure_cached: &dyn Fn(&str) -> Result<PathBuf>,
-) -> Result<PathBuf> {
-    match source {
-        ToolSource::Cached(v) => ensure_cached(&v),
-        ToolSource::Local(path) => {
-            if !path.exists() {
-                anyhow::bail!("jar not found: {}", path.display());
-            }
-            Ok(path)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::testing::FakeDownloader;
+    use crate::cache::testing::{fake_ktfmt_archive, FakeDownloader};
     use crate::config::{LicenseHeader, Paths, Whitespace};
     use crate::git::{testing::FakeGit, RealGit};
 
@@ -2799,6 +2824,7 @@ diff --git a/Foo.java b/Foo.java\n\
                 path: None,
                 style: Default::default(),
                 license_header: None,
+                native: NativeMode::Never,
                 paths: None,
             }),
             ..Default::default()
@@ -2807,6 +2833,34 @@ diff --git a/Foo.java b/Foo.java\n\
         assert_eq!(dl.calls.borrow().len(), 1);
         assert!(cache.ktfmt_path("0.56").exists());
         assert!(!cache.gjf_jar_path("1.28.0").exists());
+    }
+
+    #[test]
+    fn run_update_fetches_native_ktfmt_when_required() {
+        let Some(asset) = crate::cache::current_ktfmt_native_asset() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        let dl = FakeDownloader::new(fake_ktfmt_archive(&asset, b"native"));
+        let cfg = Config {
+            ktfmt: Some(crate::config::Ktfmt {
+                version: Some(crate::config::VersionSpec::literal("0.65")),
+                path: None,
+                style: Default::default(),
+                license_header: None,
+                native: NativeMode::Always,
+                paths: None,
+            }),
+            ..Default::default()
+        };
+
+        run_update(&cfg, dir.path(), &cache, &dl).unwrap();
+
+        assert!(cache.ktfmt_native_path("0.65", &asset).exists());
+        assert!(dl.calls.borrow()[0]
+            .0
+            .contains(&format!("/v0.65/ktfmt-{}-0.65", asset.asset)));
     }
 
     #[test]
@@ -2821,6 +2875,7 @@ diff --git a/Foo.java b/Foo.java\n\
                 path: Some(PathBuf::from("config/bin/ktfmt.jar")),
                 style: Default::default(),
                 license_header: None,
+                native: Default::default(),
                 paths: None,
             }),
             ..Default::default()
@@ -2863,6 +2918,7 @@ diff --git a/Foo.java b/Foo.java\n\
                 path: Some(PathBuf::from("config/bin/ktfmt.jar")),
                 style: Default::default(),
                 license_header: None,
+                native: Default::default(),
                 paths: None,
             }),
             gjf: Some(crate::config::Gjf {
@@ -2912,6 +2968,33 @@ diff --git a/Foo.java b/Foo.java\n\
     }
 
     #[test]
+    fn keep_paths_includes_both_ktfmt_artifacts_when_native_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().join("cache"));
+        let cfg = Config {
+            ktfmt: Some(crate::config::Ktfmt {
+                version: Some(crate::config::VersionSpec::literal("0.65")),
+                path: None,
+                style: Default::default(),
+                license_header: None,
+                native: NativeMode::Auto,
+                paths: None,
+            }),
+            ..Default::default()
+        };
+
+        let keep = keep_paths_for_config(&cfg, dir.path(), &cache);
+
+        assert!(keep.iter().any(|p| p.ends_with("ktfmt-0.65.jar")));
+        if crate::cache::current_ktfmt_native_asset().is_some() {
+            assert_eq!(keep.len(), 2);
+            assert!(keep
+                .iter()
+                .any(|p| p.to_string_lossy().contains("ktfmt-0.65-") && !p.ends_with(".jar")));
+        }
+    }
+
+    #[test]
     fn keep_paths_includes_gradle_dependencies_sorter_jar() {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(dir.path().join("cache"));
@@ -2946,6 +3029,7 @@ diff --git a/Foo.java b/Foo.java\n\
                 path: None,
                 style: Default::default(),
                 license_header: None,
+                native: NativeMode::Never,
                 paths: None,
             }),
             gjf: Some(crate::config::Gjf {
@@ -3015,6 +3099,7 @@ diff --git a/Foo.java b/Foo.java\n\
                 path: Some(PathBuf::from("config/bin/ktfmt.jar")),
                 style: Default::default(),
                 license_header: None,
+                native: Default::default(),
                 paths: None,
             }),
             gjf: Some(crate::config::Gjf {
@@ -3097,6 +3182,47 @@ diff --git a/Foo.java b/Foo.java\n\
             dest_str.contains("gjf-1.28.0-") && !dest_str.ends_with(".jar"),
             "expected native filename, got {dest_str}"
         );
+    }
+
+    #[test]
+    fn run_vendor_with_native_ktfmt_copies_native_binary() {
+        let Some(asset) = crate::cache::current_ktfmt_native_asset() else {
+            return;
+        };
+        let (dir, cache, _) = vendor_test_setup();
+        let dl = FakeDownloader::new(fake_ktfmt_archive(&asset, b"native"));
+        let cfg = Config {
+            ktfmt: Some(crate::config::Ktfmt {
+                version: Some(crate::config::VersionSpec::literal("0.65")),
+                path: None,
+                style: Default::default(),
+                license_header: None,
+                native: NativeMode::Always,
+                paths: None,
+            }),
+            ..Default::default()
+        };
+
+        let outcome =
+            run_vendor(&cfg, dir.path(), &cache, &dl, &PathBuf::from("config/bin")).unwrap();
+
+        assert_eq!(outcome.entries.len(), 1);
+        let dest = outcome.entries[0].dest.to_string_lossy();
+        assert!(
+            dest.contains("ktfmt-0.65-") && !dest.ends_with(".jar"),
+            "expected native filename, got {dest}"
+        );
+    }
+
+    #[test]
+    fn local_ktfmt_binary_is_invoked_natively() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("ktfmt");
+        std::fs::write(&binary, b"binary").unwrap();
+
+        let invoker = resolve_local_invoker("ktfmt", binary.clone()).unwrap();
+
+        assert!(matches!(invoker, formatters::Invoker::Native(path) if path == binary));
     }
 
     // --- check summary ---

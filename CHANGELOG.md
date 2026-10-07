@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Support ktfmt 0.65 native release archives on macOS ARM64, Linux x86-64, and Windows x86-64, with automatic JVM jar fallback on other platforms.
 - Format and re-stage large file sets without hitting operating-system command-line limits, including on Windows.
 
 ## [0.3.1]
