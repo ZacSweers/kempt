@@ -68,10 +68,10 @@ fn jar_args(jar: &std::path::Path) -> Vec<OsString> {
     args
 }
 
-/// Static ktfmt flags (style, check mode). Does NOT include the file list;
+/// Static ktfmt flags (style, EditorConfig, check mode). Does NOT include the file list;
 /// callers include these with the paths passed to [`run_ktfmt_argfile`].
-pub fn ktfmt_args(style: KtfmtStyle, check: bool) -> Vec<OsString> {
-    let mut args: Vec<OsString> = Vec::with_capacity(4);
+pub fn ktfmt_args(style: KtfmtStyle, check: bool, editorconfig: bool) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::with_capacity(5);
     args.push(
         match style {
             KtfmtStyle::Google => "--google-style",
@@ -81,6 +81,9 @@ pub fn ktfmt_args(style: KtfmtStyle, check: bool) -> Vec<OsString> {
         .into(),
     );
     args.push("--quiet".into());
+    if editorconfig {
+        args.push("--enable-editorconfig".into());
+    }
     if check {
         args.push("--dry-run".into());
         args.push("--set-exit-if-changed".into());
@@ -123,13 +126,17 @@ pub fn run(tool: &str, invoker: &Invoker, args: Vec<OsString>) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }
+    Err(process_failure(tool, &output))
+}
+
+fn process_failure(tool: &str, output: &std::process::Output) -> anyhow::Error {
     let code = output.status.code().unwrap_or(-1);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let filtered = filter_jvm_noise(&stderr);
     if filtered.is_empty() {
-        Err(anyhow!("{tool} failed (exit {code})"))
+        anyhow!("{tool} failed (exit {code})")
     } else {
-        Err(anyhow!("{tool} failed (exit {code}):\n{filtered}"))
+        anyhow!("{tool} failed (exit {code}):\n{filtered}")
     }
 }
 
@@ -275,6 +282,40 @@ pub fn run_ktfmt_argfile(
     result
 }
 
+/// Run ktfmt with options from an argument file and source content from stdin.
+/// The formatted source is returned from stdout.
+pub fn run_ktfmt_argfile_stdin(
+    tool: &str,
+    invoker: &Invoker,
+    args: Vec<OsString>,
+    input: &[u8],
+) -> Result<Vec<u8>> {
+    let argfile = write_argfile(&args, &[])?;
+    let mut cmd = build_command(invoker)?;
+    cmd.arg(&argfile.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn {tool} failed"))?;
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin
+            .write_all(input)
+            .with_context(|| format!("write source to {tool} stdin")),
+        None => Err(anyhow!("open {tool} stdin failed")),
+    };
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("wait for {tool}"))?;
+    drop(argfile.1);
+    if !output.status.success() {
+        return Err(process_failure(tool, &output));
+    }
+    write_result?;
+    Ok(output.stdout)
+}
+
 /// Check-mode counterpart to [`run_ktfmt_argfile`].
 pub fn run_ktfmt_argfile_check(
     tool: &str,
@@ -381,7 +422,7 @@ mod tests {
 
     #[test]
     fn ktfmt_args_default_style_is_google() {
-        let a = ktfmt_args(KtfmtStyle::Google, false);
+        let a = ktfmt_args(KtfmtStyle::Google, false, false);
         assert_eq!(s(&a[0]), "--google-style");
         assert_eq!(s(&a[1]), "--quiet");
         assert_eq!(a.len(), 2);
@@ -389,19 +430,19 @@ mod tests {
 
     #[test]
     fn ktfmt_args_kotlinlang_style() {
-        let a = ktfmt_args(KtfmtStyle::Kotlinlang, false);
+        let a = ktfmt_args(KtfmtStyle::Kotlinlang, false, false);
         assert_eq!(s(&a[0]), "--kotlinlang-style");
     }
 
     #[test]
     fn ktfmt_args_meta_style() {
-        let a = ktfmt_args(KtfmtStyle::Meta, false);
+        let a = ktfmt_args(KtfmtStyle::Meta, false, false);
         assert_eq!(s(&a[0]), "--meta-style");
     }
 
     #[test]
     fn ktfmt_args_check_adds_dry_run_and_exit_flag() {
-        let a = ktfmt_args(KtfmtStyle::Google, true);
+        let a = ktfmt_args(KtfmtStyle::Google, true, false);
         let strs: Vec<&str> = a.iter().map(s).collect();
         assert!(strs.contains(&"--dry-run"));
         assert!(strs.contains(&"--set-exit-if-changed"));
@@ -409,9 +450,16 @@ mod tests {
 
     #[test]
     fn ktfmt_args_format_mode_omits_dry_run() {
-        let a = ktfmt_args(KtfmtStyle::Google, false);
+        let a = ktfmt_args(KtfmtStyle::Google, false, false);
         let strs: Vec<&str> = a.iter().map(s).collect();
         assert!(!strs.contains(&"--dry-run"));
+    }
+
+    #[test]
+    fn ktfmt_args_editorconfig_adds_enable_flag() {
+        let a = ktfmt_args(KtfmtStyle::Google, false, true);
+        let strs: Vec<&str> = a.iter().map(s).collect();
+        assert!(strs.contains(&"--enable-editorconfig"));
     }
 
     #[test]
@@ -479,7 +527,10 @@ mod tests {
 
     #[test]
     fn ktfmt_argfile_contains_options_and_paths() {
-        let args = vec![OsString::from("--google-style"), OsString::from("--quiet")];
+        let args = vec![
+            OsString::from("--google-style"),
+            OsString::from("--enable-editorconfig"),
+        ];
         let files = vec![
             PathBuf::from("src/Foo.kt"),
             PathBuf::from("src/Foo Bar.kts"),
@@ -490,8 +541,45 @@ mod tests {
         assert!(at_arg.to_string_lossy().starts_with('@'));
         assert_eq!(
             std::fs::read_to_string(tempfile.path()).unwrap(),
-            "--google-style\n--quiet\nsrc/Foo.kt\nsrc/Foo Bar.kts\n"
+            "--google-style\n--enable-editorconfig\nsrc/Foo.kt\nsrc/Foo Bar.kts\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ktfmt_argfile_stdin_captures_formatted_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let formatter = dir.path().join("fake-ktfmt");
+        std::fs::write(
+            &formatter,
+            "#!/bin/sh\n\
+             [ \"$#\" -eq 1 ] || exit 9\n\
+             case \"$1\" in @*) argfile=\"${1#@}\" ;; *) exit 8 ;; esac\n\
+             grep -qx -- '--enable-editorconfig' \"$argfile\" || exit 7\n\
+             grep -qx -- '--stdin-name=/repo with spaces/src/Foo.kt' \"$argfile\" || exit 6\n\
+             grep -qx -- '-' \"$argfile\" || exit 5\n\
+             awk '{ gsub(/unformatted/, \"formatted\"); print }'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&formatter).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&formatter, permissions).unwrap();
+
+        let formatted = run_ktfmt_argfile_stdin(
+            "ktfmt",
+            &Invoker::Native(formatter),
+            vec![
+                OsString::from("--enable-editorconfig"),
+                OsString::from("--stdin-name=/repo with spaces/src/Foo.kt"),
+                OsString::from("-"),
+            ],
+            b"fun unformatted() = Unit\n",
+        )
+        .unwrap();
+
+        assert_eq!(formatted, b"fun formatted() = Unit\n");
     }
 
     #[test]

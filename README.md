@@ -87,6 +87,7 @@ disable that step.
 version = "0.65"
 style = "google"           # google | kotlinlang | meta
 native = "auto"            # auto | always | never
+editorconfig = false        # layer supported .editorconfig properties over style
 
 [gjf]
 version = "1.35.0"
@@ -161,6 +162,14 @@ If neither the global section nor the tool override supplies a `file`, no
 header is inserted for that language.
 
 The exclude files are plain text, one glob per line, `#` comments allowed.
+
+### ktfmt and EditorConfig
+
+Set `[ktfmt].editorconfig = true` to let ktfmt 0.62 or later read supported EditorConfig properties. Kempt gives ktfmt each source file's absolute path, so lookup begins in that file's directory. A nested `.editorconfig` overrides matching properties from parent directories, and `root = true` stops lookup above that file. The configured ktfmt `style` remains the base, with supported EditorConfig properties layered over it.
+
+Experimental partial formatting also preserves this lookup context with ktfmt 0.65 or later. Kempt sends the staged source through stdin and supplies the original absolute path for EditorConfig lookup, without reading or modifying the worktree source.
+
+For IntelliJ IDEA and Android Studio, install the [ktfmt plugin](https://github.com/Kotlin/ktfmt#intellij-android-studio-and-other-jetbrains-ides), choose the same base style, and commit `.idea/ktfmt.xml`. The IDE plugin does not apply ktfmt's CLI EditorConfig layering, so mirror supported overrides in its custom style where practical and treat Kempt's hook and CI checks as authoritative.
 
 ### Gradle dependency sorting
 
@@ -283,6 +292,7 @@ default; the section that contains it is what enables the feature."
 | `[ktfmt].path`                                    | -                                                 | Path to a checked-in jar or native binary. Mutually exclusive with `version`.                                            |
 | `[ktfmt].style`                                   | `"google"`                                        | `google` / `kotlinlang` / `meta`                                                                                         |
 | `[ktfmt].native`                                  | `"auto"`                                          | `auto` / `always` / `never`. See "Native formatter binaries".                                                            |
+| `[ktfmt].editorconfig`                            | `false`                                           | Layer supported EditorConfig properties over `style` for each file. Requires ktfmt 0.62 or later.                       |
 | `[ktfmt.paths].include`                           | `["**/*.kt", "**/*.kts"]`                         | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
 | `[ktfmt.paths].exclude`                           | `[]`                                              | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
 | `[ktfmt.license-header].file`                     | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
@@ -435,7 +445,7 @@ kempt's in-process formatting steps, including whitespace normalization and
 license-header insertion, support partially staged files by updating the Git
 index directly.
 
-GJF and ktfmt (`0.65` or later) also support partial formatting files, but must
+GJF and ktfmt (`0.65` or later) also support partial formatting of files, but must
 be enabled explicitly:
 
 - set the `KEMPT_EXPERIMENTAL_PARTIAL_KTFMT` env flag to allow partially staged ktfmt-managed Kotlin files

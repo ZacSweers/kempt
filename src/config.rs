@@ -187,6 +187,10 @@ pub struct Ktfmt {
     pub path: Option<PathBuf>,
     #[serde(default)]
     pub style: KtfmtStyle,
+    /// Whether ktfmt should layer supported EditorConfig properties over the
+    /// selected style for each source file.
+    #[serde(default)]
+    pub editorconfig: bool,
     pub license_header: Option<ToolLicenseHeader>,
     /// Whether to use ktfmt's GraalVM-native executable instead of the JVM
     /// jar. `auto` (default) uses native when available for this platform +
@@ -687,6 +691,7 @@ mod tests {
         assert_eq!(kt.version.as_ref().unwrap().as_literal(), "0.56");
         assert!(kt.path.is_none());
         assert_eq!(kt.style, KtfmtStyle::Google);
+        assert!(!kt.editorconfig);
         assert_eq!(kt.native, NativeMode::Auto);
     }
 
@@ -714,6 +719,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.ktfmt.unwrap().native, NativeMode::Never);
+    }
+
+    #[test]
+    fn ktfmt_editorconfig_can_be_enabled() {
+        let c = Config::parse(
+            r#"
+            [ktfmt]
+            version = "0.62"
+            editorconfig = true
+        "#,
+        )
+        .unwrap();
+        assert!(c.ktfmt.unwrap().editorconfig);
     }
 
     #[test]
