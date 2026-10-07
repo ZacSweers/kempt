@@ -3,7 +3,7 @@
 # crates.io by an unrelated sorted-collection library. The installed
 # binary is still `kempt` (see [[bin]] below).
 name = "kempt-fmt"
-version = "0.2.1"
+version = "0.3.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "A pre-commit-friendly multi-language formatter (ktfmt, google-java-format, license headers, whitespace)"
@@ -25,11 +25,14 @@ lto = "thin"
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
+flate2 = "1.1"
 globset = "0.4.18"
 serde = { version = "1.0.228", features = ["derive"] }
+tar = "0.4"
 tempfile = "3.27.0"
 toml = "1.1.2"
 toml_edit = "0.25"
 ureq = "3.3.0"
 walkdir = "2"
 which = "8.0.2"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }

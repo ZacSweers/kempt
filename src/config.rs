@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE: &str = ".kempt.toml";
 
-/// Where a tool's binary comes from after applying the rules in `[ktfmt]` /
-/// `[gjf]`.
+/// Where a tool's binary comes from after applying its `version` / `path`
+/// rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolSource {
     /// Download `version` into the user cache.
@@ -32,7 +32,7 @@ pub struct VersionRef {
     /// Path to a catalog TOML, relative to repo root or absolute.
     pub file: PathBuf,
     /// Lookup key under the catalog's `[versions]` table. Defaults to the
-    /// tool name (`ktfmt` or `gjf`).
+    /// tool's config-section name.
     pub key: Option<String>,
 }
 
@@ -56,6 +56,36 @@ impl GlobList {
     }
 }
 
+/// A path list either replaces the built-in defaults or extends them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum PathList {
+    Replace(GlobList),
+    Extend(ExtendedGlobList),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtendedGlobList {
+    pub extend: GlobList,
+}
+
+impl PathList {
+    fn resolve_with_defaults(&self, repo_root: &Path, defaults: &[&str]) -> Result<Vec<String>> {
+        match self {
+            Self::Replace(globs) => globs.resolve(repo_root),
+            Self::Extend(extension) => {
+                let mut resolved = defaults
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<_>>();
+                resolved.extend(extension.extend.resolve(repo_root)?);
+                Ok(resolved)
+            }
+        }
+    }
+}
+
 fn load_glob_file(repo_root: &Path, p: &Path) -> Result<Vec<String>> {
     let abs = if p.is_absolute() {
         p.to_path_buf()
@@ -72,12 +102,12 @@ fn load_glob_file(repo_root: &Path, p: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Per-tool path scope. Both fields polymorphic via [`GlobList`].
+/// Per-tool path scope. Each list can replace or extend its defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ToolPaths {
-    pub include: Option<GlobList>,
-    pub exclude: Option<GlobList>,
+    pub include: Option<PathList>,
+    pub exclude: Option<PathList>,
 }
 
 /// Path scope after defaults have been filled in and any file references
@@ -89,8 +119,7 @@ pub struct ResolvedPaths {
 }
 
 impl ToolPaths {
-    /// Resolve against per-tool defaults. Either field returns the user's
-    /// value when set, otherwise the default.
+    /// Resolve against per-tool defaults.
     pub fn resolve_with_defaults(
         &self,
         repo_root: &Path,
@@ -98,11 +127,11 @@ impl ToolPaths {
         default_exclude: &[&str],
     ) -> Result<ResolvedPaths> {
         let include = match &self.include {
-            Some(g) => g.resolve(repo_root)?,
+            Some(paths) => paths.resolve_with_defaults(repo_root, default_include)?,
             None => default_include.iter().map(|s| (*s).to_string()).collect(),
         };
         let exclude = match &self.exclude {
-            Some(g) => g.resolve(repo_root)?,
+            Some(paths) => paths.resolve_with_defaults(repo_root, default_exclude)?,
             None => default_exclude.iter().map(|s| (*s).to_string()).collect(),
         };
         Ok(ResolvedPaths { include, exclude })
@@ -133,6 +162,7 @@ impl VersionSpec {
 pub struct Config {
     pub ktfmt: Option<Ktfmt>,
     pub gjf: Option<Gjf>,
+    pub gradle_dependencies_sorter: Option<GradleDependenciesSorter>,
     pub rustfmt: Option<Rustfmt>,
     pub license_header: Option<LicenseHeader>,
     #[serde(default)]
@@ -146,9 +176,8 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Ktfmt {
-    /// Release version. The JVM jar comes from Maven Central; native binaries
-    /// come from GitHub releases. Mutually exclusive with `path`. Accepts either
-    /// a literal string (`"0.65"`) or a catalog reference table
+    /// GitHub release version. Mutually exclusive with `path`. Accepts either a
+    /// literal string (`"0.65"`) or a catalog reference table
     /// (`{ file = "gradle/libs.versions.toml", key = "ktfmt" }`).
     pub version: Option<VersionSpec>,
     /// Path to a checked-in formatter binary (relative to the repo root, or
@@ -217,6 +246,31 @@ impl Gjf {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct GradleDependenciesSorter {
+    /// Maven Central version. Mutually exclusive with `path`. Accepts either
+    /// a literal string or a catalog reference (see [`VersionSpec`]).
+    pub version: Option<VersionSpec>,
+    /// Path to a checked-in CLI artifact (relative to the repo root, or
+    /// absolute). `.jar` files run via `java -jar`; anything else runs
+    /// directly, such as the executable from the upstream distribution.
+    pub path: Option<PathBuf>,
+    /// Insert blank lines between different dependency configurations.
+    #[serde(default = "default_true")]
+    pub insert_blank_lines: bool,
+    /// Tool-specific path scope. Defaults to `**/*.gradle` and
+    /// `**/*.gradle.kts`.
+    pub paths: Option<ToolPaths>,
+}
+
+impl GradleDependenciesSorter {
+    pub fn resolve_paths(&self, repo_root: &Path) -> Result<ResolvedPaths> {
+        let p = self.paths.clone().unwrap_or_default();
+        p.resolve_with_defaults(repo_root, &["**/*.gradle", "**/*.gradle.kts"], &[])
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Rustfmt {
@@ -276,13 +330,14 @@ pub struct ResolvedHeader {
 
 /// Universal path filter applied before any tool-specific scope. Currently
 /// only excludes are configurable here; per-language inclusion lives in
-/// `[ktfmt.paths]`, `[gjf.paths]`, `[rustfmt.paths]`, and
+/// `[ktfmt.paths]`, `[gjf.paths]`, `[gradle-dependencies-sorter.paths]`,
+/// `[rustfmt.paths]`, and
 /// `[whitespace.paths]`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Paths {
     #[serde(default = "default_global_exclude")]
-    pub exclude: GlobList,
+    pub exclude: PathList,
 }
 
 impl Default for Paths {
@@ -293,8 +348,22 @@ impl Default for Paths {
     }
 }
 
-fn default_global_exclude() -> GlobList {
-    GlobList::Inline(vec!["**/build/**".into(), "**/target/**".into()])
+impl Paths {
+    pub fn resolve_excludes(&self, repo_root: &Path) -> Result<Vec<String>> {
+        self.exclude
+            .resolve_with_defaults(repo_root, DEFAULT_GLOBAL_EXCLUDE)
+    }
+}
+
+const DEFAULT_GLOBAL_EXCLUDE: &[&str] = &["**/build/**", "**/target/**"];
+
+fn default_global_exclude() -> PathList {
+    PathList::Replace(GlobList::Inline(
+        DEFAULT_GLOBAL_EXCLUDE
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect(),
+    ))
 }
 
 /// Whitespace normalization knobs. Both pass-toggles default to enabled.
@@ -403,12 +472,19 @@ impl Config {
         if let Some(g) = &self.gjf {
             validate_source_xor(g.version.as_ref(), g.path.as_deref(), "gjf")?;
         }
+        if let Some(g) = &self.gradle_dependencies_sorter {
+            validate_source_xor(
+                g.version.as_ref(),
+                g.path.as_deref(),
+                "gradle-dependencies-sorter",
+            )?;
+        }
         Ok(())
     }
 
     /// Resolve any [`VersionSpec::Ref`] entries against the filesystem.
-    /// After this returns Ok, every `Ktfmt::version` / `Gjf::version` is
-    /// either `None` or `Some(VersionSpec::Literal(_))`.
+    /// After this returns Ok, every tool version is either `None` or
+    /// `Some(VersionSpec::Literal(_))`.
     ///
     /// The same catalog file is parsed at most once per call.
     pub fn resolve_catalogs(mut self, repo_root: &Path) -> Result<Self> {
@@ -422,6 +498,13 @@ impl Config {
         if let Some(g) = &mut self.gjf {
             if let Some(VersionSpec::Ref(r)) = g.version.clone() {
                 let v = resolve_catalog_ref(&r, repo_root, "gjf", &mut cache)?;
+                g.version = Some(VersionSpec::Literal(v));
+            }
+        }
+        if let Some(g) = &mut self.gradle_dependencies_sorter {
+            if let Some(VersionSpec::Ref(r)) = g.version.clone() {
+                let v =
+                    resolve_catalog_ref(&r, repo_root, "gradle-dependencies-sorter", &mut cache)?;
                 g.version = Some(VersionSpec::Literal(v));
             }
         }
@@ -440,6 +523,16 @@ impl Ktfmt {
 }
 
 impl Gjf {
+    pub fn source(&self, repo_root: &Path) -> ToolSource {
+        resolve_source(
+            self.version.as_ref().map(|v| v.as_literal()),
+            self.path.as_deref(),
+            repo_root,
+        )
+    }
+}
+
+impl GradleDependenciesSorter {
     pub fn source(&self, repo_root: &Path) -> ToolSource {
         resolve_source(
             self.version.as_ref().map(|v| v.as_literal()),
@@ -565,6 +658,7 @@ mod tests {
         let c = Config::parse("").unwrap();
         assert!(c.ktfmt.is_none());
         assert!(c.gjf.is_none());
+        assert!(c.gradle_dependencies_sorter.is_none());
         assert!(c.rustfmt.is_none());
         assert!(c.license_header.is_none());
         assert!(c.whitespace.strip_trailing);
@@ -572,11 +666,11 @@ mod tests {
         assert_eq!(c.hook.mode, HookMode::Format);
         // Default global exclude is built-in (build/, target/).
         match &c.paths.exclude {
-            GlobList::Inline(v) => {
+            PathList::Replace(GlobList::Inline(v)) => {
                 assert!(v.contains(&"**/build/**".to_string()));
                 assert!(v.contains(&"**/target/**".to_string()));
             }
-            GlobList::FromFile(_) => panic!("expected inline list by default"),
+            other => panic!("expected inline replacement by default, got {other:?}"),
         }
     }
 
@@ -648,6 +742,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.gjf.unwrap().style, GjfStyle::Aosp);
+    }
+
+    #[test]
+    fn gradle_dependencies_sorter_defaults_match_upstream_cli() {
+        let c = Config::parse(
+            r#"
+            [gradle-dependencies-sorter]
+            version = "0.20.0"
+        "#,
+        )
+        .unwrap();
+        let sorter = c.gradle_dependencies_sorter.unwrap();
+        assert!(sorter.insert_blank_lines);
+        let paths = sorter.resolve_paths(Path::new("/repo")).unwrap();
+        assert_eq!(
+            paths.include,
+            vec!["**/*.gradle".to_string(), "**/*.gradle.kts".to_string()]
+        );
+        assert!(paths.exclude.is_empty());
+    }
+
+    #[test]
+    fn gradle_dependencies_sorter_can_disable_blank_lines() {
+        let c = Config::parse(
+            r#"
+            [gradle-dependencies-sorter]
+            version = "0.20.0"
+            insert-blank-lines = false
+        "#,
+        )
+        .unwrap();
+        assert!(!c.gradle_dependencies_sorter.unwrap().insert_blank_lines);
     }
 
     #[test]
@@ -835,9 +961,26 @@ mod tests {
         )
         .unwrap();
         match &c.paths.exclude {
-            GlobList::Inline(v) => assert_eq!(v, &vec!["**/generated/**".to_string()]),
-            GlobList::FromFile(_) => panic!(),
+            PathList::Replace(GlobList::Inline(v)) => {
+                assert_eq!(v, &vec!["**/generated/**".to_string()])
+            }
+            other => panic!("expected inline replacement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn paths_nested_extend_appends_to_defaults() {
+        let c = Config::parse(
+            r#"
+            [paths]
+            exclude = { extend = ["**/generated/**"] }
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.paths.resolve_excludes(Path::new("/repo")).unwrap(),
+            vec!["**/build/**", "**/target/**", "**/generated/**"]
+        );
     }
 
     #[test]
@@ -850,8 +993,10 @@ mod tests {
         )
         .unwrap();
         match &c.paths.exclude {
-            GlobList::FromFile(p) => assert_eq!(p, &PathBuf::from("config/global-excludes.txt")),
-            GlobList::Inline(_) => panic!("expected file path form"),
+            PathList::Replace(GlobList::FromFile(p)) => {
+                assert_eq!(p, &PathBuf::from("config/global-excludes.txt"))
+            }
+            other => panic!("expected file-path replacement, got {other:?}"),
         }
     }
 
@@ -943,6 +1088,65 @@ mod tests {
     }
 
     #[test]
+    fn tool_path_extensions_append_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Config::parse(
+            r#"
+            [ktfmt]
+            version = "0.62"
+
+            [ktfmt.paths]
+            include = { extend = ["scripts/**/*.kts"] }
+            exclude = { extend = ["**/Legacy.kt"] }
+        "#,
+        )
+        .unwrap();
+        let resolved = c.ktfmt.unwrap().resolve_paths(dir.path()).unwrap();
+        assert_eq!(
+            resolved.include,
+            vec!["**/*.kt", "**/*.kts", "scripts/**/*.kts"]
+        );
+        assert_eq!(resolved.exclude, vec!["**/Legacy.kt"]);
+    }
+
+    #[test]
+    fn tool_path_extensions_accept_glob_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(
+            dir.path().join("config/extra-includes.txt"),
+            "**/*.md\n**/.gitignore\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config/extra-excludes.txt"),
+            "**/generated/**\n",
+        )
+        .unwrap();
+        let c = Config::parse(
+            r#"
+            [whitespace.paths]
+            include = { extend = "config/extra-includes.txt" }
+            exclude = { extend = "config/extra-excludes.txt" }
+        "#,
+        )
+        .unwrap();
+        let resolved = c.whitespace.resolve_paths(dir.path()).unwrap();
+        assert_eq!(
+            resolved.include,
+            vec![
+                "**/*.kt",
+                "**/*.kts",
+                "**/*.java",
+                "**/*.rs",
+                "**/*.md",
+                "**/.gitignore"
+            ]
+        );
+        assert_eq!(resolved.exclude, vec!["**/generated/**"]);
+    }
+
+    #[test]
     fn glob_list_accepts_inline_array_or_file_path() {
         // Inline.
         let c = Config::parse(
@@ -956,7 +1160,9 @@ mod tests {
         )
         .unwrap();
         match &c.ktfmt.as_ref().unwrap().paths.as_ref().unwrap().include {
-            Some(GlobList::Inline(v)) => assert_eq!(v, &vec!["**/*.kt".to_string()]),
+            Some(PathList::Replace(GlobList::Inline(v))) => {
+                assert_eq!(v, &vec!["**/*.kt".to_string()])
+            }
             other => panic!("expected inline, got {other:?}"),
         }
 
@@ -972,7 +1178,7 @@ mod tests {
         )
         .unwrap();
         match &c.ktfmt.as_ref().unwrap().paths.as_ref().unwrap().exclude {
-            Some(GlobList::FromFile(p)) => {
+            Some(PathList::Replace(GlobList::FromFile(p))) => {
                 assert_eq!(p, &PathBuf::from("config/ktfmt-skip.txt"))
             }
             other => panic!("expected file-path form, got {other:?}"),
@@ -1146,6 +1352,22 @@ mod tests {
     }
 
     #[test]
+    fn gradle_dependencies_sorter_requires_one_source() {
+        let missing = Config::parse("[gradle-dependencies-sorter]\n").unwrap_err();
+        assert!(format!("{missing:#}").contains("must set either"));
+
+        let both = Config::parse(
+            r#"
+            [gradle-dependencies-sorter]
+            version = "0.20.0"
+            path = "config/bin/gradle-dependencies-sorter.jar"
+        "#,
+        )
+        .unwrap_err();
+        assert!(format!("{both:#}").contains("pick one"));
+    }
+
+    #[test]
     fn ktfmt_path_only_is_valid() {
         let c = Config::parse(
             r#"
@@ -1215,6 +1437,22 @@ mod tests {
         .unwrap();
         let src = c.gjf.as_ref().unwrap().source(Path::new("/r"));
         assert_eq!(src, ToolSource::Local(PathBuf::from("/r/tools/gjf.jar")));
+    }
+
+    #[test]
+    fn gradle_dependencies_sorter_source_resolves_against_repo_root() {
+        let c = Config::parse(
+            r#"
+            [gradle-dependencies-sorter]
+            path = "tools/sort"
+        "#,
+        )
+        .unwrap();
+        let source = c
+            .gradle_dependencies_sorter
+            .unwrap()
+            .source(Path::new("/repo"));
+        assert_eq!(source, ToolSource::Local(PathBuf::from("/repo/tools/sort")));
     }
 
     #[test]
@@ -1305,6 +1543,33 @@ mod tests {
         .unwrap();
         assert_eq!(c.ktfmt.unwrap().version.unwrap().as_literal(), "0.62");
         assert_eq!(c.gjf.unwrap().version.unwrap().as_literal(), "1.35.0");
+    }
+
+    #[test]
+    fn gradle_dependencies_sorter_catalog_uses_section_name_as_default_key() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "gradle/libs.versions.toml",
+            "[versions]\ngradle-dependencies-sorter = \"0.20.0\"\n",
+        );
+        let c = Config::parse(
+            r#"
+            [gradle-dependencies-sorter]
+            version = { file = "gradle/libs.versions.toml" }
+        "#,
+        )
+        .unwrap()
+        .resolve_catalogs(dir.path())
+        .unwrap();
+        assert_eq!(
+            c.gradle_dependencies_sorter
+                .unwrap()
+                .version
+                .unwrap()
+                .as_literal(),
+            "0.20.0"
+        );
     }
 
     #[test]

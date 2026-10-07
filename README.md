@@ -6,11 +6,12 @@ whitespace. Configured per repo via `.kempt.toml`.
 
 Supported targets:
 
-| Language | Extensions    | Formatter                                                          | Config section |
-|----------|---------------|--------------------------------------------------------------------|----------------|
-| Kotlin   | `.kt`, `.kts` | [ktfmt](https://github.com/kotlin/ktfmt)                           | `[ktfmt]`      |
-| Java     | `.java`       | [google-java-format](https://github.com/google/google-java-format) | `[gjf]`        |
-| Rust     | `.rs`         | `cargo fmt`                                                        | `[rustfmt]`    |
+| Target              | Extensions               | Formatter                                                                          | Config section                 |
+|---------------------|--------------------------|------------------------------------------------------------------------------------|--------------------------------|
+| Kotlin              | `.kt`, `.kts`            | [ktfmt](https://github.com/kotlin/ktfmt)                                           | `[ktfmt]`                      |
+| Java                | `.java`                  | [google-java-format](https://github.com/google/google-java-format)                 | `[gjf]`                        |
+| Gradle dependencies | `.gradle`, `.gradle.kts` | [Gradle Dependencies Sorter](https://github.com/square/gradle-dependencies-sorter) | `[gradle-dependencies-sorter]` |
+| Rust                | `.rs`                    | `cargo fmt`                                                                        | `[rustfmt]`                    |
 
 ## Install
 
@@ -39,7 +40,10 @@ cargo install kempt-fmt
 
 ### Notes
 
-A working `java` (JDK 17+) on `PATH` is required to run ktfmt and gjf (unless using `native`).
+A working Git 2.25 or later is required.
+
+A working `java` (JDK 17+) on `PATH` is required to run the Gradle Dependencies
+Sorter and any ktfmt or gjf configuration that does not use `native`.
 A working `cargo fmt` on `PATH` is required when `[rustfmt]` is enabled.
 
 ## Quick start
@@ -52,12 +56,14 @@ kempt install-hook     # writes .git/hooks/pre-commit
 kempt format           # format everything once
 ```
 
-`kempt init` walks the repo root looking for `.kt`/`.kts`, `.java`, and `.rs`
-source files, skipping gen/vcs dirs like `.git`, `build`, `target`, and
-`node_modules`. It tailors the starter config based on what it finds:
+`kempt init` walks the repo root looking for `.kt`/`.kts`, `.java`, `.rs`,
+`.gradle`, and `.gradle.kts` files, skipping generated/VCS directories like
+`.git`, `build`, `target`, and `node_modules`. It tailors the starter config
+based on what it finds:
 
 - `[ktfmt]` is emitted only when Kotlin files exist
 - `[gjf]` only when Java files exist
+- `[gradle-dependencies-sorter]` only when Gradle scripts exist
 - `[rustfmt]` only when Rust files exist.
 
 An empty repo gets all formatter sections. The versions
@@ -78,7 +84,7 @@ disable that step.
 
 ```toml
 [ktfmt]
-version = "0.63"
+version = "0.65"
 style = "google"           # google | kotlinlang | meta
 native = "auto"            # auto | always | never
 
@@ -86,6 +92,10 @@ native = "auto"            # auto | always | never
 version = "1.35.0"
 style = "google"           # google | aosp
 native = "auto"            # auto | always | never
+
+[gradle-dependencies-sorter]
+version = "0.20.0"
+insert-blank-lines = true
 
 [rustfmt]
 
@@ -106,12 +116,12 @@ file = "config/license-header-rust.txt"        # overrides global for .rs
 excludes = "config/license-excludes-rs.txt"
 
 [paths]
-# Global exclude applied before any tool's own filter. Inline array OR
-# a path to a text file (one glob per line, `#` comments).
-exclude = ["**/build/**", "**/target/**"]
+# Global excludes applied before any tool's own filter. The built-in defaults
+# are ["**/build/**", "**/target/**"]; extend them without repeating them.
+exclude = { extend = ["**/generated/**"] }
 
-# Per-tool path scope. Each tool has its own include/exclude with sensible
-# language defaults; you only set these to narrow further.
+# Per-tool path scope. A plain array or file path replaces the default, while
+# the nested extend form appends to it.
 [ktfmt.paths]
 # defaults: include = ["**/*.kt", "**/*.kts"], exclude = []
 include = ["**/src/**/*.kt", "**/src/**/*.kts"]
@@ -121,11 +131,15 @@ exclude = "config/ktfmt-skip.txt"   # polymorphic: array or file path
 # defaults: include = ["**/*.java"], exclude = []
 exclude = ["**/*Generated.java"]
 
+[gradle-dependencies-sorter.paths]
+# defaults: include = ["**/*.gradle", "**/*.gradle.kts"], exclude = []
+
 [rustfmt.paths]
 # defaults: include = ["**/*.rs"], exclude = []
 
 [whitespace.paths]
 # defaults: include = ["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"], exclude = []
+include = { extend = ["**/*.md", "**/.gitignore"] }
 
 [whitespace]
 strip-trailing = true   # strip trailing space/tab/CR from every line
@@ -148,42 +162,47 @@ header is inserted for that language.
 
 The exclude files are plain text, one glob per line, `#` comments allowed.
 
+### Gradle dependency sorting
+
+`[gradle-dependencies-sorter]` runs Square's standalone CLI fat JAR directly.
+Kempt does not apply the companion Gradle plugin or invoke Gradle tasks. It
+passes only the build scripts selected by the normal Kempt scope and path
+filters. `insert-blank-lines = true` matches the upstream default; set it to
+`false` to keep dependency configurations adjacent.
+
+`kempt check` sorts temporary copies and compares them with the originals, so
+the check remains read-only while reporting the exact scripts that need work.
+
 ### Two kinds of excludes
 
 kempt has two exclude mechanisms because they answer different questions:
 
 | Where                                             | Question it answers                          | Example use                                                          |
 |---------------------------------------------------|----------------------------------------------|----------------------------------------------------------------------|
-| `[paths].exclude` (inline list)                   | "Should kempt touch this file at all?"       | Build output, test fixtures, generated code, vendored upstream files |
+| `[paths].exclude`                                 | "Should kempt touch this file at all?"       | Build output, test fixtures, generated code, vendored upstream files |
 | `[<tool>.license-header].excludes` (file pointer) | "Should kempt insert a header in this file?" | Files with their own license header that should still be formatted   |
 
-If a file matches `[paths].exclude`, kempt skips it completely, no formatter and
-no header. If a file is in a license-header _excludes file_ but not in
-`[paths].exclude`, kempt still formats it with its configured tool; it just won't
-prepend a header.
+If a file matches the resolved global exclusions, kempt skips it completely, with no formatter and no header. If a file is in a license-header _excludes file_ but not in the global exclusions, kempt still formats it with its configured tool; it just will not prepend a header.
 
-When in doubt, prefer `[paths].exclude`. Use license-header excludes only when
-the formatter should still run on a file that should not receive a header.
+When in doubt, prefer `[paths].exclude`. Use license-header excludes only when the formatter should still run on a file that should not receive a header.
 
 ### Per-tool path scope
 
-Each tool has its own `paths.include` / `paths.exclude` with language
-defaults so you only configure these when you need to narrow further:
+Each tool has its own path lists with language defaults. A plain array or file path assigned to `include` or `exclude` replaces its default. The nested `{ extend = ... }` form appends entries to the built-in default instead:
 
-| Tool                 | Default include                                   | Default exclude |
-|----------------------|---------------------------------------------------|-----------------|
-| `[ktfmt.paths]`      | `["**/*.kt", "**/*.kts"]`                         | `[]`            |
-| `[gjf.paths]`        | `["**/*.java"]`                                   | `[]`            |
-| `[rustfmt.paths]`    | `["**/*.rs"]`                                     | `[]`            |
-| `[whitespace.paths]` | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | `[]`            |
+| Tool                                 | Default include                                   | Default exclude |
+|--------------------------------------|---------------------------------------------------|-----------------|
+| `[ktfmt.paths]`                      | `["**/*.kt", "**/*.kts"]`                         | `[]`            |
+| `[gjf.paths]`                        | `["**/*.java"]`                                   | `[]`            |
+| `[gradle-dependencies-sorter.paths]` | `["**/*.gradle", "**/*.gradle.kts"]`              | `[]`            |
+| `[rustfmt.paths]`                    | `["**/*.rs"]`                                     | `[]`            |
+| `[whitespace.paths]`                 | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | `[]`            |
 
-The global `[paths].exclude` is applied first as a universal filter; each
-tool's own `include` / `exclude` then narrows further. A file is processed
-by a given tool iff:
+The resolved global exclusion list is applied first as a universal filter; each tool's resolved include and exclude lists then narrow further. A file is processed by a given tool iff:
 
-- It is not matched by `[paths].exclude` (universal exclusion), AND
-- It is matched by that tool's `paths.include`, AND
-- It is not matched by that tool's `paths.exclude`.
+- It is not matched by the resolved `[paths]` exclusions, AND
+- It is matched by that tool's resolved include list, AND
+- It is not matched by that tool's resolved exclude list.
 
 License-header insertion is determined by file extension (`.kt`/`.kts`
 get the kt header, `.java` gets the java header, `.rs` gets the rust header)
@@ -191,18 +210,22 @@ plus the per-tool `license-header.excludes` list. It is intentionally NOT
 gated on tool path scope so you can configure `[license-header]` without
 configuring `[ktfmt]` and still get headers on kt files.
 
-### Polymorphic include / exclude
+Whitespace normalization is independent of license-header language detection. Any UTF-8 text file matched by the resolved `[whitespace.paths]` lists can be normalized, including Markdown and extensionless dotfiles.
 
-Every `include` and `exclude` field accepts either an inline array or a
-path to a text file (one glob per line, `#` comments allowed):
+### Path list forms
+
+Every `include` and `exclude` field accepts a plain inline array or path to a text file as a replacement. Nest either form under `extend` to append it to the built-in default:
 
 ```toml
 [ktfmt.paths]
 include = ["**/*.kt", "**/*.kts"]      # inline
 exclude = "config/ktfmt-skip.txt"      # file path
 
+[whitespace.paths]
+include = { extend = ["**/*.md", "**/.gitignore"] }
+
 [paths]
-exclude = "config/global-excludes.txt" # file path also works for the global
+exclude = { extend = "config/global-excludes.txt" }
 
 [ktfmt.license-header]
 excludes = "config/license-excludes-kt.txt"  # already file-path-only
@@ -221,17 +244,24 @@ File paths are resolved relative to the repo root. The format is:
 ### File scope
 
 `kempt format` and `kempt check` default to every **tracked** file matching
-the include globs (via `git ls-files`). Two flags adjust the file set:
+the include globs (via `git ls-files`). Scope flags adjust the file set:
 
-| Flag                     | Effect                                                                                                                                                                      |
-|--------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| (none) or `--all`        | All tracked files. The default "format everything" mode. `--all` exists as an explicit alias for symmetry with the other scope flags and so suggestions can be unambiguous. |
-| `--staged`               | Files in the index only. Used by the pre-commit hook.                                                                                                                       |
-| `--discovery=walk`       | Filesystem walk from the repo root. Includes untracked files. Does NOT consult `.gitignore`. `[paths].exclude` is the only filter.                                          |
-| `<file>...` (positional) | Operate on exactly the listed files. Bypasses scope flags and `[paths].include` / `[paths].exclude`. Useful for targeted runs (e.g. `kempt format src/Foo.kt`).             |
+| Flag                   | Effect                                                                                                                                                                      |
+|------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| (none) or `--all`      | All tracked files. The default "format everything" mode. `--all` exists as an explicit alias for symmetry with the other scope flags and so suggestions can be unambiguous. |
+| `--staged`             | Files in the index only. Used by the pre-commit hook.                                                                                                                       |
+| `--touched`            | Files changed on the current branch since it diverged from the default branch, including committed, staged, unstaged, and non-ignored untracked files.                      |
+| `--discovery=walk`     | Filesystem walk from the repo root. Includes untracked files. Does NOT consult `.gitignore`. The resolved `[paths]` exclusions are the only filter.                         |
+| `<path-or-pattern>...` | Operate on files, recursive directories, or glob patterns relative to the current directory. Respects configured path exclusions.                                           |
 
-`--all`, `--staged`, `--discovery=walk`, and explicit positional paths are
-all mutually exclusive.
+`--all`, `--staged`, `--touched`, `--discovery=walk`, and explicit positional
+paths are all mutually exclusive.
+
+`--touched` detects the default branch from the remote's symbolic `HEAD`, with
+`main`, `master`, and `trunk` fallbacks, then compares the working tree to its
+merge-base with `HEAD`. Pass `--base <ref>` to override the detected branch,
+for example `kempt format --touched --base upstream/main`. Formatting changes
+the working tree but does not stage or re-stage files.
 
 When `kempt check` (or `kempt format --dry-run`) finds 30 or fewer files
 needing formatting, it appends a copy-pasteable command listing those files
@@ -240,47 +270,50 @@ without touching the rest of the working tree.
 
 `--discovery=walk` is for files outside git's index, such as newly created
 files that have not been staged. It does not consult `.gitignore`. In walk
-mode, `[paths].exclude` is the only filter. Use `[paths].exclude` to filter
-out build outputs and similar directories (the defaults already cover
-`**/build/**` and `**/target/**`). The `.git/` directory is always skipped
-before config filters are applied.
+mode, the resolved `[paths]` exclusions are the only filter. Use a plain `[paths].exclude` value to replace the defaults or its nested `{ extend = ... }` form to add entries. The defaults already cover `**/build/**` and `**/target/**`. The `.git/` directory is always skipped before config filters are applied.
 
 ### Config reference
 
 Every option, with its default. A `-` in the default column means "no built-in
 default; the section that contains it is what enables the feature."
 
-| Key                                 | Default                                           | Notes                                                                                                              |
-|-------------------------------------|---------------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
-| `[ktfmt].version`                   | -                                                 | Release version. Either a literal `"0.65"` or a catalog reference `{ file, key }`. Mutually exclusive with `path`. |
-| `[ktfmt].path`                      | -                                                 | Path to a checked-in jar or native binary. Mutually exclusive with `version`.                                      |
-| `[ktfmt].style`                     | `"google"`                                        | `google` / `kotlinlang` / `meta`                                                                                   |
-| `[ktfmt].native`                    | `"auto"`                                          | `auto` / `always` / `never`. See "Native formatter binaries".                                                      |
-| `[ktfmt.paths].include`             | `["**/*.kt", "**/*.kts"]`                         | Inline array or path to a glob-list file.                                                                          |
-| `[ktfmt.paths].exclude`             | `[]`                                              | Inline array or path to a glob-list file.                                                                          |
-| `[ktfmt.license-header].file`       | inherits `[license-header].file`                  | Per-tool template override.                                                                                        |
-| `[ktfmt.license-header].excludes`   | none                                              | Path to a glob list (one per line, `#` comments).                                                                  |
-| `[gjf].version`                     | -                                                 | GitHub release version. Either a literal or a catalog reference `{ file, key }`. Mutually exclusive with `path`.   |
-| `[gjf].path`                        | -                                                 | Path to a checked-in jar or native binary. Mutually exclusive with `version`.                                      |
-| `[gjf].style`                       | `"google"`                                        | `google` / `aosp`                                                                                                  |
-| `[gjf].native`                      | `"auto"`                                          | `auto` / `always` / `never`. See "Native formatter binaries".                                                      |
-| `[gjf.paths].include`               | `["**/*.java"]`                                   | Inline array or path to a glob-list file.                                                                          |
-| `[gjf.paths].exclude`               | `[]`                                              | Inline array or path to a glob-list file.                                                                          |
-| `[gjf.license-header].file`         | inherits `[license-header].file`                  | Per-tool template override.                                                                                        |
-| `[gjf.license-header].excludes`     | none                                              | Path to a glob list.                                                                                               |
-| `[rustfmt.paths].include`           | `["**/*.rs"]`                                     | Inline array or path to a glob-list file.                                                                          |
-| `[rustfmt.paths].exclude`           | `[]`                                              | Inline array or path to a glob-list file.                                                                          |
-| `[rustfmt.license-header].file`     | inherits `[license-header].file`                  | Per-tool template override.                                                                                        |
-| `[rustfmt.license-header].excludes` | none                                              | Path to a glob list.                                                                                               |
-| `[license-header].file`             | -                                                 | Default license header template, `${YEAR}` expanded at write time. Section absence = no header insertion.          |
-| `[paths].exclude`                   | `["**/build/**", "**/target/**"]`                 | Global exclude, applied before any tool's filter. Inline array or path to a glob-list file.                        |
-| `[whitespace].strip-trailing`       | `true`                                            | Strip trailing space/tab/CR on every line.                                                                         |
-| `[whitespace].final-newline`        | `true`                                            | Ensure files end with exactly one `\n`.                                                                            |
-| `[whitespace.paths].include`        | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | Inline array or path to a glob-list file.                                                                          |
-| `[whitespace.paths].exclude`        | `[]`                                              | Inline array or path to a glob-list file.                                                                          |
-| `[hook].mode`                       | `"format"`                                        | `format` formats and re-stages. `check` fails the commit if changes are needed.                                    |
+| Key                                               | Default                                           | Notes                                                                                                                    |
+|---------------------------------------------------|---------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| `[ktfmt].version`                                 | -                                                 | Release version. Either a literal `"0.65"` or a catalog reference `{ file, key }`. Mutually exclusive with `path`.      |
+| `[ktfmt].path`                                    | -                                                 | Path to a checked-in jar or native binary. Mutually exclusive with `version`.                                            |
+| `[ktfmt].style`                                   | `"google"`                                        | `google` / `kotlinlang` / `meta`                                                                                         |
+| `[ktfmt].native`                                  | `"auto"`                                          | `auto` / `always` / `never`. See "Native formatter binaries".                                                            |
+| `[ktfmt.paths].include`                           | `["**/*.kt", "**/*.kts"]`                         | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
+| `[ktfmt.paths].exclude`                           | `[]`                                              | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
+| `[ktfmt.license-header].file`                     | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
+| `[ktfmt.license-header].excludes`                 | none                                              | Path to a glob list (one per line, `#` comments).                                                                        |
+| `[gjf].version`                                   | -                                                 | GitHub release version. Either a literal or a catalog reference `{ file, key }`. Mutually exclusive with `path`.         |
+| `[gjf].path`                                      | -                                                 | Path to a checked-in jar or native binary. Mutually exclusive with `version`.                                            |
+| `[gjf].style`                                     | `"google"`                                        | `google` / `aosp`                                                                                                        |
+| `[gjf].native`                                    | `"auto"`                                          | `auto` / `always` / `never`. See "Native gjf".                                                                           |
+| `[gjf.paths].include`                             | `["**/*.java"]`                                   | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
+| `[gjf.paths].exclude`                             | `[]`                                              | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
+| `[gjf.license-header].file`                       | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
+| `[gjf.license-header].excludes`                   | none                                              | Path to a glob list.                                                                                                     |
+| `[gradle-dependencies-sorter].version`            | -                                                 | Maven Central CLI version. Either a literal or a catalog reference `{ file, key }`. Mutually exclusive with `path`.      |
+| `[gradle-dependencies-sorter].path`               | -                                                 | Path to a checked-in fat JAR or executable CLI. Mutually exclusive with `version`.                                       |
+| `[gradle-dependencies-sorter].insert-blank-lines` | `true`                                            | Insert blank lines between different dependency configurations.                                                          |
+| `[gradle-dependencies-sorter.paths].include`      | `["**/*.gradle", "**/*.gradle.kts"]`              | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
+| `[gradle-dependencies-sorter.paths].exclude`      | `[]`                                              | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
+| `[rustfmt.paths].include`                         | `["**/*.rs"]`                                     | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
+| `[rustfmt.paths].exclude`                         | `[]`                                              | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
+| `[rustfmt.license-header].file`                   | inherits `[license-header].file`                  | Per-tool template override.                                                                                              |
+| `[rustfmt.license-header].excludes`               | none                                              | Path to a glob list.                                                                                                     |
+| `[license-header].file`                           | -                                                 | Default license header template, `${YEAR}` expanded at write time. Section absence = no header insertion.                |
+| `[paths].exclude`                                 | `["**/build/**", "**/target/**"]`                 | Global filter. Array/file replaces the default; nested `{ extend = ... }` appends to it.                                 |
+| `[whitespace].strip-trailing`                     | `true`                                            | Strip trailing space/tab/CR on every line.                                                                               |
+| `[whitespace].final-newline`                      | `true`                                            | Ensure files end with exactly one `\n`.                                                                                  |
+| `[whitespace.paths].include`                      | `["**/*.kt", "**/*.kts", "**/*.java", "**/*.rs"]` | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
+| `[whitespace.paths].exclude`                      | `[]`                                              | Array/file replaces the default; nested `{ extend = ... }` appends to it.                                                |
+| `[hook].mode`                                     | `"format"`                                        | `format` formats and re-stages. `check` fails the commit if changes are needed.                                          |
 
-Sections that are entirely optional: `[ktfmt]`, `[gjf]`, `[rustfmt]`,
+Sections that are entirely optional: `[ktfmt]`, `[gjf]`,
+`[gradle-dependencies-sorter]`, `[rustfmt]`,
 `[license-header]`, `[ktfmt.license-header]`, `[gjf.license-header]`,
 `[rustfmt.license-header]`.
 Omitting a section disables that step. `[paths]`, `[whitespace]`, and
@@ -292,7 +325,7 @@ Omitting a section disables that step. `[paths]`, `[whitespace]`, and
 |----------------------|------------------------------------------------------------------------------------------------------------------------------------------|
 | `kempt format`       | Format files in place.                                                                                                                   |
 | `kempt check`        | Dry-run; exits non-zero if changes are needed. Suitable for CI.                                                                          |
-| `kempt init`         | Scaffold `.kempt.toml`. Detects `.kt`/`.java`/`.rs` to decide which sections to write.                                                   |
+| `kempt init`         | Scaffold `.kempt.toml`. Detects source files and Gradle scripts to decide which sections to write.                                       |
 | `kempt install-hook` | Write a `.git/hooks/pre-commit` that calls `kempt hook`.                                                                                 |
 | `kempt hook`         | Run as the pre-commit hook. Not normally invoked manually.                                                                               |
 | `kempt update`       | Download formatter artifacts per config. Pre-warms the cache.                                                                            |
@@ -305,17 +338,23 @@ Omitting a section disables that step. `[paths]`, `[whitespace]`, and
 
 `kempt format` and `kempt check` share the same flag set:
 
-| Flag                        | Default                        | Effect                                                                        |
-|-----------------------------|--------------------------------|-------------------------------------------------------------------------------|
-| `--all`                     | (the implicit default)         | All tracked files. Explicit alias of the default for unambiguous suggestions. |
-| `--staged`                  | off                            | Only files in the git index.                                                  |
-| `--discovery=<vcs\|walk>`   | `vcs`                          | `walk` walks the filesystem; doesn't consult `.gitignore`.                    |
-| `--dry-run` (`format` only) | off                            | Preview without writing. Equivalent to `kempt check`.                         |
-| `<file>...` (positional)    | -                              | Process exactly the listed files. Bypasses scope flags and `[paths]` filters. |
-| `--config <PATH>`           | `.kempt.toml` in the repo root | Override the config file path.                                                |
+| Flag                        | Default                        | Effect                                                                                    |
+|-----------------------------|--------------------------------|-------------------------------------------------------------------------------------------|
+| `--all`                     | (the implicit default)         | All tracked files. Explicit alias of the default for unambiguous suggestions.             |
+| `--staged`                  | off                            | Only files in the git index.                                                              |
+| `--discovery=<vcs\|walk>`   | `vcs`                          | `walk` walks the filesystem; doesn't consult `.gitignore`.                                |
+| `--dry-run` (`format` only) | off                            | Preview without writing. Equivalent to `kempt check`.                                     |
+| `--force`                   | off                            | Allow positional targets to bypass resolved global and per-tool path exclusions.          |
+| `<path-or-pattern>...`      | -                              | Process files, recursive directories, or glob patterns relative to the current directory. |
+| `--config <PATH>`           | `.kempt.toml` in the repo root | Override the config file path.                                                            |
 
 `--all`, `--staged`, `--discovery=walk`, and explicit positional paths are
 mutually exclusive.
+
+Positional glob patterns use the same syntax as Kempt's configured path
+patterns. Quote them when the shell would otherwise expand them first, for
+example `kempt format 'src/**/*.kt'`. Positional targets respect global and
+per-tool path exclusions by default; pass `--force` to override them. Resolved tool include filters and `license-header.excludes` still apply.
 
 `kempt init` takes `--license-header` to add `[license-header]` and write a
 starter `config/license-header.txt`.
@@ -346,8 +385,8 @@ followed by an actionable trailer that's tailored to scope and content:
 - Pure parse errors: trailer says formatting can't proceed until they're
   fixed.
 
-ktfmt/gjf parse errors are surfaced with their file:line:col message; JVM
-deprecation warnings are filtered out, so the actual error is what you read.
+ktfmt, gjf, and Gradle Dependencies Sorter parse errors are surfaced while JVM
+warning noise is filtered out, so the actual error is what you read.
 
 ## Pre-commit hook
 
@@ -382,7 +421,8 @@ The hook does, in order:
    1. Stage the rest
    2. `git stash --keep-index`
    3. Commit with `--no-verify`.
-3. Run the full pipeline (license headers, whitespace, ktfmt, gjf, cargo fmt).
+3. Run the full pipeline (license headers, whitespace, Gradle dependency
+   sorting, ktfmt, gjf, cargo fmt).
 4. `git add --force` the formatted files back to the index (--force so tracked files
    inside ignored directories can still be re-staged).
 
@@ -402,7 +442,8 @@ be enabled explicitly:
 - set the `KEMPT_EXPERIMENTAL_PARTIAL_GJF` env flag to allow partially staged GJF-managed Java files
 
 kempt formats the staged content and updates the index directly, without
-staging unrelated worktree hunks. Other partially staged files still use the
+staging unrelated worktree hunks. Gradle Dependencies Sorter does not support
+partial-file formatting, so partially staged Gradle scripts still use the
 refusal path above.
 
 ## CI
@@ -522,10 +563,14 @@ version = { file = "gradle/libs.versions.toml", key = "ktfmt" }
 
 [gjf]
 version = { file = "gradle/libs.versions.toml" }   # key defaults to "gjf"
+
+[gradle-dependencies-sorter]
+version = { file = "gradle/libs.versions.toml" }
+# key defaults to "gradle-dependencies-sorter"
 ```
 
 kempt resolves the reference by reading the catalog's `[versions]` table
-at startup. The `key` field defaults to the tool name (`ktfmt` or `gjf`)
+at startup. The `key` field defaults to the tool's config-section name
 so the common case is even shorter:
 
 ```toml
@@ -539,7 +584,7 @@ Resolution rules:
   versions (`{ strictly = "1.0", require = "..." }`) error with a clear
   message.
 - The catalog file is parsed at most once per kempt invocation, even if
-  both `[ktfmt]` and `[gjf]` reference the same file.
+  multiple tools reference the same file.
 
 This works well with **Dependabot**, which doesn't natively understand
 `.kempt.toml`: keep a dummy `[libraries]` entry in `libs.versions.toml`
@@ -559,9 +604,8 @@ manager covers it cleanly. Add this to your `renovate.json`:
       "matchStrings": [
         "\\[ktfmt\\][^\\[]*?version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
       ],
-      "datasourceTemplate": "maven",
-      "registryUrlTemplate": "https://repo1.maven.org/maven2",
-      "depNameTemplate": "com.facebook:ktfmt"
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "Kotlin/ktfmt"
     },
     {
       "customType": "regex",
@@ -572,15 +616,24 @@ manager covers it cleanly. Add this to your `renovate.json`:
       "datasourceTemplate": "maven",
       "registryUrlTemplate": "https://repo1.maven.org/maven2",
       "depNameTemplate": "com.google.googlejavaformat:google-java-format"
+    },
+    {
+      "customType": "regex",
+      "fileMatch": ["(^|/)\\.kempt\\.toml$"],
+      "matchStrings": [
+        "\\[gradle-dependencies-sorter\\][^\\[]*?version\\s*=\\s*\"(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "maven",
+      "registryUrlTemplate": "https://repo1.maven.org/maven2",
+      "depNameTemplate": "com.squareup:sort-gradle-dependencies-app"
     }
   ]
 }
 ```
 
 Each manager scans `.kempt.toml`, finds the first `version = "..."` after a
-matching tool section header (`[ktfmt]` or `[gjf]`), and tracks the
-corresponding Maven Central coordinate. Renovate opens a PR per upstream
-release.
+matching tool section header, and tracks the
+corresponding upstream release. Renovate opens a PR per release.
 
 `[^\[]*?` in the match string keeps the lookahead within the current
 section, so a later section's `version` value isn't matched by the wrong
@@ -599,9 +652,11 @@ understands (e.g., a Gradle `libs.versions.toml`) and copy it into
 
 ktfmt 0.65+ and gjf 1.20.0+ publish GraalVM-native binaries alongside their JVM
 jars. They start without JVM warmup, don't need a JDK, and avoid the JVM
-`--add-opens` flags. Both publish `darwin-arm64`, `linux-x86-64`,
-`linux-arm64`, and `windows-x86-64` binaries, though gjf added `linux-arm64`
-in 1.26.0. Neither publishes an Intel macOS (`darwin-x86-64`) binary.
+`--add-opens` flags. ktfmt 0.65 publishes compressed archives for macOS ARM64,
+Linux x86-64, and Windows x86-64. gjf publishes raw `darwin-arm64`,
+`linux-x86-64`, `linux-arm64` (1.26.0+), and `windows-x86-64` executables.
+Neither formatter publishes an Intel macOS binary, and ktfmt 0.65 does not
+publish a Linux ARM64 binary.
 
 `[ktfmt].native` and `[gjf].native` control which artifact kempt downloads:
 
@@ -609,6 +664,8 @@ in 1.26.0. Neither publishes an Intel macOS (`darwin-x86-64`) binary.
   otherwise.
 - `always`: native always; errors if not published for the host.
 - `never`: jar always.
+
+Version-managed Gradle Dependencies Sorter installations always use the JVM.
 
 ### Checking in the binaries (hermetic / offline builds)
 
@@ -630,6 +687,9 @@ path = "config/bin/ktfmt-0.62.jar"
 
 [gjf]
 path = "config/bin/gjf-1.35.0.jar"
+
+[gradle-dependencies-sorter]
+path = "config/bin/gradle-dependencies-sorter-0.20.0.jar"
 ```
 
 `path` and `version` are mutually exclusive; exactly one must be set per

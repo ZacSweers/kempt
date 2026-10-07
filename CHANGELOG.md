@@ -2,8 +2,28 @@
 
 ## [Unreleased]
 
-- Support ktfmt 0.65+ GraalVM-native binaries with automatic JVM jar fallback,
-  matching the existing GJF native modes.
+- Support ktfmt 0.65 native release archives on macOS ARM64, Linux x86-64, and Windows x86-64, with automatic JVM jar fallback on other platforms.
+- Format and re-stage large file sets without hitting operating-system command-line limits, including on Windows.
+
+## [0.3.1]
+
+_2026-07-28_
+
+- Support nested `{ extend = ... }` path includes and excludes, allowing whitespace normalization to add other paths without repeating Kempt's defaults.
+- Add Gradle dependency sorting for `.gradle` and `.gradle.kts` files through
+  Square's standalone Gradle Dependencies Sorter CLI.
+
+## [0.3.0]
+
+_2026-07-14_
+
+- Keep hook subprocess parsing stable when Git diff customization or JVM
+  environment-option announcements would otherwise alter captured output.
+- Add `--touched` to format or check files changed on the current branch,
+  including committed, staged, unstaged, and non-ignored untracked files.
+- Support files, recursive directories, and glob patterns as explicit
+  `format` and `check` targets. These respect global and per-tool path
+  exclusions unless `--force` is passed.
 
 ## [0.2.1]
 

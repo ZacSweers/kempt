@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 mod cache;
 mod cli;
+mod command_args;
 mod commands;
 mod config;
 mod formatters;
 mod git;
+mod gradle_dependencies;
 mod hook;
 mod license;
 mod paths;
@@ -53,20 +55,33 @@ fn run() -> Result<ExitCode> {
             println!("installed {}", path.display());
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Format(args) => format_or_check(
-            cli.config,
-            args.all,
-            args.staged,
-            args.discovery,
-            args.paths,
-            args.dry_run,
-        ),
+        Cmd::Format(args) => {
+            let check = args.dry_run;
+            format_or_check(
+                cli.config,
+                FileScopeOptions {
+                    all: args.all,
+                    staged: args.staged,
+                    touched: args.touched,
+                    base: args.base,
+                    discovery: args.discovery,
+                    explicit_paths: args.paths,
+                    force: args.force,
+                },
+                check,
+            )
+        }
         Cmd::Check(args) => format_or_check(
             cli.config,
-            args.all,
-            args.staged,
-            args.discovery,
-            args.paths,
+            FileScopeOptions {
+                all: args.all,
+                staged: args.staged,
+                touched: args.touched,
+                base: args.base,
+                discovery: args.discovery,
+                explicit_paths: args.paths,
+                force: args.force,
+            },
             true,
         ),
         Cmd::Hook => run_hook_subcommand(cli.config),
@@ -87,7 +102,7 @@ fn run_vendor_subcommand(config_path: Option<PathBuf>, dir: PathBuf) -> Result<E
     let outcome = commands::run_vendor(&config, git.root(), &cache, &dl, &dir)?;
 
     if outcome.entries.is_empty() && outcome.skipped.is_empty() {
-        println!("kempt: nothing to vendor (no [ktfmt] or [gjf] in config)");
+        println!("kempt: nothing to vendor (no downloadable formatters in config)");
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -166,22 +181,40 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-fn format_or_check(
-    config_path: Option<PathBuf>,
+struct FileScopeOptions {
     all: bool,
     staged: bool,
+    touched: bool,
+    base: Option<String>,
     discovery: Discovery,
     explicit_paths: Vec<PathBuf>,
+    force: bool,
+}
+
+fn format_or_check(
+    config_path: Option<PathBuf>,
+    scope_options: FileScopeOptions,
     check: bool,
 ) -> Result<ExitCode> {
+    let FileScopeOptions {
+        all,
+        staged,
+        touched,
+        base,
+        discovery,
+        explicit_paths,
+        force,
+    } = scope_options;
     let cwd = std::env::current_dir().context("read current dir")?;
     let git = RealGit::discover(&cwd)?;
     let config = load_config(&config_path, git.root())?;
     let cache = Cache::new(Cache::default_root()?);
     let dl = UreqDownloader;
     let has_explicit = !explicit_paths.is_empty();
-    if has_explicit && (all || staged || discovery == Discovery::Walk) {
-        anyhow::bail!("explicit paths are incompatible with --all, --staged, and --discovery=walk");
+    if has_explicit && (all || staged || touched || discovery == Discovery::Walk) {
+        anyhow::bail!(
+            "explicit paths are incompatible with --all, --staged, --touched, and --discovery=walk"
+        );
     }
     if all && staged {
         anyhow::bail!("--all is incompatible with --staged");
@@ -189,12 +222,26 @@ fn format_or_check(
     if all && discovery == Discovery::Walk {
         anyhow::bail!("--all is incompatible with --discovery=walk");
     }
+    if all && touched {
+        anyhow::bail!("--all is incompatible with --touched");
+    }
     if staged && discovery == Discovery::Walk {
         anyhow::bail!("--staged is incompatible with --discovery=walk");
     }
+    if staged && touched {
+        anyhow::bail!("--staged is incompatible with --touched");
+    }
+    if touched && discovery == Discovery::Walk {
+        anyhow::bail!("--touched is incompatible with --discovery=walk");
+    }
 
     let scope = if has_explicit {
-        Scope::Explicit(resolve_explicit_paths(&explicit_paths, &cwd, git.root())?)
+        Scope::Explicit {
+            files: paths::resolve_explicit_targets(&explicit_paths, &cwd, git.root())?,
+            force,
+        }
+    } else if touched {
+        Scope::Touched { base }
     } else {
         match (discovery, staged) {
             (Discovery::Walk, _) => Scope::Walk,
@@ -213,36 +260,6 @@ fn format_or_check(
     } else {
         Ok(ExitCode::SUCCESS)
     }
-}
-
-/// Resolve user-supplied paths to repo-relative form. Paths are interpreted
-/// against `cwd` first, then made relative to `repo_root`. Errors out if any
-/// path falls outside the repo.
-fn resolve_explicit_paths(
-    paths: &[PathBuf],
-    cwd: &std::path::Path,
-    repo_root: &std::path::Path,
-) -> Result<Vec<PathBuf>> {
-    let canonical_root = repo_root
-        .canonicalize()
-        .with_context(|| format!("canonicalize {}", repo_root.display()))?;
-    let mut out = Vec::with_capacity(paths.len());
-    for p in paths {
-        let abs = if p.is_absolute() {
-            p.clone()
-        } else {
-            cwd.join(p)
-        };
-        let canonical = abs
-            .canonicalize()
-            .with_context(|| format!("path not found: {}", p.display()))?;
-        let rel = canonical
-            .strip_prefix(&canonical_root)
-            .with_context(|| format!("path {} is outside the repo root", p.display()))?
-            .to_path_buf();
-        out.push(rel);
-    }
-    Ok(out)
 }
 
 fn run_hook_subcommand(config_path: Option<PathBuf>) -> Result<ExitCode> {
@@ -354,8 +371,9 @@ fn check_context_for_scope(scope: &Scope) -> commands::CheckContext {
     match scope {
         Scope::All => commands::CheckContext::All,
         Scope::Staged => commands::CheckContext::Staged,
+        Scope::Touched { base } => commands::CheckContext::Touched { base: base.clone() },
         Scope::Walk => commands::CheckContext::Walk,
-        Scope::Explicit(_) => commands::CheckContext::Explicit,
+        Scope::Explicit { .. } => commands::CheckContext::Explicit,
     }
 }
 

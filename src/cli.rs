@@ -9,7 +9,7 @@ pub enum Discovery {
     #[default]
     Vcs,
     /// Walk the filesystem from the repo root. Ignore files (`.gitignore`)
-    /// are not consulted. Use `[paths].exclude` to filter results. The
+    /// are not consulted. Use `[paths]` exclusions to filter results. The
     /// `.git/` directory is always pruned.
     Walk,
 }
@@ -95,13 +95,23 @@ pub struct PruneArgs {
 pub struct FormatArgs {
     /// Explicitly target all tracked files. Same as the default behavior;
     /// the flag exists so suggestions can be unambiguous about scope.
-    /// Incompatible with `--staged`, `--discovery=walk`, or explicit paths.
+    /// Incompatible with `--staged`, `--touched`, `--discovery=walk`, or
+    /// explicit paths.
     #[arg(long)]
     pub all: bool,
     /// Operate on staged files (index) only.
-    /// Incompatible with `--all`, `--discovery=walk`, or explicit paths.
+    /// Incompatible with `--all`, `--touched`, `--discovery=walk`, or explicit
+    /// paths.
     #[arg(long)]
     pub staged: bool,
+    /// Operate on files changed on this branch since it diverged from the
+    /// default branch, including committed, staged, unstaged, and untracked
+    /// files. Use `--base` to override the detected default branch.
+    #[arg(long)]
+    pub touched: bool,
+    /// Git ref to use as the comparison base for `--touched`.
+    #[arg(long, value_name = "REF", requires = "touched")]
+    pub base: Option<String>,
     /// Show what would change without modifying any files. Exits non-zero
     /// if changes are needed. Equivalent to `kempt check`.
     #[arg(long)]
@@ -109,29 +119,48 @@ pub struct FormatArgs {
     /// File discovery mode.
     #[arg(long, value_enum, default_value_t = Discovery::Vcs)]
     pub discovery: Discovery,
-    /// Optional explicit list of files to process. When provided, scope
-    /// flags are not allowed and `[paths].include` / `[paths].exclude`
-    /// don't apply. Paths are resolved relative to the current directory.
-    #[arg(value_name = "FILE")]
+    /// Process explicitly targeted paths even when they match global or
+    /// per-tool `paths.exclude`. Requires at least one positional target.
+    #[arg(long, requires = "paths")]
+    pub force: bool,
+    /// Optional files, directories, or glob patterns to process. Directories
+    /// are recursive and patterns are resolved relative to the current
+    /// directory. When provided, scope flags are not allowed.
+    #[arg(value_name = "PATH_OR_PATTERN")]
     pub paths: Vec<PathBuf>,
 }
 
 #[derive(Args, Debug, Default)]
 pub struct CheckArgs {
     /// Explicitly target all tracked files. Same as the default behavior.
-    /// Incompatible with `--staged`, `--discovery=walk`, or explicit paths.
+    /// Incompatible with `--staged`, `--touched`, `--discovery=walk`, or
+    /// explicit paths.
     #[arg(long)]
     pub all: bool,
     /// Operate on staged files (index) only.
-    /// Incompatible with `--all`, `--discovery=walk`, or explicit paths.
+    /// Incompatible with `--all`, `--touched`, `--discovery=walk`, or explicit
+    /// paths.
     #[arg(long)]
     pub staged: bool,
+    /// Operate on files changed on this branch since it diverged from the
+    /// default branch, including committed, staged, unstaged, and untracked
+    /// files. Use `--base` to override the detected default branch.
+    #[arg(long)]
+    pub touched: bool,
+    /// Git ref to use as the comparison base for `--touched`.
+    #[arg(long, value_name = "REF", requires = "touched")]
+    pub base: Option<String>,
     /// File discovery mode.
     #[arg(long, value_enum, default_value_t = Discovery::Vcs)]
     pub discovery: Discovery,
-    /// Optional explicit list of files to check. When provided, scope flags
-    /// are not allowed.
-    #[arg(value_name = "FILE")]
+    /// Check explicitly targeted paths even when they match global or
+    /// per-tool `paths.exclude`. Requires at least one positional target.
+    #[arg(long, requires = "paths")]
+    pub force: bool,
+    /// Optional files, directories, or glob patterns to check. Directories
+    /// are recursive and patterns are resolved relative to the current
+    /// directory. When provided, scope flags are not allowed.
+    #[arg(value_name = "PATH_OR_PATTERN")]
     pub paths: Vec<PathBuf>,
 }
 
@@ -140,4 +169,29 @@ pub struct InstallHookArgs {
     /// Overwrite an existing pre-commit hook.
     #[arg(long)]
     pub force: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn force_requires_an_explicit_target() {
+        assert!(Cli::try_parse_from(["kempt", "format", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["kempt", "check", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["kempt", "format", "--force", "src"]).is_ok());
+        assert!(Cli::try_parse_from(["kempt", "check", "--force", "src"]).is_ok());
+    }
+
+    #[test]
+    fn base_requires_touched_scope() {
+        assert!(Cli::try_parse_from(["kempt", "format", "--base", "origin/main"]).is_err());
+        assert!(Cli::try_parse_from(["kempt", "check", "--base", "origin/main"]).is_err());
+        assert!(
+            Cli::try_parse_from(["kempt", "format", "--touched", "--base", "origin/main"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["kempt", "check", "--touched", "--base", "origin/main"]).is_ok()
+        );
+    }
 }

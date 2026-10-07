@@ -3,9 +3,11 @@
 //! Subcommand implementations. Glue between the lower-level modules.
 
 use crate::cache::{Cache, Downloader, GjfFlavor, KtfmtFlavor};
+use crate::command_args;
 use crate::config::{Config, Gjf, HookMode, Ktfmt, NativeMode, ToolSource};
 use crate::formatters;
 use crate::git::GitContext;
+use crate::gradle_dependencies;
 use crate::hook::{self, StagingCheck};
 use crate::license::SourceKind;
 use crate::paths::{self, Scope};
@@ -28,7 +30,7 @@ pub struct FormatOutcome {
     pub changed: BTreeSet<PathBuf>,
     /// True when running in check mode and at least one change is needed.
     pub check_failed: bool,
-    /// Filtered stderr from ktfmt/gjf (typically parse errors). Only
+    /// Filtered formatter diagnostics (typically parse errors). Only
     /// populated in check mode.
     pub parse_errors: String,
 }
@@ -41,7 +43,13 @@ impl FormatOutcome {
     }
 }
 
-/// Run the full format pipeline (in-process steps + ktfmt + gjf).
+#[derive(Debug, Clone, Copy)]
+struct FormatOptions {
+    check: bool,
+    ignore_excludes: bool,
+}
+
+/// Run the full format pipeline.
 ///
 /// `check` selects dry-run mode: nothing is written; non-zero exit indicates
 /// changes are needed.
@@ -54,21 +62,25 @@ pub fn run_format(
     check: bool,
     year: u32,
 ) -> Result<FormatOutcome> {
+    let force = matches!(scope, Scope::Explicit { force: true, .. });
+    let options = FormatOptions {
+        check,
+        ignore_excludes: force,
+    };
     let candidates = collect_candidates(git, &scope, config)?;
     if candidates.is_empty() {
         return Ok(FormatOutcome::default());
     }
-    let mut outcome = apply_pipeline(config, git.root(), &candidates, check, year)?;
-    apply_jvm_formatters(
+    let mut outcome = apply_pipeline(config, git.root(), &candidates, options, year)?;
+    apply_external_formatters(
         config,
         cache,
         downloader,
         git.root(),
         &candidates,
-        check,
+        options,
         &mut outcome,
     )?;
-    apply_rustfmt(config, git.root(), &candidates, check, &mut outcome)?;
     Ok(outcome)
 }
 
@@ -247,21 +259,26 @@ fn run_hook_inner(
         }
     }
 
-    let mut outcome = apply_pipeline(config, git.root(), &normal_candidates, check_mode, year)?;
-    apply_jvm_formatters(
+    let mut outcome = apply_pipeline(
+        config,
+        git.root(),
+        &normal_candidates,
+        FormatOptions {
+            check: check_mode,
+            ignore_excludes: false,
+        },
+        year,
+    )?;
+    apply_external_formatters(
         config,
         cache,
         downloader,
         git.root(),
         &normal_candidates,
-        check_mode,
-        &mut outcome,
-    )?;
-    apply_rustfmt(
-        config,
-        git.root(),
-        &normal_candidates,
-        check_mode,
+        FormatOptions {
+            check: check_mode,
+            ignore_excludes: false,
+        },
         &mut outcome,
     )?;
     let mut partial_changed = BTreeSet::new();
@@ -310,7 +327,7 @@ fn partial_formatting_plan(
     files: &[PathBuf],
     options: PartialFormattingOptions,
 ) -> Result<PartialFormattingPlan> {
-    let scopes = ToolScopes::build(config, repo_root)?;
+    let scopes = ToolScopes::build(config, repo_root, false)?;
     let mut handled = BTreeSet::new();
     let mut unhandled = Vec::new();
     for path in files {
@@ -329,7 +346,7 @@ fn partial_file_supported(
     path: &Path,
     options: PartialFormattingOptions,
 ) -> bool {
-    if scopes.matches_rustfmt(path) {
+    if scopes.matches_rustfmt(path) || scopes.matches_gradle_dependencies_sorter(path) {
         return false;
     }
     if PartialFormatter::Ktfmt.matches(config, scopes, path) && !options.ktfmt {
@@ -341,10 +358,9 @@ fn partial_file_supported(
     true
 }
 
-/// Write a starter config to `target_dir`. The config is tailored to what
-/// kempt finds in the repo: `[ktfmt]` is included only when `.kt`/`.kts`
-/// files exist, `[gjf]` only when `.java` files exist, and `[rustfmt]` only
-/// when `.rs` files exist. An empty repo gets all formatter sections.
+/// Write a starter config to `target_dir`. The config is tailored to the
+/// source and Gradle files Kempt finds. An empty repo gets all formatter
+/// sections.
 /// Idempotent.
 pub fn run_init(target_dir: &Path, include_license_header: bool) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
@@ -369,23 +385,25 @@ pub fn run_init(target_dir: &Path, include_license_header: bool) -> Result<Vec<P
     Ok(written)
 }
 
-/// Languages kempt found in the repo at init time.
+/// Source/build file kinds Kempt found in the repo at init time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DetectedLanguages {
     pub kotlin: bool,
     pub java: bool,
     pub rust: bool,
+    pub gradle: bool,
 }
 
 impl DetectedLanguages {
     fn complete(self) -> bool {
-        self.kotlin && self.java && self.rust
+        self.kotlin && self.java && self.rust && self.gradle
     }
 }
 
-/// Walk `target_dir` looking for `.kt`/`.kts`, `.java`, and `.rs` files.
+/// Walk `target_dir` looking for `.kt`/`.kts`, `.java`, `.rs`, and Gradle
+/// build scripts.
 /// Skips `.git/`, `build/`, `target/`, and `node_modules/`. Stops scanning
-/// once every language has been seen.
+/// once every file kind has been seen.
 pub fn detect_languages(target_dir: &Path) -> DetectedLanguages {
     let mut found = DetectedLanguages::default();
     let walker = walkdir::WalkDir::new(target_dir)
@@ -404,6 +422,10 @@ pub fn detect_languages(target_dir: &Path) -> DetectedLanguages {
         if !entry.file_type().is_file() {
             continue;
         }
+        let filename = entry.file_name().to_string_lossy();
+        if filename.ends_with(".gradle") || filename.ends_with(".gradle.kts") {
+            found.gradle = true;
+        }
         match entry.path().extension().and_then(|e| e.to_str()) {
             Some("kt" | "kts") => found.kotlin = true,
             Some("java") => found.java = true,
@@ -420,10 +442,11 @@ pub fn detect_languages(target_dir: &Path) -> DetectedLanguages {
 fn build_starter_config(langs: DetectedLanguages, include_license_header: bool) -> String {
     // No detected languages means there is no useful signal, so emit the full
     // starter config.
-    let neither = !langs.kotlin && !langs.java && !langs.rust;
+    let neither = !langs.kotlin && !langs.java && !langs.rust && !langs.gradle;
     let want_ktfmt = langs.kotlin || neither;
     let want_gjf = langs.java || neither;
     let want_rustfmt = langs.rust || neither;
+    let want_gradle_dependencies_sorter = langs.gradle || neither;
 
     let mut out = String::from(
         "# kempt configuration: https://github.com/ZacSweers/kempt\n# Run `kempt --help` to see all options.\n\n",
@@ -435,6 +458,11 @@ fn build_starter_config(langs: DetectedLanguages, include_license_header: bool) 
     }
     if want_gjf {
         out.push_str(&format!("[gjf]\nversion = \"{STARTER_GJF_VERSION}\"\n\n"));
+    }
+    if want_gradle_dependencies_sorter {
+        out.push_str(&format!(
+            "[gradle-dependencies-sorter]\nversion = \"{STARTER_GRADLE_DEPENDENCIES_SORTER_VERSION}\"\n\n"
+        ));
     }
     if want_rustfmt {
         out.push_str("[rustfmt]\n\n");
@@ -454,7 +482,7 @@ pub fn keep_paths_for_config(config: &Config, repo_root: &Path, cache: &Cache) -
         if let ToolSource::Cached(v) = kt.source(repo_root) {
             keep.push(cache.ktfmt_path(&v));
             if kt.native != NativeMode::Never {
-                if let Some(asset) = crate::cache::current_native_asset() {
+                if let Some(asset) = crate::cache::current_ktfmt_native_asset() {
                     if crate::cache::ktfmt_native_supported_for_version(&v) {
                         keep.push(cache.ktfmt_native_path(&v, &asset));
                     }
@@ -478,6 +506,11 @@ pub fn keep_paths_for_config(config: &Config, repo_root: &Path, cache: &Cache) -
             }
         }
     }
+    if let Some(g) = &config.gradle_dependencies_sorter {
+        if let ToolSource::Cached(v) = g.source(repo_root) {
+            keep.push(cache.gradle_dependencies_sorter_path(&v));
+        }
+    }
     keep
 }
 
@@ -497,6 +530,11 @@ pub fn run_update(
     if let Some(g) = &config.gjf {
         if let ToolSource::Cached(v) = g.source(repo_root) {
             ensure_gjf_artifact(&v, g, cache, downloader)?;
+        }
+    }
+    if let Some(g) = &config.gradle_dependencies_sorter {
+        if let ToolSource::Cached(v) = g.source(repo_root) {
+            cache.ensure_gradle_dependencies_sorter(&v, downloader)?;
         }
     }
     Ok(())
@@ -586,6 +624,32 @@ fn resolve_local_invoker(tool: &str, path: PathBuf) -> Result<formatters::Invoke
     })
 }
 
+fn resolve_gradle_dependencies_sorter_invoker(
+    config: &crate::config::GradleDependenciesSorter,
+    repo_root: &Path,
+    cache: &Cache,
+    downloader: &dyn Downloader,
+) -> Result<formatters::Invoker> {
+    let path = match config.source(repo_root) {
+        ToolSource::Cached(version) => {
+            cache.ensure_gradle_dependencies_sorter(&version, downloader)?
+        }
+        ToolSource::Local(path) => path,
+    };
+    if !path.exists() {
+        anyhow::bail!(
+            "Gradle Dependencies Sorter binary not found: {}",
+            path.display()
+        );
+    }
+    let is_jar = path.extension().and_then(|e| e.to_str()) == Some("jar");
+    Ok(if is_jar {
+        formatters::Invoker::Jar(path)
+    } else {
+        formatters::Invoker::Native(path)
+    })
+}
+
 /// Outcome of `kempt vendor`. `entries` lists newly-copied artifacts;
 /// `skipped` names tools that were already vendored (using `path = ...`).
 #[derive(Debug, Default)]
@@ -652,6 +716,22 @@ pub fn run_vendor(
             ToolSource::Local(_) => outcome.skipped.push("gjf"),
         }
     }
+    if let Some(g) = &config.gradle_dependencies_sorter {
+        match g.source(repo_root) {
+            ToolSource::Cached(v) => {
+                let src = cache.ensure_gradle_dependencies_sorter(&v, downloader)?;
+                let entry = copy_into(
+                    "gradle-dependencies-sorter",
+                    &v,
+                    &src,
+                    &abs_target,
+                    target_dir,
+                )?;
+                outcome.entries.push(entry);
+            }
+            ToolSource::Local(_) => outcome.skipped.push("gradle-dependencies-sorter"),
+        }
+    }
 
     Ok(outcome)
 }
@@ -688,28 +768,28 @@ fn copy_into(
 /// `.github/workflows/bump-starter-versions.yml` workflow scrapes the latest
 /// releases weekly and opens a PR bumping these constants. Format must stay
 /// `pub const NAME: &str = "x.y.z";` exactly so the workflow's regex hits.
-pub const STARTER_KTFMT_VERSION: &str = "0.64";
-pub const STARTER_GJF_VERSION: &str = "1.35.0";
+pub const STARTER_KTFMT_VERSION: &str = "0.65";
+pub const STARTER_GJF_VERSION: &str = "1.37.0";
+pub const STARTER_GRADLE_DEPENDENCIES_SORTER_VERSION: &str = "0.21.0";
 
 const STARTER_HEADER: &str =
     "// Copyright (C) ${YEAR} <author>\n// SPDX-License-Identifier: Apache-2.0\n";
 
 /// Compute the candidate file set: universe (per scope) minus the global
-/// `[paths].exclude`. Per-tool include/exclude is applied later, at use
-/// site.
+/// the resolved `[paths]` exclusions. Per-tool include/exclude is applied
+/// later, at use site.
 fn collect_candidates(
     git: &dyn GitContext,
     scope: &Scope,
     config: &Config,
 ) -> Result<Vec<PathBuf>> {
     let universe = paths::collect_universe(git, scope.clone())?;
-    if matches!(scope, Scope::Explicit(_)) {
-        // Explicit paths bypass all globsets, including the global one.
+    if matches!(scope, Scope::Explicit { force: true, .. }) {
         return Ok(universe);
     }
-    let global_exclude_globs = config.paths.exclude.resolve(git.root())?;
+    let global_exclude_globs = config.paths.resolve_excludes(git.root())?;
     let global_exclude =
-        paths::build_globset(&global_exclude_globs).context("invalid [paths].exclude glob")?;
+        paths::build_globset(&global_exclude_globs).context("invalid [paths] exclusion glob")?;
     Ok(paths::apply_global_excludes(universe, &global_exclude))
 }
 
@@ -718,12 +798,14 @@ fn collect_candidates(
 struct ToolScopes {
     ktfmt: Option<(GlobSet, GlobSet)>,
     gjf: Option<(GlobSet, GlobSet)>,
+    gradle_dependencies_sorter: Option<(GlobSet, GlobSet)>,
     rustfmt: Option<(GlobSet, GlobSet)>,
     whitespace: (GlobSet, GlobSet),
+    ignore_excludes: bool,
 }
 
 impl ToolScopes {
-    fn build(config: &Config, repo_root: &Path) -> Result<Self> {
+    fn build(config: &Config, repo_root: &Path, ignore_excludes: bool) -> Result<Self> {
         let ktfmt = match &config.ktfmt {
             Some(kt) => {
                 let rp = kt.resolve_paths(repo_root)?;
@@ -732,6 +814,13 @@ impl ToolScopes {
             None => None,
         };
         let gjf = match &config.gjf {
+            Some(g) => {
+                let rp = g.resolve_paths(repo_root)?;
+                Some(paths::tool_globset(&rp)?)
+            }
+            None => None,
+        };
+        let gradle_dependencies_sorter = match &config.gradle_dependencies_sorter {
             Some(g) => {
                 let rp = g.resolve_paths(repo_root)?;
                 Some(paths::tool_globset(&rp)?)
@@ -749,35 +838,44 @@ impl ToolScopes {
         Ok(Self {
             ktfmt,
             gjf,
+            gradle_dependencies_sorter,
             rustfmt,
             whitespace,
+            ignore_excludes,
         })
     }
 
     fn matches_ktfmt(&self, path: &Path) -> bool {
         match &self.ktfmt {
-            Some((inc, exc)) => inc.is_match(path) && !exc.is_match(path),
+            Some((inc, exc)) => inc.is_match(path) && (self.ignore_excludes || !exc.is_match(path)),
             None => false,
         }
     }
 
     fn matches_gjf(&self, path: &Path) -> bool {
         match &self.gjf {
-            Some((inc, exc)) => inc.is_match(path) && !exc.is_match(path),
+            Some((inc, exc)) => inc.is_match(path) && (self.ignore_excludes || !exc.is_match(path)),
+            None => false,
+        }
+    }
+
+    fn matches_gradle_dependencies_sorter(&self, path: &Path) -> bool {
+        match &self.gradle_dependencies_sorter {
+            Some((inc, exc)) => inc.is_match(path) && (self.ignore_excludes || !exc.is_match(path)),
             None => false,
         }
     }
 
     fn matches_rustfmt(&self, path: &Path) -> bool {
         match &self.rustfmt {
-            Some((inc, exc)) => inc.is_match(path) && !exc.is_match(path),
+            Some((inc, exc)) => inc.is_match(path) && (self.ignore_excludes || !exc.is_match(path)),
             None => false,
         }
     }
 
     fn matches_whitespace(&self, path: &Path) -> bool {
         let (inc, exc) = &self.whitespace;
-        inc.is_match(path) && !exc.is_match(path)
+        inc.is_match(path) && (self.ignore_excludes || !exc.is_match(path))
     }
 }
 
@@ -785,19 +883,17 @@ fn apply_pipeline(
     config: &Config,
     repo_root: &Path,
     files: &[PathBuf],
-    check: bool,
+    options: FormatOptions,
     year: u32,
 ) -> Result<FormatOutcome> {
     let headers = Headers::build(config, repo_root, year)?;
     let ws_opts = crate::whitespace::Options::from(&config.whitespace);
-    let scopes = ToolScopes::build(config, repo_root)?;
+    let scopes = ToolScopes::build(config, repo_root, options.ignore_excludes)?;
     let mut report = PipelineReport::default();
 
     for rel in files {
         let abs = repo_root.join(rel);
-        let Some(kind) = SourceKind::from_path(rel) else {
-            continue;
-        };
+        let kind = SourceKind::from_path(rel);
 
         // License-header insertion is determined by file kind (extension)
         // plus the per-tool excludes list. Tool path scope (e.g. ktfmt's
@@ -805,12 +901,14 @@ fn apply_pipeline(
         // formatter routing are separate concerns. A user can configure a
         // global `[license-header]` without configuring `[ktfmt]` and
         // still get headers in their kt files.
-        let header_arg = headers.for_kind(kind).and_then(|h| {
-            if h.is_excluded(rel) {
-                None
-            } else {
-                Some((h.rendered.as_str(), h.marker.as_str()))
-            }
+        let header_arg = kind.and_then(|kind| {
+            headers.for_kind(kind).and_then(|h| {
+                if h.is_excluded(rel) {
+                    None
+                } else {
+                    Some((kind, h.rendered.as_str(), h.marker.as_str()))
+                }
+            })
         });
 
         // Whitespace passes only run if the file is in the whitespace tool's
@@ -829,10 +927,10 @@ fn apply_pipeline(
         let content =
             std::fs::read_to_string(&abs).with_context(|| format!("read {}", abs.display()))?;
         let (new_content, file_report) =
-            pipeline::process_content(&content, kind, header_arg, effective_ws);
+            pipeline::process_content(&content, header_arg, effective_ws);
         if file_report.changed() {
             report.record(rel, &file_report);
-            if !check {
+            if !options.check {
                 std::fs::write(&abs, new_content)
                     .with_context(|| format!("write {}", abs.display()))?;
             }
@@ -843,7 +941,7 @@ fn apply_pipeline(
     for p in report.changed {
         outcome.changed.insert(p);
     }
-    if check && !outcome.changed.is_empty() {
+    if options.check && !outcome.changed.is_empty() {
         outcome.check_failed = true;
     }
     Ok(outcome)
@@ -857,19 +955,19 @@ fn apply_partial_pipeline_to_index(
 ) -> Result<BTreeSet<PathBuf>> {
     let headers = Headers::build(config, git.root(), year)?;
     let ws_opts = crate::whitespace::Options::from(&config.whitespace);
-    let scopes = ToolScopes::build(config, git.root())?;
+    let scopes = ToolScopes::build(config, git.root(), false)?;
     let mut changed = BTreeSet::new();
 
     for rel in files {
-        let Some(kind) = SourceKind::from_path(rel) else {
-            continue;
-        };
-        let header_arg = headers.for_kind(kind).and_then(|h| {
-            if h.is_excluded(rel) {
-                None
-            } else {
-                Some((h.rendered.as_str(), h.marker.as_str()))
-            }
+        let kind = SourceKind::from_path(rel);
+        let header_arg = kind.and_then(|kind| {
+            headers.for_kind(kind).and_then(|h| {
+                if h.is_excluded(rel) {
+                    None
+                } else {
+                    Some((kind, h.rendered.as_str(), h.marker.as_str()))
+                }
+            })
         });
         let effective_ws = if scopes.matches_whitespace(rel) {
             ws_opts
@@ -884,7 +982,7 @@ fn apply_partial_pipeline_to_index(
         let content = String::from_utf8(staged_contents)
             .with_context(|| format!("staged file is not utf8: {}", rel.display()))?;
         let (new_content, file_report) =
-            pipeline::process_content(&content, kind, header_arg, effective_ws);
+            pipeline::process_content(&content, header_arg, effective_ws);
         if file_report.changed() {
             git.update_staged_file(rel, new_content.as_bytes())?;
             changed.insert(rel.clone());
@@ -894,16 +992,37 @@ fn apply_partial_pipeline_to_index(
     Ok(changed)
 }
 
+/// Run dependency sorting before language formatters so ktfmt can normalize
+/// any Kotlin Gradle script edits made by the sorter. Both normal commands and
+/// hooks use this function to keep their ordering identical.
+fn apply_external_formatters(
+    config: &Config,
+    cache: &Cache,
+    downloader: &dyn Downloader,
+    repo_root: &Path,
+    files: &[PathBuf],
+    options: FormatOptions,
+    outcome: &mut FormatOutcome,
+) -> Result<()> {
+    apply_gradle_dependencies_sorter(
+        config, cache, downloader, repo_root, files, options, outcome,
+    )?;
+    apply_jvm_formatters(
+        config, cache, downloader, repo_root, files, options, outcome,
+    )?;
+    apply_rustfmt(config, repo_root, files, options, outcome)
+}
+
 fn apply_jvm_formatters(
     config: &Config,
     cache: &Cache,
     downloader: &dyn Downloader,
     repo_root: &Path,
     files: &[PathBuf],
-    check: bool,
+    options: FormatOptions,
     outcome: &mut FormatOutcome,
 ) -> Result<()> {
-    let scopes = ToolScopes::build(config, repo_root)?;
+    let scopes = ToolScopes::build(config, repo_root, options.ignore_excludes)?;
     let kt_files: Vec<PathBuf> = files
         .iter()
         .filter(|p| scopes.matches_ktfmt(p))
@@ -918,25 +1037,13 @@ fn apply_jvm_formatters(
     if let Some(kt) = &config.ktfmt {
         if !kt_files.is_empty() {
             let invoker = resolve_ktfmt_invoker(kt, repo_root, cache, downloader)?;
-            let base = formatters::ktfmt_args(kt.style, check);
-            if check {
-                let run = formatters::run_batched_check(
-                    "ktfmt",
-                    &invoker,
-                    &base,
-                    &kt_files,
-                    formatters::MAX_ARG_BYTES,
-                )?;
+            let base = formatters::ktfmt_args(kt.style, options.check);
+            if options.check {
+                let run = formatters::run_ktfmt_argfile_check("ktfmt", &invoker, base, &kt_files)?;
                 merge_jvm_check_run(outcome, repo_root, run);
             } else {
                 let before = snapshot_files(&kt_files)?;
-                formatters::run_batched(
-                    "ktfmt",
-                    &invoker,
-                    &base,
-                    &kt_files,
-                    formatters::MAX_ARG_BYTES,
-                )?;
+                formatters::run_ktfmt_argfile("ktfmt", &invoker, base, &kt_files)?;
                 merge_format_changes(outcome, repo_root, before)?;
             }
         }
@@ -945,8 +1052,8 @@ fn apply_jvm_formatters(
     if let Some(g) = &config.gjf {
         if !java_files.is_empty() {
             let invoker = resolve_gjf_invoker(g, repo_root, cache, downloader)?;
-            let base = formatters::gjf_args(g.style, check);
-            if check {
+            let base = formatters::gjf_args(g.style, options.check);
+            if options.check {
                 let run = formatters::run_argfile_check("gjf", &invoker, base, &java_files)?;
                 merge_jvm_check_run(outcome, repo_root, run);
             } else {
@@ -960,17 +1067,60 @@ fn apply_jvm_formatters(
     Ok(())
 }
 
+fn apply_gradle_dependencies_sorter(
+    config: &Config,
+    cache: &Cache,
+    downloader: &dyn Downloader,
+    repo_root: &Path,
+    files: &[PathBuf],
+    options: FormatOptions,
+    outcome: &mut FormatOutcome,
+) -> Result<()> {
+    let Some(sorter) = &config.gradle_dependencies_sorter else {
+        return Ok(());
+    };
+    let scopes = ToolScopes::build(config, repo_root, options.ignore_excludes)?;
+    let gradle_files: Vec<PathBuf> = files
+        .iter()
+        .filter(|p| scopes.matches_gradle_dependencies_sorter(p))
+        .cloned()
+        .collect();
+    if gradle_files.is_empty() {
+        return Ok(());
+    }
+
+    let invoker = resolve_gradle_dependencies_sorter_invoker(sorter, repo_root, cache, downloader)?;
+    let run = gradle_dependencies::run(
+        &invoker,
+        sorter.insert_blank_lines,
+        repo_root,
+        &gradle_files,
+        options.check,
+    )?;
+    if options.check && (!run.changed.is_empty() || !run.errors.is_empty()) {
+        outcome.check_failed = true;
+    }
+    outcome.changed.extend(run.changed);
+    if !run.errors.is_empty() {
+        if !outcome.parse_errors.is_empty() {
+            outcome.parse_errors.push('\n');
+        }
+        outcome.parse_errors.push_str(&run.errors);
+    }
+    Ok(())
+}
+
 fn apply_rustfmt(
     config: &Config,
     repo_root: &Path,
     files: &[PathBuf],
-    check: bool,
+    options: FormatOptions,
     outcome: &mut FormatOutcome,
 ) -> Result<()> {
     if config.rustfmt.is_none() {
         return Ok(());
     }
-    let scopes = ToolScopes::build(config, repo_root)?;
+    let scopes = ToolScopes::build(config, repo_root, options.ignore_excludes)?;
     let rust_files: Vec<PathBuf> = files
         .iter()
         .filter(|p| scopes.matches_rustfmt(p))
@@ -980,9 +1130,9 @@ fn apply_rustfmt(
         return Ok(());
     }
 
-    if check {
+    if options.check {
         for rel in rust_files {
-            let output = cargo_fmt(repo_root, check, std::slice::from_ref(&rel))?;
+            let output = cargo_fmt(repo_root, options.check, std::slice::from_ref(&rel))?;
             if !output.status.success() {
                 outcome.check_failed = true;
                 outcome.changed.insert(rel);
@@ -992,9 +1142,12 @@ fn apply_rustfmt(
     } else {
         let abs_files: Vec<PathBuf> = rust_files.iter().map(|p| repo_root.join(p)).collect();
         let before = snapshot_files(&abs_files)?;
-        let output = cargo_fmt(repo_root, check, &rust_files)?;
-        if !output.status.success() {
-            return Err(formatter_failure("cargo fmt", output));
+        let fixed_args = cargo_fmt_args(false);
+        for chunk in command_args::path_chunks(&fixed_args, &rust_files) {
+            let output = cargo_fmt(repo_root, false, chunk)?;
+            if !output.status.success() {
+                return Err(formatter_failure("cargo fmt", output));
+            }
         }
         merge_format_changes(outcome, repo_root, before)?;
     }
@@ -1003,11 +1156,8 @@ fn apply_rustfmt(
 
 fn cargo_fmt(repo_root: &Path, check: bool, files: &[PathBuf]) -> Result<std::process::Output> {
     let mut cmd = Command::new("cargo");
-    cmd.arg("fmt");
-    if check {
-        cmd.arg("--check");
-    }
-    cmd.arg("--").current_dir(repo_root);
+    cmd.args(cargo_fmt_args(check));
+    cmd.current_dir(repo_root);
     for file in files {
         cmd.arg(file);
     }
@@ -1015,6 +1165,15 @@ fn cargo_fmt(repo_root: &Path, check: bool, files: &[PathBuf]) -> Result<std::pr
         .stderr(Stdio::piped())
         .output()
         .context("spawn cargo fmt failed")
+}
+
+fn cargo_fmt_args(check: bool) -> Vec<OsString> {
+    let mut args = vec![OsString::from("fmt")];
+    if check {
+        args.push(OsString::from("--check"));
+    }
+    args.push(OsString::from("--"));
+    args
 }
 
 fn append_rustfmt_stderr(outcome: &mut FormatOutcome, stderr: &[u8]) {
@@ -1051,7 +1210,7 @@ fn partial_formatter_targets(
     files: &[PathBuf],
     options: PartialFormattingOptions,
 ) -> Result<Vec<(PartialFormatter, Vec<PathBuf>)>> {
-    let scopes = ToolScopes::build(config, repo_root)?;
+    let scopes = ToolScopes::build(config, repo_root, false)?;
     Ok(options
         .enabled_formatters()
         .filter_map(|formatter| {
@@ -1076,16 +1235,17 @@ fn apply_partial_formatter_to_index(
     let Some((invoker, base_args)) = formatter.invocation(config, git, cache, downloader)? else {
         return Ok(BTreeSet::new());
     };
-    apply_partial_formatter_invocation_to_index(git, files, formatter.tool(), &invoker, base_args)
+    apply_partial_formatter_invocation_to_index(git, files, formatter, &invoker, base_args)
 }
 
 fn apply_partial_formatter_invocation_to_index(
     git: &dyn GitContext,
     files: &[PathBuf],
-    tool: &str,
+    formatter: PartialFormatter,
     invoker: &formatters::Invoker,
     base_args: Vec<OsString>,
 ) -> Result<BTreeSet<PathBuf>> {
+    let tool = formatter.tool();
     let mut changed = BTreeSet::new();
     for rel in files {
         let diff = git.staged_diff(rel, 0)?;
@@ -1110,9 +1270,14 @@ fn apply_partial_formatter_invocation_to_index(
             args.push("--lines".into());
             args.push(format!("{start}:{end}").into());
         }
-        args.push(tmp.path().into());
-        formatters::run(tool, invoker, args)
-            .with_context(|| format!("partial {tool} failed for {}", rel.display()))?;
+        let temp_file = [tmp.path().to_path_buf()];
+        match formatter {
+            PartialFormatter::Ktfmt => {
+                formatters::run_ktfmt_argfile(tool, invoker, args, &temp_file)
+            }
+            PartialFormatter::Gjf => formatters::run_argfile(tool, invoker, args, &temp_file),
+        }
+        .with_context(|| format!("partial {tool} failed for {}", rel.display()))?;
 
         let formatted = std::fs::read(tmp.path())
             .with_context(|| format!("read partial {tool} output for {}", rel.display()))?;
@@ -1159,12 +1324,14 @@ fn parse_added_line_ranges(diff: &str) -> Vec<(usize, usize)> {
 
 /// Where the user invoked kempt from, used to tailor the "run X to fix"
 /// suggestion in the check summary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckContext {
     /// `kempt check` (default scope = all tracked).
     All,
     /// `kempt check --staged`.
     Staged,
+    /// `kempt check --touched`, optionally with an explicit base ref.
+    Touched { base: Option<String> },
     /// `kempt check --discovery=walk`.
     Walk,
     /// Running as the pre-commit hook with `[hook] mode = "check"`.
@@ -1174,16 +1341,20 @@ pub enum CheckContext {
 }
 
 impl CheckContext {
-    fn fix_command(self) -> &'static str {
+    fn fix_command(&self) -> String {
         match self {
-            Self::All => "kempt format --all",
-            Self::Staged | Self::Hook => "kempt format --staged",
-            Self::Walk => "kempt format --discovery=walk",
-            Self::Explicit => "kempt format",
+            Self::All => "kempt format --all".to_string(),
+            Self::Staged | Self::Hook => "kempt format --staged".to_string(),
+            Self::Touched { base: Some(base) } => {
+                format!("kempt format --touched --base {}", shell_escape_arg(base))
+            }
+            Self::Touched { base: None } => "kempt format --touched".to_string(),
+            Self::Walk => "kempt format --discovery=walk".to_string(),
+            Self::Explicit => "kempt format".to_string(),
         }
     }
 
-    fn allows_per_file_suggestion(self) -> bool {
+    fn allows_per_file_suggestion(&self) -> bool {
         // The hook's trailer is already multi-line and re-stages anyway;
         // per-file is awkward there. When the user already passed explicit
         // paths, they've got the file list.
@@ -1197,11 +1368,15 @@ pub const MAX_PER_FILE_SUGGESTION: usize = 30;
 
 fn shell_escape(p: &Path) -> String {
     let s = p.display().to_string();
+    shell_escape_arg(&s)
+}
+
+fn shell_escape_arg(s: &str) -> String {
     let needs_quote = s.is_empty()
         || s.chars()
             .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\' | '$' | '`' | '*' | '?'));
     if !needs_quote {
-        return s;
+        return s.to_string();
     }
     // Single-quote, escape any embedded single quotes.
     let escaped = s.replace('\'', "'\\''");
@@ -1232,7 +1407,7 @@ pub fn render_check_summary(outcome: &FormatOutcome, ctx: CheckContext) -> Vec<S
         lines.push(format!("  - Run `{cmd}` to format the rest"));
     } else if has_errors {
         lines.push("kempt: syntax errors prevent formatting (see above).".to_string());
-    } else if matches!(ctx, CheckContext::Hook) {
+    } else if matches!(&ctx, CheckContext::Hook) {
         lines.push(format!(
             "kempt: {n_changed} staged {n_word} {verb} formatting."
         ));
@@ -1240,7 +1415,7 @@ pub fn render_check_summary(outcome: &FormatOutcome, ctx: CheckContext) -> Vec<S
             "Run `{cmd}` to format and re-stage, then commit again."
         ));
         lines.push("Or commit with `--no-verify` to bypass.".to_string());
-    } else if matches!(ctx, CheckContext::Explicit) {
+    } else if matches!(&ctx, CheckContext::Explicit) {
         // The user already typed the file list; tell them to swap `check`
         // for `format`.
         lines.push(format!(
@@ -1307,7 +1482,7 @@ fn merge_format_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::testing::FakeDownloader;
+    use crate::cache::testing::{fake_ktfmt_archive, FakeDownloader};
     use crate::config::{LicenseHeader, Paths, Whitespace};
     use crate::git::{testing::FakeGit, RealGit};
 
@@ -1325,16 +1500,107 @@ mod tests {
         Config {
             ktfmt: None,
             gjf: None,
+            gradle_dependencies_sorter: None,
             rustfmt: None,
             license_header: Some(LicenseHeader {
                 file: PathBuf::from("config/header.txt"),
             }),
             paths: Paths {
-                exclude: crate::config::GlobList::Inline(vec![]),
+                exclude: crate::config::PathList::Replace(crate::config::GlobList::Inline(vec![])),
             },
             whitespace: Whitespace::default(),
             hook: Default::default(),
         }
+    }
+
+    #[test]
+    fn explicit_targets_respect_global_excludes() {
+        let config = Config::parse(
+            r#"
+            [paths]
+            exclude = ["generated/**"]
+        "#,
+        )
+        .unwrap();
+        let git = FakeGit::new("/repo");
+        let scope = Scope::Explicit {
+            files: vec![
+                PathBuf::from("src/Foo.kt"),
+                PathBuf::from("generated/Generated.kt"),
+            ],
+            force: false,
+        };
+
+        let out = collect_candidates(&git, &scope, &config).unwrap();
+
+        assert_eq!(out, vec![PathBuf::from("src/Foo.kt")]);
+    }
+
+    #[test]
+    fn forced_explicit_targets_bypass_global_excludes() {
+        let config = Config::parse(
+            r#"
+            [paths]
+            exclude = ["generated/**"]
+        "#,
+        )
+        .unwrap();
+        let git = FakeGit::new("/repo");
+        let files = vec![
+            PathBuf::from("src/Foo.kt"),
+            PathBuf::from("generated/Generated.kt"),
+        ];
+        let scope = Scope::Explicit {
+            files: files.clone(),
+            force: true,
+        };
+
+        let out = collect_candidates(&git, &scope, &config).unwrap();
+
+        assert_eq!(out, files);
+    }
+
+    #[test]
+    fn forced_targets_bypass_per_tool_excludes_but_not_includes() {
+        let config = Config::parse(
+            r#"
+            [ktfmt]
+            version = "0.64"
+
+            [ktfmt.paths]
+            include = ["src/**/*.kt"]
+            exclude = ["src/generated/**"]
+
+            [whitespace.paths]
+            include = ["src/**/*.kt"]
+            exclude = ["src/generated/**"]
+
+            [gradle-dependencies-sorter]
+            version = "0.20.0"
+
+            [gradle-dependencies-sorter.paths]
+            include = ["gradle/**/*.gradle.kts"]
+            exclude = ["gradle/generated/**"]
+        "#,
+        )
+        .unwrap();
+        let excluded = Path::new("src/generated/Generated.kt");
+        let outside_include = Path::new("other/Other.kt");
+
+        let normal = ToolScopes::build(&config, Path::new("/repo"), false).unwrap();
+        assert!(!normal.matches_ktfmt(excluded));
+        assert!(!normal.matches_whitespace(excluded));
+        assert!(!normal
+            .matches_gradle_dependencies_sorter(Path::new("gradle/generated/build.gradle.kts")));
+
+        let forced = ToolScopes::build(&config, Path::new("/repo"), true).unwrap();
+        assert!(forced.matches_ktfmt(excluded));
+        assert!(forced.matches_whitespace(excluded));
+        assert!(!forced.matches_ktfmt(outside_include));
+        assert!(!forced.matches_whitespace(outside_include));
+        assert!(forced
+            .matches_gradle_dependencies_sorter(Path::new("gradle/generated/build.gradle.kts")));
+        assert!(!forced.matches_gradle_dependencies_sorter(Path::new("other/build.gradle.kts")));
     }
 
     #[cfg(unix)]
@@ -1351,6 +1617,7 @@ mod tests {
                    argfile=\"${arg#@}\"\n\
                    while IFS= read -r f; do\n\
                      [ -n \"$f\" ] || continue\n\
+                     case \"$f\" in -*) continue ;; esac\n\
                      printf 'reformatted\\n' >> \"$f\"\n\
                    done < \"$argfile\"\n\
                    ;;\n\
@@ -1365,6 +1632,35 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn fake_formatter_requiring_sorted_input(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let formatter = root.join("fake-formatter-requiring-sorted-input");
+        std::fs::write(
+            &formatter,
+            "#!/bin/sh\n\
+             for arg in \"$@\"; do\n\
+               case \"$arg\" in\n\
+                 @*)\n\
+                   argfile=\"${arg#@}\"\n\
+                   while IFS= read -r file; do\n\
+                     [ -n \"$file\" ] || continue\n\
+                     case \"$file\" in -*) continue ;; esac\n\
+                     grep -q '// sorted' \"$file\" || exit 9\n\
+                     printf '// formatted after sorting\\n' >> \"$file\"\n\
+                   done < \"$argfile\"\n\
+                   ;;\n\
+               esac\n\
+             done\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&formatter).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&formatter, permissions).unwrap();
+        formatter
+    }
+
+    #[cfg(unix)]
     fn config_gjf_only(fake_gjf: PathBuf) -> Config {
         Config {
             ktfmt: None,
@@ -1376,13 +1672,51 @@ mod tests {
                 native: Default::default(),
                 paths: None,
             }),
+            gradle_dependencies_sorter: None,
             rustfmt: None,
             license_header: None,
             paths: Paths {
-                exclude: crate::config::GlobList::Inline(vec![]),
+                exclude: crate::config::PathList::Replace(crate::config::GlobList::Inline(vec![])),
             },
             whitespace: Whitespace::default(),
             hook: Default::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_gradle_dependencies_sorter(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let sorter = root.join("fake-gradle-dependencies-sorter");
+        std::fs::write(
+            &sorter,
+            "#!/bin/sh\n\
+             for file in \"$@\"; do\n\
+               [ \"$file\" = \"--no-blank-lines\" ] && continue\n\
+               grep -q UNSORTED \"$file\" || continue\n\
+               printf '\\n// sorted\\n' >> \"$file\"\n\
+             done\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&sorter).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&sorter, permissions).unwrap();
+        sorter
+    }
+
+    #[cfg(unix)]
+    fn config_gradle_dependencies_sorter_only(sorter: PathBuf) -> Config {
+        Config {
+            gradle_dependencies_sorter: Some(crate::config::GradleDependenciesSorter {
+                version: None,
+                path: Some(sorter),
+                insert_blank_lines: true,
+                paths: None,
+            }),
+            paths: Paths {
+                exclude: crate::config::PathList::Replace(crate::config::GlobList::Inline(vec![])),
+            },
+            ..Default::default()
         }
     }
 
@@ -1390,7 +1724,7 @@ mod tests {
         Config {
             rustfmt: Some(crate::config::Rustfmt::default()),
             paths: Paths {
-                exclude: crate::config::GlobList::Inline(vec![]),
+                exclude: crate::config::PathList::Replace(crate::config::GlobList::Inline(vec![])),
             },
             ..Default::default()
         }
@@ -1399,7 +1733,7 @@ mod tests {
     fn config_whitespace_only() -> Config {
         Config {
             paths: Paths {
-                exclude: crate::config::GlobList::Inline(vec![]),
+                exclude: crate::config::PathList::Replace(crate::config::GlobList::Inline(vec![])),
             },
             whitespace: Whitespace::default(),
             ..Default::default()
@@ -1417,6 +1751,11 @@ mod tests {
              file=\"\"\n\
              for arg in \"$@\"; do\n\
                case \"$arg\" in\n\
+                 @*)\n\
+                   while IFS= read -r nested; do\n\
+                     case \"$nested\" in *.java) file=\"$nested\" ;; esac\n\
+                   done < \"${arg#@}\"\n\
+                   ;;\n\
                  *.java) file=\"$arg\" ;;\n\
                esac\n\
              done\n\
@@ -1442,7 +1781,11 @@ mod tests {
              file=\"\"\n\
              for arg in \"$@\"; do\n\
                case \"$arg\" in\n\
-                 *.kt|*.kts) file=\"$arg\" ;;\n\
+                 @*)\n\
+                   while IFS= read -r nested; do\n\
+                     case \"$nested\" in *.kt|*.kts) file=\"$nested\" ;; esac\n\
+                   done < \"${arg#@}\"\n\
+                   ;;\n\
                esac\n\
              done\n\
              [ -n \"$file\" ] || exit 2\n\
@@ -1509,6 +1852,64 @@ diff --git a/Foo.java b/Foo.java\n\
     }
 
     #[test]
+    fn whitespace_nested_extend_formats_additional_text_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "config/header.txt", "// (c) ${YEAR} test\n");
+        write(root, "src/Foo.kt", "package foo   \n");
+        write(root, "README.md", "# Kempt   \n");
+        write(root, ".gitignore", "build/   ");
+        write(root, "notes.txt", "leave this alone   ");
+        let cfg = Config::parse(
+            r#"
+            [license-header]
+            file = "config/header.txt"
+
+            [whitespace.paths]
+            include = { extend = ["**/*.md", "**/.gitignore"] }
+        "#,
+        )
+        .unwrap();
+        let git = FakeGit::new(root).with_tracked(vec![
+            "src/Foo.kt",
+            "README.md",
+            ".gitignore",
+            "notes.txt",
+        ]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_format(&cfg, &git, &cache, &dl, Scope::All, false, 2026).unwrap();
+
+        assert_eq!(
+            out.changed,
+            BTreeSet::from([
+                PathBuf::from(".gitignore"),
+                PathBuf::from("README.md"),
+                PathBuf::from("src/Foo.kt")
+            ])
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "# Kempt\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitignore")).unwrap(),
+            "build/\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "leave this alone   "
+        );
+        let kotlin = std::fs::read_to_string(root.join("src/Foo.kt")).unwrap();
+        assert!(kotlin.starts_with("// (c) 2026 test\n"));
+        assert!(!kotlin.contains("foo   "));
+        assert!(!std::fs::read_to_string(root.join("README.md"))
+            .unwrap()
+            .contains("// (c)"));
+    }
+
+    #[test]
     fn run_format_inserts_kts_header_after_shebang() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1555,6 +1956,32 @@ diff --git a/Foo.java b/Foo.java\n\
     }
 
     #[test]
+    fn whitespace_extended_text_file_check_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "README.md", "# Kempt   \n");
+        let cfg = Config::parse(
+            r#"
+            [whitespace.paths]
+            include = { extend = ["**/*.md"] }
+        "#,
+        )
+        .unwrap();
+        let git = FakeGit::new(root).with_tracked(vec!["README.md"]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_format(&cfg, &git, &cache, &dl, Scope::All, true, 2026).unwrap();
+
+        assert_eq!(out.changed, BTreeSet::from([PathBuf::from("README.md")]));
+        assert!(out.check_failed);
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "# Kempt   \n"
+        );
+    }
+
+    #[test]
     fn run_format_clean_files_yield_empty_outcome() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1567,6 +1994,63 @@ diff --git a/Foo.java b/Foo.java\n\
         let out = run_format(&cfg, &git, &cache, &dl, Scope::All, false, 2026).unwrap();
         assert!(out.changed.is_empty());
         assert!(!out.check_failed);
+    }
+
+    #[test]
+    fn forced_explicit_target_runs_tool_that_excludes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = PathBuf::from("generated/Foo.kt");
+        write(root, "generated/Foo.kt", "package foo   \n");
+        let config = Config::parse(
+            r#"
+            [whitespace.paths]
+            include = ["**/*.kt"]
+            exclude = ["generated/**"]
+        "#,
+        )
+        .unwrap();
+        let git = FakeGit::new(root);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let unforced = run_format(
+            &config,
+            &git,
+            &cache,
+            &dl,
+            Scope::Explicit {
+                files: vec![path.clone()],
+                force: false,
+            },
+            false,
+            2026,
+        )
+        .unwrap();
+        assert!(unforced.changed.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join(&path)).unwrap(),
+            "package foo   \n"
+        );
+
+        let forced = run_format(
+            &config,
+            &git,
+            &cache,
+            &dl,
+            Scope::Explicit {
+                files: vec![path.clone()],
+                force: true,
+            },
+            false,
+            2026,
+        )
+        .unwrap();
+        assert_eq!(forced.changed, BTreeSet::from([path.clone()]));
+        assert_eq!(
+            std::fs::read_to_string(root.join(path)).unwrap(),
+            "package foo\n"
+        );
     }
 
     #[cfg(unix)]
@@ -1586,6 +2070,109 @@ diff --git a/Foo.java b/Foo.java\n\
 
         let body = std::fs::read_to_string(root.join("src/Foo.java")).unwrap();
         assert!(body.contains("reformatted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_format_reports_gradle_dependencies_sorter_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "gradle/conventions.gradle", "UNSORTED\n");
+        write(root, "README.md", "UNSORTED\n");
+        let cfg = config_gradle_dependencies_sorter_only(fake_gradle_dependencies_sorter(root));
+        let git = FakeGit::new(root).with_tracked(vec!["gradle/conventions.gradle", "README.md"]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_format(&cfg, &git, &cache, &dl, Scope::All, false, 2026).unwrap();
+
+        assert_eq!(
+            out.changed,
+            BTreeSet::from([PathBuf::from("gradle/conventions.gradle")])
+        );
+        assert!(
+            std::fs::read_to_string(root.join("gradle/conventions.gradle"))
+                .unwrap()
+                .contains("// sorted")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "UNSORTED\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn language_formatter_stage_runs_after_gradle_dependency_sorting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "build.gradle", "UNSORTED\n");
+
+        // Give the native formatter the same test-only scope as the sorter.
+        // It exits unless it observes the sorter's edit first.
+        let mut cfg = config_gjf_only(fake_formatter_requiring_sorted_input(root));
+        cfg.gjf.as_mut().unwrap().paths = Some(crate::config::ToolPaths {
+            include: Some(crate::config::PathList::Replace(
+                crate::config::GlobList::Inline(vec!["**/*.gradle".to_string()]),
+            )),
+            ..Default::default()
+        });
+        cfg.gradle_dependencies_sorter = Some(crate::config::GradleDependenciesSorter {
+            version: None,
+            path: Some(fake_gradle_dependencies_sorter(root)),
+            insert_blank_lines: true,
+            paths: None,
+        });
+        let git = FakeGit::new(root).with_tracked(vec!["build.gradle"]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        run_format(&cfg, &git, &cache, &dl, Scope::All, false, 2026).unwrap();
+
+        let body = std::fs::read_to_string(root.join("build.gradle")).unwrap();
+        let sorted = body.find("// sorted").unwrap();
+        let formatted = body.find("// formatted after sorting").unwrap();
+        assert!(sorted < formatted, "unexpected formatter order: {body:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_check_reports_sorter_change_without_writing_build_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "build.gradle.kts", "UNSORTED\n");
+        let cfg = config_gradle_dependencies_sorter_only(fake_gradle_dependencies_sorter(root));
+        let git = FakeGit::new(root).with_tracked(vec!["build.gradle.kts"]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_format(&cfg, &git, &cache, &dl, Scope::All, true, 2026).unwrap();
+
+        assert!(out.check_failed);
+        assert_eq!(
+            out.changed,
+            BTreeSet::from([PathBuf::from("build.gradle.kts")])
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("build.gradle.kts")).unwrap(),
+            "UNSORTED\n"
+        );
+    }
+
+    #[test]
+    fn partially_staged_gradle_scripts_are_not_supported() {
+        let config = Config::parse("[gradle-dependencies-sorter]\nversion = \"0.20.0\"\n").unwrap();
+        let scopes = ToolScopes::build(&config, Path::new("/repo"), false).unwrap();
+
+        assert!(!partial_file_supported(
+            &config,
+            &scopes,
+            Path::new("build.gradle.kts"),
+            PartialFormattingOptions {
+                ktfmt: true,
+                gjf: true,
+            },
+        ));
     }
 
     #[test]
@@ -1751,6 +2338,67 @@ diff --git a/Foo.java b/Foo.java\n\
 
     #[cfg(unix)]
     #[test]
+    fn run_hook_partial_extended_whitespace_updates_only_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_cmd(root, &["init"]);
+        git_cmd(root, &["config", "user.email", "test@example.com"]);
+        git_cmd(root, &["config", "user.name", "Test User"]);
+
+        write(
+            root,
+            "README.md",
+            "staged: old\n\
+             unstaged: old\n",
+        );
+        git_cmd(root, &["add", "README.md"]);
+        git_cmd(root, &["commit", "-m", "initial"]);
+
+        write(
+            root,
+            "README.md",
+            "staged: new   \n\
+             unstaged: old\n",
+        );
+        git_cmd(root, &["add", "README.md"]);
+        write(
+            root,
+            "README.md",
+            "staged: new   \n\
+             unstaged: worktree   \n",
+        );
+
+        let cfg = Config::parse(
+            r#"
+            [whitespace.paths]
+            include = { extend = ["**/*.md"] }
+        "#,
+        )
+        .unwrap();
+        let git = RealGit::discover(root).unwrap();
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        let out = run_hook_inner(
+            &cfg,
+            &git,
+            &cache,
+            &dl,
+            2026,
+            PartialFormattingOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(out.changed, BTreeSet::from([PathBuf::from("README.md")]));
+
+        let staged = git_cmd(root, &["show", ":README.md"]);
+        assert_eq!(staged, "staged: new\nunstaged: old\n");
+
+        let worktree = std::fs::read_to_string(root.join("README.md")).unwrap();
+        assert_eq!(worktree, "staged: new   \nunstaged: worktree   \n");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn run_hook_partial_gjf_updates_index_without_staging_unstaged_hunks() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1879,12 +2527,18 @@ diff --git a/Foo.java b/Foo.java\n\
              }\n",
         );
 
+        let staged_before = git_cmd(root, &["show", ":src/Foo.kt"]);
+        let expected_staged = staged_before.replace(
+            "println(\"new staged\")",
+            "println(\"new staged\") // formatted",
+        );
+        let worktree_before = std::fs::read(root.join("src/Foo.kt")).unwrap();
         let git = RealGit::discover(root).unwrap();
         let invoker = formatters::Invoker::Native(fake_ktfmt_marking_new_line(root));
         let changed = apply_partial_formatter_invocation_to_index(
             &git,
             &[PathBuf::from("src/Foo.kt")],
-            "ktfmt",
+            PartialFormatter::Ktfmt,
             &invoker,
             formatters::ktfmt_args(crate::config::KtfmtStyle::Google, false),
         )
@@ -1892,14 +2546,11 @@ diff --git a/Foo.java b/Foo.java\n\
         assert_eq!(changed, BTreeSet::from([PathBuf::from("src/Foo.kt")]));
 
         let staged = git_cmd(root, &["show", ":src/Foo.kt"]);
-        assert!(staged.contains("new staged\") // formatted"));
-        assert!(staged.contains("old unstaged"));
-        assert!(!staged.contains("worktree unstaged"));
-
-        let worktree = std::fs::read_to_string(root.join("src/Foo.kt")).unwrap();
-        assert!(worktree.contains("new staged\")"));
-        assert!(worktree.contains("worktree unstaged"));
-        assert!(!worktree.contains("// formatted"));
+        assert_eq!(staged, expected_staged);
+        assert_eq!(
+            std::fs::read(root.join("src/Foo.kt")).unwrap(),
+            worktree_before
+        );
     }
 
     #[test]
@@ -1920,7 +2571,7 @@ diff --git a/Foo.java b/Foo.java\n\
         assert_eq!(*added, vec![PathBuf::from("src/Foo.kt")]);
     }
 
-    // Regression test for the hook silently dropping ktfmt/gjf re-stages.
+    // Regression test for the hook silently dropping JVM formatter re-stages.
     // Uses gjf's `path = "..."` with a non-`.jar` extension so kempt picks
     // `Invoker::Native` and runs the binary directly. The fake shell script
     // mimics `gjf --replace @argfile` by mutating each listed file in place.
@@ -1952,6 +2603,27 @@ diff --git a/Foo.java b/Foo.java\n\
             body.contains("reformatted"),
             "fake gjf did not run; file body: {body:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_hook_restages_gradle_dependencies_sorter_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "build.gradle", "UNSORTED\n");
+        let cfg = config_gradle_dependencies_sorter_only(fake_gradle_dependencies_sorter(root));
+        let git = FakeGit::new(root)
+            .with_tracked(vec!["build.gradle"])
+            .with_staged(vec!["build.gradle"]);
+        let cache = Cache::new(root.join(".cache"));
+        let dl = FakeDownloader::new(b"".to_vec());
+
+        run_hook(&cfg, &git, &cache, &dl, 2026).unwrap();
+
+        assert!(git.added.borrow().contains(&PathBuf::from("build.gradle")));
+        assert!(std::fs::read_to_string(root.join("build.gradle"))
+            .unwrap()
+            .contains("// sorted"));
     }
 
     #[test]
@@ -1998,7 +2670,7 @@ diff --git a/Foo.java b/Foo.java\n\
         let dir = tempfile::tempdir().unwrap();
         write_blank(dir.path(), "src/Foo.kt");
         let langs = detect_languages(dir.path());
-        assert!(langs.kotlin && !langs.java && !langs.rust);
+        assert!(langs.kotlin && !langs.java && !langs.rust && !langs.gradle);
     }
 
     #[test]
@@ -2006,7 +2678,7 @@ diff --git a/Foo.java b/Foo.java\n\
         let dir = tempfile::tempdir().unwrap();
         write_blank(dir.path(), "src/Bar.java");
         let langs = detect_languages(dir.path());
-        assert!(langs.java && !langs.kotlin && !langs.rust);
+        assert!(langs.java && !langs.kotlin && !langs.rust && !langs.gradle);
     }
 
     #[test]
@@ -2014,7 +2686,7 @@ diff --git a/Foo.java b/Foo.java\n\
         let dir = tempfile::tempdir().unwrap();
         write_blank(dir.path(), "src/lib.rs");
         let langs = detect_languages(dir.path());
-        assert!(langs.rust && !langs.kotlin && !langs.java);
+        assert!(langs.rust && !langs.kotlin && !langs.java && !langs.gradle);
     }
 
     #[test]
@@ -2022,7 +2694,7 @@ diff --git a/Foo.java b/Foo.java\n\
         let dir = tempfile::tempdir().unwrap();
         write_blank(dir.path(), "build.gradle.kts");
         let langs = detect_languages(dir.path());
-        assert!(langs.kotlin);
+        assert!(langs.kotlin && langs.gradle);
     }
 
     #[test]
@@ -2032,7 +2704,7 @@ diff --git a/Foo.java b/Foo.java\n\
         write_blank(dir.path(), "src/Bar.java");
         write_blank(dir.path(), "src/lib.rs");
         let langs = detect_languages(dir.path());
-        assert!(langs.kotlin && langs.java && langs.rust);
+        assert!(langs.kotlin && langs.java && langs.rust && !langs.gradle);
     }
 
     #[test]
@@ -2042,7 +2714,7 @@ diff --git a/Foo.java b/Foo.java\n\
         write_blank(dir.path(), ".git/hooks/script.java");
         write_blank(dir.path(), "target/generated.rs");
         let langs = detect_languages(dir.path());
-        assert!(!langs.kotlin && !langs.java && !langs.rust);
+        assert!(!langs.kotlin && !langs.java && !langs.rust && !langs.gradle);
     }
 
     #[test]
@@ -2054,6 +2726,7 @@ diff --git a/Foo.java b/Foo.java\n\
         assert!(body.contains("[ktfmt]"));
         assert!(!body.contains("[gjf]"));
         assert!(!body.contains("[rustfmt]"));
+        assert!(!body.contains("[gradle-dependencies-sorter]"));
     }
 
     #[test]
@@ -2065,6 +2738,7 @@ diff --git a/Foo.java b/Foo.java\n\
         assert!(body.contains("[gjf]"));
         assert!(!body.contains("[ktfmt]"));
         assert!(!body.contains("[rustfmt]"));
+        assert!(!body.contains("[gradle-dependencies-sorter]"));
     }
 
     #[test]
@@ -2076,16 +2750,30 @@ diff --git a/Foo.java b/Foo.java\n\
         assert!(body.contains("[rustfmt]"));
         assert!(!body.contains("[ktfmt]"));
         assert!(!body.contains("[gjf]"));
+        assert!(!body.contains("[gradle-dependencies-sorter]"));
     }
 
     #[test]
-    fn run_init_empty_repo_writes_both_sections() {
+    fn run_init_gradle_only_adds_dependencies_sorter() {
+        let dir = tempfile::tempdir().unwrap();
+        write_blank(dir.path(), "build.gradle");
+        run_init(dir.path(), false).unwrap();
+        let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
+        assert!(body.contains("[gradle-dependencies-sorter]"));
+        assert!(!body.contains("[ktfmt]"));
+        assert!(!body.contains("[gjf]"));
+        assert!(!body.contains("[rustfmt]"));
+    }
+
+    #[test]
+    fn run_init_empty_repo_writes_all_formatter_sections() {
         let dir = tempfile::tempdir().unwrap();
         run_init(dir.path(), false).unwrap();
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         assert!(body.contains("[ktfmt]"));
         assert!(body.contains("[gjf]"));
         assert!(body.contains("[rustfmt]"));
+        assert!(body.contains("[gradle-dependencies-sorter]"));
     }
 
     #[test]
@@ -2096,6 +2784,7 @@ diff --git a/Foo.java b/Foo.java\n\
         write_blank(dir.path(), "src/Foo.kt");
         write_blank(dir.path(), "src/Bar.java");
         write_blank(dir.path(), "src/lib.rs");
+        write_blank(dir.path(), "build.gradle");
         run_init(dir.path(), false).unwrap();
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         assert!(
@@ -2110,6 +2799,7 @@ diff --git a/Foo.java b/Foo.java\n\
         write_blank(dir.path(), "src/Foo.kt");
         write_blank(dir.path(), "src/Bar.java");
         write_blank(dir.path(), "src/lib.rs");
+        write_blank(dir.path(), "build.gradle");
         run_init(dir.path(), false).unwrap();
         let body = std::fs::read_to_string(dir.path().join(".kempt.toml")).unwrap();
         // Must be a valid kempt config end-to-end.
@@ -2117,6 +2807,7 @@ diff --git a/Foo.java b/Foo.java\n\
         assert!(cfg.ktfmt.is_some());
         assert!(cfg.gjf.is_some());
         assert!(cfg.rustfmt.is_some());
+        assert!(cfg.gradle_dependencies_sorter.is_some());
         assert_eq!(cfg.ktfmt.unwrap().style, crate::config::KtfmtStyle::Google);
         assert_eq!(cfg.gjf.unwrap().style, crate::config::GjfStyle::Google);
     }
@@ -2146,12 +2837,12 @@ diff --git a/Foo.java b/Foo.java\n\
 
     #[test]
     fn run_update_fetches_native_ktfmt_when_required() {
-        let Some(asset) = crate::cache::current_native_asset() else {
+        let Some(asset) = crate::cache::current_ktfmt_native_asset() else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(dir.path().to_path_buf());
-        let dl = FakeDownloader::new(b"native".to_vec());
+        let dl = FakeDownloader::new(fake_ktfmt_archive(&asset, b"native"));
         let cfg = Config {
             ktfmt: Some(crate::config::Ktfmt {
                 version: Some(crate::config::VersionSpec::literal("0.65")),
@@ -2167,7 +2858,9 @@ diff --git a/Foo.java b/Foo.java\n\
         run_update(&cfg, dir.path(), &cache, &dl).unwrap();
 
         assert!(cache.ktfmt_native_path("0.65", &asset).exists());
-        assert!(dl.calls.borrow()[0].0.contains("/v0.65/ktfmt_"));
+        assert!(dl.calls.borrow()[0]
+            .0
+            .contains(&format!("/v0.65/ktfmt-{}-0.65", asset.asset)));
     }
 
     #[test]
@@ -2192,6 +2885,27 @@ diff --git a/Foo.java b/Foo.java\n\
             dl.calls.borrow().is_empty(),
             "must not download for in-repo jars"
         );
+    }
+
+    #[test]
+    fn run_update_fetches_gradle_dependencies_sorter_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().join("cache"));
+        let dl = FakeDownloader::new(b"jar".to_vec());
+        let cfg = Config {
+            gradle_dependencies_sorter: Some(crate::config::GradleDependenciesSorter {
+                version: Some(crate::config::VersionSpec::literal("0.20.0")),
+                path: None,
+                insert_blank_lines: true,
+                paths: None,
+            }),
+            ..Default::default()
+        };
+
+        run_update(&cfg, dir.path(), &cache, &dl).unwrap();
+
+        assert!(cache.gradle_dependencies_sorter_path("0.20.0").exists());
+        assert_eq!(dl.calls.borrow().len(), 1);
     }
 
     #[test]
@@ -2272,12 +2986,32 @@ diff --git a/Foo.java b/Foo.java\n\
         let keep = keep_paths_for_config(&cfg, dir.path(), &cache);
 
         assert!(keep.iter().any(|p| p.ends_with("ktfmt-0.65.jar")));
-        if crate::cache::current_native_asset().is_some() {
+        if crate::cache::current_ktfmt_native_asset().is_some() {
             assert_eq!(keep.len(), 2);
             assert!(keep
                 .iter()
                 .any(|p| p.to_string_lossy().contains("ktfmt-0.65-") && !p.ends_with(".jar")));
         }
+    }
+
+    #[test]
+    fn keep_paths_includes_gradle_dependencies_sorter_jar() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().join("cache"));
+        let cfg = Config {
+            gradle_dependencies_sorter: Some(crate::config::GradleDependenciesSorter {
+                version: Some(crate::config::VersionSpec::literal("0.20.0")),
+                path: None,
+                insert_blank_lines: true,
+                paths: None,
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            keep_paths_for_config(&cfg, dir.path(), &cache),
+            vec![cache.gradle_dependencies_sorter_path("0.20.0")]
+        );
     }
 
     fn vendor_test_setup() -> (tempfile::TempDir, Cache, FakeDownloader) {
@@ -2308,6 +3042,12 @@ diff --git a/Foo.java b/Foo.java\n\
                 native: NativeMode::Never,
                 paths: None,
             }),
+            gradle_dependencies_sorter: Some(crate::config::GradleDependenciesSorter {
+                version: Some(crate::config::VersionSpec::literal("0.20.0")),
+                path: None,
+                insert_blank_lines: true,
+                paths: None,
+            }),
             ..Default::default()
         }
     }
@@ -2320,17 +3060,22 @@ diff --git a/Foo.java b/Foo.java\n\
         let outcome =
             run_vendor(&cfg, dir.path(), &cache, &dl, &PathBuf::from("config/bin")).unwrap();
 
-        assert_eq!(outcome.entries.len(), 2);
+        assert_eq!(outcome.entries.len(), 3);
         assert!(outcome.skipped.is_empty());
 
         let ktfmt_dest = dir.path().join("config/bin/ktfmt-0.56.jar");
         let gjf_dest = dir.path().join("config/bin/gjf-1.28.0.jar");
+        let sorter_dest = dir
+            .path()
+            .join("config/bin/gradle-dependencies-sorter-0.20.0.jar");
         assert!(ktfmt_dest.exists(), "ktfmt jar should be copied");
         assert!(gjf_dest.exists(), "gjf jar should be copied");
+        assert!(sorter_dest.exists(), "sorter jar should be copied");
 
         // Contents match the (faked) cache payload.
         assert_eq!(std::fs::read(&ktfmt_dest).unwrap(), b"jar-bytes");
         assert_eq!(std::fs::read(&gjf_dest).unwrap(), b"jar-bytes");
+        assert_eq!(std::fs::read(&sorter_dest).unwrap(), b"jar-bytes");
     }
 
     #[test]
@@ -2394,7 +3139,7 @@ diff --git a/Foo.java b/Foo.java\n\
         // Second run should not error and should leave the files in place.
         let outcome =
             run_vendor(&cfg, dir.path(), &cache, &dl, &PathBuf::from("config/bin")).unwrap();
-        assert_eq!(outcome.entries.len(), 2);
+        assert_eq!(outcome.entries.len(), 3);
         assert!(dir.path().join("config/bin/ktfmt-0.56.jar").exists());
     }
 
@@ -2441,10 +3186,11 @@ diff --git a/Foo.java b/Foo.java\n\
 
     #[test]
     fn run_vendor_with_native_ktfmt_copies_native_binary() {
-        let Some(_asset) = crate::cache::current_native_asset() else {
+        let Some(asset) = crate::cache::current_ktfmt_native_asset() else {
             return;
         };
-        let (dir, cache, dl) = vendor_test_setup();
+        let (dir, cache, _) = vendor_test_setup();
+        let dl = FakeDownloader::new(fake_ktfmt_archive(&asset, b"native"));
         let cfg = Config {
             ktfmt: Some(crate::config::Ktfmt {
                 version: Some(crate::config::VersionSpec::literal("0.65")),
@@ -2520,6 +3266,30 @@ diff --git a/Foo.java b/Foo.java\n\
         let out = outcome_with(&["a.kt"], "");
         let summary = render_check_summary(&out, CheckContext::Staged);
         assert!(summary[0].contains("kempt format --staged"));
+    }
+
+    #[test]
+    fn check_summary_touched_scope_preserves_explicit_base() {
+        let out = outcome_with(&["a.kt"], "");
+        let summary = render_check_summary(
+            &out,
+            CheckContext::Touched {
+                base: Some("upstream/main".to_string()),
+            },
+        );
+        assert!(summary[0].contains("kempt format --touched --base upstream/main"));
+    }
+
+    #[test]
+    fn check_summary_touched_scope_shell_escapes_explicit_base() {
+        let out = outcome_with(&["a.kt"], "");
+        let summary = render_check_summary(
+            &out,
+            CheckContext::Touched {
+                base: Some("refs/heads/topic$branch".to_string()),
+            },
+        );
+        assert!(summary[0].contains("kempt format --touched --base 'refs/heads/topic$branch'"));
     }
 
     #[test]
