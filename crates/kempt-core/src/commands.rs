@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Subcommand implementations. Glue between the lower-level modules.
 
-use crate::cache::{Cache, Downloader, GjfFlavor, KtfmtFlavor};
+use crate::formatter_cache::{Cache, Downloader, GjfFlavor, KtfmtFlavor};
+use crate::process_output::Capture;
 use crate::command_args;
 use crate::config::{Config, Gjf, HookMode, Ktfmt, NativeMode, ToolSource};
 use crate::formatters;
@@ -44,26 +45,29 @@ impl FormatOutcome {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FormatOptions {
+struct FormatOptions<'a> {
+    capture: &'a Capture,
     check: bool,
     ignore_excludes: bool,
 }
 
-/// Run the full format pipeline.
-///
-/// `check` selects dry-run mode: nothing is written; non-zero exit indicates
-/// changes are needed.
-pub fn run_format(
-    config: &Config,
-    git: &dyn GitContext,
-    cache: &Cache,
-    downloader: &dyn Downloader,
-    scope: Scope,
-    check: bool,
-    year: u32,
-) -> Result<FormatOutcome> {
+/// Inputs shared by formatting steps during one command execution.
+pub(crate) struct Runtime<'a> {
+    pub year: u32,
+    pub capture: &'a Capture,
+    pub partial: PartialFormattingOptions,
+}
+
+#[cfg(test)]
+pub fn run_format(config: &Config, git: &dyn GitContext, cache: &Cache, downloader: &dyn Downloader, scope: Scope, check: bool, year: u32) -> Result<FormatOutcome> {
+    let capture = Capture::default();
+    run_format_with_runtime(config, git, cache, downloader, scope, check, &Runtime { year, capture: &capture, partial: PartialFormattingOptions::default() })
+}
+
+pub(crate) fn run_format_with_runtime(config: &Config, git: &dyn GitContext, cache: &Cache, downloader: &dyn Downloader, scope: Scope, check: bool, runtime: &Runtime<'_>) -> Result<FormatOutcome> {
     let force = matches!(scope, Scope::Explicit { force: true, .. });
     let options = FormatOptions {
+        capture: runtime.capture,
         check,
         ignore_excludes: force,
     };
@@ -71,7 +75,7 @@ pub fn run_format(
     if candidates.is_empty() {
         return Ok(FormatOutcome::default());
     }
-    let mut outcome = apply_pipeline(config, git.root(), &candidates, options, year)?;
+    let mut outcome = apply_pipeline(config, git.root(), &candidates, options, runtime.year)?;
     apply_external_formatters(
         config,
         cache,
@@ -86,6 +90,7 @@ pub fn run_format(
 
 /// Run as the pre-commit hook. Mirrors `run_format(scope=Staged)` but with
 /// partial-staging safety check + re-staging after format.
+#[cfg(test)]
 pub fn run_hook(
     config: &Config,
     git: &dyn GitContext,
@@ -103,14 +108,17 @@ pub fn run_hook(
     )
 }
 
+/// Experimental formatter support for partially staged files.
+/// Both formatters are disabled by default. In-process partial formatting
+/// remains available independently of these options.
 #[derive(Debug, Clone, Copy, Default)]
-struct PartialFormattingOptions {
-    ktfmt: bool,
-    gjf: bool,
+pub struct PartialFormattingOptions {
+    pub ktfmt: bool,
+    pub gjf: bool,
 }
 
 impl PartialFormattingOptions {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         Self {
             ktfmt: PartialFormatter::Ktfmt.enabled_from_env(),
             gjf: PartialFormatter::Gjf.enabled_from_env(),
@@ -220,14 +228,15 @@ impl PartialFormatter {
     }
 }
 
-fn run_hook_inner(
-    config: &Config,
-    git: &dyn GitContext,
-    cache: &Cache,
-    downloader: &dyn Downloader,
-    year: u32,
-    partial_options: PartialFormattingOptions,
-) -> Result<FormatOutcome> {
+#[cfg(test)]
+fn run_hook_inner(config: &Config, git: &dyn GitContext, cache: &Cache, downloader: &dyn Downloader, year: u32, partial_options: PartialFormattingOptions) -> Result<FormatOutcome> {
+    let capture = Capture::default();
+    run_hook_with_runtime(config, git, cache, downloader, &Runtime { year, capture: &capture, partial: partial_options })
+}
+
+pub(crate) fn run_hook_with_runtime(config: &Config, git: &dyn GitContext, cache: &Cache, downloader: &dyn Downloader, runtime: &Runtime<'_>) -> Result<FormatOutcome> {
+    let year = runtime.year;
+    let partial_options = runtime.partial;
     let candidates = collect_candidates(git, &Scope::Staged, config)?;
     if candidates.is_empty() {
         return Ok(FormatOutcome::default());
@@ -252,8 +261,10 @@ fn run_hook_inner(
                         partial_options,
                     )?;
                 } else {
-                    eprint!("{}", hook::format_partial_stage_error(&plan.unhandled));
-                    return Err(partial_formatting_scope_error(partial_options));
+                    return Err(crate::commands::HookFailure {
+                        detail: hook::format_partial_stage_error(&plan.unhandled),
+                        source: partial_formatting_scope_error(partial_options),
+                    }.into());
                 }
             }
         }
@@ -264,6 +275,7 @@ fn run_hook_inner(
         git.root(),
         &normal_candidates,
         FormatOptions {
+            capture: runtime.capture,
             check: check_mode,
             ignore_excludes: false,
         },
@@ -276,6 +288,7 @@ fn run_hook_inner(
         git.root(),
         &normal_candidates,
         FormatOptions {
+            capture: runtime.capture,
             check: check_mode,
             ignore_excludes: false,
         },
@@ -291,7 +304,7 @@ fn run_hook_inner(
         )?);
         for (formatter, files) in &partial_targets {
             partial_changed.extend(apply_partial_formatter_to_index(
-                config, git, cache, downloader, *formatter, files,
+                config, git, cache, downloader, *formatter, files, runtime.capture,
             )?);
         }
     }
@@ -482,8 +495,8 @@ pub fn keep_paths_for_config(config: &Config, repo_root: &Path, cache: &Cache) -
         if let ToolSource::Cached(v) = kt.source(repo_root) {
             keep.push(cache.ktfmt_path(&v));
             if kt.native != NativeMode::Never {
-                if let Some(asset) = crate::cache::current_ktfmt_native_asset() {
-                    if crate::cache::ktfmt_native_supported_for_version(&v) {
+                if let Some(asset) = crate::formatter_cache::current_ktfmt_native_asset() {
+                    if crate::formatter_cache::ktfmt_native_supported_for_version(&v) {
                         keep.push(cache.ktfmt_native_path(&v, &asset));
                     }
                 }
@@ -498,8 +511,8 @@ pub fn keep_paths_for_config(config: &Config, repo_root: &Path, cache: &Cache) -
             // missing entries.
             keep.push(cache.gjf_jar_path(&v));
             if g.native != NativeMode::Never {
-                if let Some(asset) = crate::cache::current_native_asset() {
-                    if crate::cache::gjf_native_supported_for_version(&v, &asset) {
+                if let Some(asset) = crate::formatter_cache::current_native_asset() {
+                    if crate::formatter_cache::gjf_native_supported_for_version(&v, &asset) {
                         keep.push(cache.gjf_native_path(&v, &asset));
                     }
                 }
@@ -549,7 +562,7 @@ fn ensure_ktfmt_artifact(
 ) -> Result<formatters::Invoker> {
     let prefer = !matches!(kt.native, NativeMode::Never);
     let require = matches!(kt.native, NativeMode::Always);
-    match crate::cache::resolve_ktfmt_flavor(version, prefer, require)? {
+    match crate::formatter_cache::resolve_ktfmt_flavor(version, prefer, require)? {
         KtfmtFlavor::Jar => {
             let path = cache.ensure_ktfmt(version, downloader)?;
             Ok(formatters::Invoker::Jar(path))
@@ -583,7 +596,7 @@ fn ensure_gjf_artifact(
 ) -> Result<formatters::Invoker> {
     let prefer = !matches!(g.native, NativeMode::Never);
     let require = matches!(g.native, NativeMode::Always);
-    match crate::cache::resolve_gjf_flavor(version, prefer, require)? {
+    match crate::formatter_cache::resolve_gjf_flavor(version, prefer, require)? {
         GjfFlavor::Jar => {
             let path = cache.ensure_gjf_jar(version, downloader)?;
             Ok(formatters::Invoker::Jar(path))
@@ -692,9 +705,7 @@ pub fn run_vendor(
         match kt.source(repo_root) {
             ToolSource::Cached(v) => {
                 let invoker = ensure_ktfmt_artifact(&v, kt, cache, downloader)?;
-                let src = match &invoker {
-                    formatters::Invoker::Jar(p) | formatters::Invoker::Native(p) => p.clone(),
-                };
+                let src = invoker.artifact_path().to_path_buf();
                 let entry = copy_into("ktfmt", &v, &src, &abs_target, target_dir)?;
                 outcome.entries.push(entry);
             }
@@ -707,9 +718,7 @@ pub fn run_vendor(
                 // Vendor whichever artifact this config resolves to (jar or
                 // native). Filename in the cache already encodes the flavor.
                 let invoker = ensure_gjf_artifact(&v, g, cache, downloader)?;
-                let src = match &invoker {
-                    formatters::Invoker::Jar(p) | formatters::Invoker::Native(p) => p.clone(),
-                };
+                let src = invoker.artifact_path().to_path_buf();
                 let entry = copy_into("gjf", &v, &src, &abs_target, target_dir)?;
                 outcome.entries.push(entry);
             }
@@ -1037,6 +1046,7 @@ fn apply_jvm_formatters(
     if let Some(kt) = &config.ktfmt {
         if !kt_files.is_empty() {
             let invoker = resolve_ktfmt_invoker(kt, repo_root, cache, downloader)?;
+            let invoker = invoker.with_context(repo_root, options.capture);
             let base = formatters::ktfmt_args(kt.style, options.check, kt.editorconfig);
             if options.check {
                 let run = formatters::run_ktfmt_argfile_check("ktfmt", &invoker, base, &kt_files)?;
@@ -1052,6 +1062,7 @@ fn apply_jvm_formatters(
     if let Some(g) = &config.gjf {
         if !java_files.is_empty() {
             let invoker = resolve_gjf_invoker(g, repo_root, cache, downloader)?;
+            let invoker = invoker.with_context(repo_root, options.capture);
             let base = formatters::gjf_args(g.style, options.check);
             if options.check {
                 let run = formatters::run_argfile_check("gjf", &invoker, base, &java_files)?;
@@ -1090,6 +1101,7 @@ fn apply_gradle_dependencies_sorter(
     }
 
     let invoker = resolve_gradle_dependencies_sorter_invoker(sorter, repo_root, cache, downloader)?;
+    let invoker = invoker.with_context(repo_root, options.capture);
     let run = gradle_dependencies::run(
         &invoker,
         sorter.insert_blank_lines,
@@ -1133,6 +1145,7 @@ fn apply_rustfmt(
     if options.check {
         for rel in rust_files {
             let output = cargo_fmt(repo_root, options.check, std::slice::from_ref(&rel))?;
+            options.capture.record("cargo fmt", &output, false, false);
             if !output.status.success() {
                 outcome.check_failed = true;
                 outcome.changed.insert(rel);
@@ -1145,6 +1158,7 @@ fn apply_rustfmt(
         let fixed_args = cargo_fmt_args(false);
         for chunk in command_args::path_chunks(&fixed_args, &rust_files) {
             let output = cargo_fmt(repo_root, false, chunk)?;
+            options.capture.record("cargo fmt", &output, false, false);
             if !output.status.success() {
                 return Err(formatter_failure("cargo fmt", output));
             }
@@ -1231,10 +1245,12 @@ fn apply_partial_formatter_to_index(
     downloader: &dyn Downloader,
     formatter: PartialFormatter,
     files: &[PathBuf],
+    capture: &Capture,
 ) -> Result<BTreeSet<PathBuf>> {
     let Some((invoker, base_args)) = formatter.invocation(config, git, cache, downloader)? else {
         return Ok(BTreeSet::new());
     };
+    let invoker = invoker.with_context(git.root(), capture);
     apply_partial_formatter_invocation_to_index(git, files, formatter, &invoker, base_args)
 }
 
@@ -1344,6 +1360,7 @@ pub enum CheckContext {
     Explicit,
 }
 
+#[cfg(any(feature = "cli", test))]
 impl CheckContext {
     fn fix_command(&self) -> String {
         match self {
@@ -1368,13 +1385,16 @@ impl CheckContext {
 
 /// Threshold above which the per-file copy/paste line is suppressed.
 /// Past this, "kempt format --all" is more practical anyway.
+#[cfg(any(feature = "cli", test))]
 pub const MAX_PER_FILE_SUGGESTION: usize = 30;
 
+#[cfg(any(feature = "cli", test))]
 fn shell_escape(p: &Path) -> String {
     let s = p.display().to_string();
     shell_escape_arg(&s)
 }
 
+#[cfg(any(feature = "cli", test))]
 fn shell_escape_arg(s: &str) -> String {
     let needs_quote = s.is_empty()
         || s.chars()
@@ -1389,6 +1409,7 @@ fn shell_escape_arg(s: &str) -> String {
 
 /// Build the actionable summary lines for a check-mode outcome. Returns
 /// nothing when the outcome is clean (no changes, no parse errors).
+#[cfg(any(feature = "cli", test))]
 pub fn render_check_summary(outcome: &FormatOutcome, ctx: CheckContext) -> Vec<String> {
     let mut lines = Vec::new();
     let n_changed = outcome.changed.len();
@@ -1486,7 +1507,7 @@ fn merge_format_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::testing::{fake_ktfmt_archive, FakeDownloader};
+    use crate::formatter_cache::testing::{fake_ktfmt_archive, FakeDownloader};
     use crate::config::{LicenseHeader, Paths, Whitespace};
     use crate::git::{testing::FakeGit, RealGit};
 
@@ -3010,7 +3031,7 @@ diff --git a/Foo.java b/Foo.java\n\
 
     #[test]
     fn run_update_fetches_native_ktfmt_when_required() {
-        let Some(asset) = crate::cache::current_ktfmt_native_asset() else {
+        let Some(asset) = crate::formatter_cache::current_ktfmt_native_asset() else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -3138,7 +3159,7 @@ diff --git a/Foo.java b/Foo.java\n\
         assert!(keep.iter().any(|p| p.ends_with("gjf-1.28.0.jar")));
         // On hosts where the native asset is published, the native path is
         // also kept. Don't enforce platform specifics in the assertion.
-        if crate::cache::current_native_asset().is_some() {
+        if crate::formatter_cache::current_native_asset().is_some() {
             assert!(keep.len() == 2);
         }
     }
@@ -3163,7 +3184,7 @@ diff --git a/Foo.java b/Foo.java\n\
         let keep = keep_paths_for_config(&cfg, dir.path(), &cache);
 
         assert!(keep.iter().any(|p| p.ends_with("ktfmt-0.65.jar")));
-        if crate::cache::current_ktfmt_native_asset().is_some() {
+        if crate::formatter_cache::current_ktfmt_native_asset().is_some() {
             assert_eq!(keep.len(), 2);
             assert!(keep
                 .iter()
@@ -3336,7 +3357,7 @@ diff --git a/Foo.java b/Foo.java\n\
     fn run_vendor_with_native_gjf_copies_native_binary() {
         // Only meaningful on hosts where a native asset is available; this
         // test is a no-op (still asserts) when running on, say, an Intel Mac.
-        let Some(_asset) = crate::cache::current_native_asset() else {
+        let Some(_asset) = crate::formatter_cache::current_native_asset() else {
             return;
         };
         let (dir, cache, dl) = vendor_test_setup();
@@ -3365,7 +3386,7 @@ diff --git a/Foo.java b/Foo.java\n\
 
     #[test]
     fn run_vendor_with_native_ktfmt_copies_native_binary() {
-        let Some(asset) = crate::cache::current_ktfmt_native_asset() else {
+        let Some(asset) = crate::formatter_cache::current_ktfmt_native_asset() else {
             return;
         };
         let (dir, cache, _) = vendor_test_setup();

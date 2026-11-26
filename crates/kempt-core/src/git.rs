@@ -36,6 +36,7 @@ pub trait GitContext {
 
 pub struct RealGit {
     root: PathBuf,
+    capture: crate::process_output::Capture,
 }
 
 impl RealGit {
@@ -57,7 +58,13 @@ impl RealGit {
             .to_string();
         Ok(Self {
             root: PathBuf::from(root_str),
+            capture: crate::process_output::Capture::default(),
         })
+    }
+
+    pub(crate) fn with_capture(mut self, capture: &crate::process_output::Capture) -> Self {
+        self.capture = capture.clone();
+        self
     }
 
     fn run(&self, args: &[&str]) -> Result<Vec<PathBuf>> {
@@ -316,16 +323,17 @@ impl GitContext for RealGit {
             .trim()
             .to_string();
 
-        let status = Command::new("git")
+        let output = Command::new("git")
             .arg("update-index")
             .arg("--cacheinfo")
             .arg(mode)
             .arg(sha)
             .arg(path)
             .current_dir(&self.root)
-            .status()
+            .output()
             .with_context(|| format!("git update-index failed to spawn for {}", path.display()))?;
-        if !status.success() {
+        self.capture.record("git update-index", &output, true, true);
+        if !output.status.success() {
             return Err(anyhow!("git update-index failed for {}", path.display()));
         }
         Ok(())
