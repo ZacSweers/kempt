@@ -713,6 +713,17 @@ as-is. When `path` is set, kempt never touches the cache for that tool:
 If the file is missing at the resolved path, kempt errors out with the full
 path so you can spot the typo quickly.
 
+## Reusing kempt from Rust
+
+Depend on [`kempt-core`](crates/kempt-core/README.md) for formatter caching and in-process command APIs. The CLI uses the same library and cache. Default library features include the cache API without HTTP/TLS dependencies.
+
+```toml
+[dependencies]
+kempt-core = { path = "../kempt/crates/kempt-core" }
+```
+
+See the [embedding guide](crates/kempt-core/README.md#embedding-ktfmt) for reviewed checksums, custom downloaders, and optional command APIs.
+
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE.txt).

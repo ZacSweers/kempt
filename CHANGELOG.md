@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- Split the reusable APIs into `kempt-core`. Keep `kempt-fmt` as the CLI package that installs `kempt`.
+
+- Expose ktfmt release metadata and checksum-verified installs with shared download coordination, cache repair, and an optional HTTP client for Rust embedding.
+
+- Add a feature-gated Rust library for caching arbitrary tools, executing typed kempt commands, and parsing CLI arguments without spawning kempt.
+- Publish cached artifacts atomically using unique staging directories so concurrent downloads and interrupted downloads cannot leave partial cache entries.
+
 ## [0.4.0]
 
 _2026-10-07_
