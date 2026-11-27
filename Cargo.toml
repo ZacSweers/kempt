@@ -1,18 +1,34 @@
-[package]
-# Crate name is `kempt-fmt` because the short `kempt` is already taken on
-# crates.io by an unrelated sorted-collection library. The installed
-# binary is still `kempt` (see [[bin]] below).
-name = "kempt-fmt"
+[workspace]
+members = ["crates/kempt-core"]
+default-members = [".", "crates/kempt-core"]
+resolver = "2"
+
+[workspace.package]
 version = "0.4.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "A pre-commit-friendly multi-language formatter (ktfmt, google-java-format, license headers, whitespace)"
 repository = "https://github.com/ZacSweers/kempt"
 homepage = "https://github.com/ZacSweers/kempt"
+rust-version = "1.75"
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+tempfile = "3.27.0"
+kempt-core = { path = "crates/kempt-core", version = "=0.4.0", default-features = false }
+
+[package]
+# The installed binary is `kempt`. The short package name is taken on crates.io.
+name = "kempt-fmt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "A pre-commit-friendly multi-language formatter (ktfmt, google-java-format, license headers, whitespace)"
 readme = "README.md"
 keywords = ["formatter", "ktfmt", "google-java-format", "kotlin", "java"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.75"
 
 [[bin]]
 name = "kempt"
@@ -23,16 +39,8 @@ inherits = "release"
 lto = "thin"
 
 [dependencies]
-anyhow = "1.0.102"
-clap = { version = "4.6.1", features = ["derive"] }
-flate2 = "1.1"
-globset = "0.4.18"
-serde = { version = "1.0.228", features = ["derive"] }
-tar = "0.4"
-tempfile = "3.27.0"
-toml = "1.1.2"
-toml_edit = "0.25"
-ureq = "3.3.0"
-walkdir = "2"
-which = "8.0.2"
-zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+anyhow.workspace = true
+kempt-core = { workspace = true, features = ["cli"] }
+
+[dev-dependencies]
+tempfile.workspace = true

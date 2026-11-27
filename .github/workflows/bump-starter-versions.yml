@@ -1,7 +1,7 @@
 name: Bump starter versions
 
 # Runs weekly. Scrapes the latest ktfmt, gjf, and Gradle Dependencies Sorter
-# releases, edits the version constants in `src/commands.rs`, runs the test
+# releases, edits the version constants in `crates/kempt-core/src/commands.rs`, runs the test
 # suite, and opens a PR if anything changed. The constants kempt init writes
 # into a fresh .kempt.toml track upstream this way without making init a
 # network call.
@@ -42,9 +42,9 @@ jobs:
         id: current
         run: |
           set -euo pipefail
-          KTFMT=$(grep -oE 'STARTER_KTFMT_VERSION: &str = "[0-9.]+"' src/commands.rs | grep -oE '[0-9.]+')
-          GJF=$(grep -oE 'STARTER_GJF_VERSION: &str = "[0-9.]+"' src/commands.rs | grep -oE '[0-9.]+')
-          GRADLE_SORTER=$(grep -oE 'STARTER_GRADLE_DEPENDENCIES_SORTER_VERSION: &str = "[0-9.]+"' src/commands.rs | grep -oE '[0-9.]+')
+          KTFMT=$(grep -oE 'STARTER_KTFMT_VERSION: &str = "[0-9.]+"' crates/kempt-core/src/commands.rs | grep -oE '[0-9.]+')
+          GJF=$(grep -oE 'STARTER_GJF_VERSION: &str = "[0-9.]+"' crates/kempt-core/src/commands.rs | grep -oE '[0-9.]+')
+          GRADLE_SORTER=$(grep -oE 'STARTER_GRADLE_DEPENDENCIES_SORTER_VERSION: &str = "[0-9.]+"' crates/kempt-core/src/commands.rs | grep -oE '[0-9.]+')
           echo "ktfmt=$KTFMT" >> "$GITHUB_OUTPUT"
           echo "gjf=$GJF" >> "$GITHUB_OUTPUT"
           echo "gradle_sorter=$GRADLE_SORTER" >> "$GITHUB_OUTPUT"
@@ -110,10 +110,10 @@ jobs:
         if: steps.decide.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          sed -i -E "s/(STARTER_KTFMT_VERSION: &str = \")[0-9.]+(\")/\\1${{ steps.latest.outputs.ktfmt }}\\2/" src/commands.rs
-          sed -i -E "s/(STARTER_GJF_VERSION: &str = \")[0-9.]+(\")/\\1${{ steps.latest.outputs.gjf }}\\2/" src/commands.rs
+          sed -i -E "s/(STARTER_KTFMT_VERSION: &str = \")[0-9.]+(\")/\\1${{ steps.latest.outputs.ktfmt }}\\2/" crates/kempt-core/src/commands.rs
+          sed -i -E "s/(STARTER_GJF_VERSION: &str = \")[0-9.]+(\")/\\1${{ steps.latest.outputs.gjf }}\\2/" crates/kempt-core/src/commands.rs
 
-          sed -i -E 's/(STARTER_GRADLE_DEPENDENCIES_SORTER_VERSION: &str = ")[0-9.]+(")/\1${{ steps.latest.outputs.gradle_sorter }}\2/' src/commands.rs
+          sed -i -E 's/(STARTER_GRADLE_DEPENDENCIES_SORTER_VERSION: &str = ")[0-9.]+(")/\1${{ steps.latest.outputs.gradle_sorter }}\2/' crates/kempt-core/src/commands.rs
 
       - uses: dtolnay/rust-toolchain@stable
         if: steps.decide.outputs.changed == 'true'

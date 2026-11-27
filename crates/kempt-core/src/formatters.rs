@@ -11,6 +11,7 @@
 
 use crate::command_args;
 use crate::config::{GjfStyle, KtfmtStyle};
+use crate::process_output::Capture;
 use anyhow::{anyhow, Context, Result};
 use std::ffi::OsString;
 use std::io::Write;
@@ -24,6 +25,34 @@ pub enum Invoker {
     Jar(PathBuf),
     /// Run the binary directly (e.g. a GraalVM native image).
     Native(PathBuf),
+    Context {
+        inner: Box<Invoker>,
+        directory: PathBuf,
+        capture: Capture,
+    },
+}
+
+impl Invoker {
+    pub(crate) fn with_context(self, directory: &std::path::Path, capture: &Capture) -> Self {
+        Self::Context {
+            inner: Box::new(self),
+            directory: directory.into(),
+            capture: capture.clone(),
+        }
+    }
+
+    pub(crate) fn artifact_path(&self) -> &std::path::Path {
+        match self {
+            Self::Jar(path) | Self::Native(path) => path,
+            Self::Context { inner, .. } => inner.artifact_path(),
+        }
+    }
+
+    fn record(&self, tool: &str, output: &std::process::Output, display_stdout: bool) {
+        if let Self::Context { capture, .. } = self {
+            capture.record(tool, output, display_stdout, false);
+        }
+    }
 }
 
 fn build_command(invoker: &Invoker) -> Result<Command> {
@@ -37,6 +66,13 @@ fn build_command(invoker: &Invoker) -> Result<Command> {
             Ok(cmd)
         }
         Invoker::Native(bin) => Ok(Command::new(bin)),
+        Invoker::Context {
+            inner, directory, ..
+        } => {
+            let mut command = build_command(inner)?;
+            command.current_dir(directory);
+            Ok(command)
+        }
     }
 }
 
@@ -107,22 +143,20 @@ pub fn gjf_args(style: GjfStyle, check: bool) -> Vec<OsString> {
     args
 }
 
-/// Spawn the invoker. Stdout is inherited so the user sees the formatter's
-/// per-file diagnostic output. Stderr is captured and surfaced in the error
-/// on non-zero exit; on success it's discarded (this hides JVM `--add-opens`
-/// deprecation warnings during normal operation).
+/// Spawn the invoker and retain stdout and stderr in its execution context.
+/// Non-zero exits surface filtered stderr in the error. The CLI renderer
+/// forwards stdout and hides successful JVM warning output.
 ///
 /// `tool` is the user-facing label ("ktfmt", "gjf") used in error messages.
 pub fn run(tool: &str, invoker: &Invoker, args: Vec<OsString>) -> Result<()> {
     let mut cmd = build_command(invoker)?;
-    cmd.args(args)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::piped());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     let output = cmd
         .spawn()
         .with_context(|| format!("spawn {tool} failed"))?
         .wait_with_output()
         .with_context(|| format!("wait for {tool}"))?;
+    invoker.record(tool, &output, true);
     if output.status.success() {
         return Ok(());
     }
@@ -168,12 +202,15 @@ pub(crate) fn run_output(
     current_dir: &std::path::Path,
 ) -> Result<std::process::Output> {
     let mut cmd = build_command(invoker)?;
-    cmd.args(args)
+    let output = cmd
+        .args(args)
         .current_dir(current_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .with_context(|| format!("spawn {tool} failed"))
+        .with_context(|| format!("spawn {tool} failed"))?;
+    invoker.record(tool, &output, false);
+    Ok(output)
 }
 
 fn run_batched(
@@ -226,6 +263,7 @@ pub fn run_check(tool: &str, invoker: &Invoker, args: Vec<OsString>) -> Result<C
     let output = cmd
         .output()
         .with_context(|| format!("spawn {tool} failed"))?;
+    invoker.record(tool, &output, false);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let paths: Vec<String> = stdout
         .lines()
@@ -309,6 +347,7 @@ pub fn run_ktfmt_argfile_stdin(
         .wait_with_output()
         .with_context(|| format!("wait for {tool}"))?;
     drop(argfile.1);
+    invoker.record(tool, &output, false);
     if !output.status.success() {
         return Err(process_failure(tool, &output));
     }

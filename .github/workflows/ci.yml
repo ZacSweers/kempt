@@ -7,14 +7,22 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        cargo-args:
+          - "--workspace"
+          - "-p kempt-core"
+          - "-p kempt-core --no-default-features --features commands"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build
-      - run: cargo test
-      - run: cargo clippy --tests -- -D warnings
+      - run: cargo build --all-targets ${{ matrix.cargo-args }}
+      - run: cargo test --all-targets ${{ matrix.cargo-args }}
+      - run: cargo clippy --all-targets ${{ matrix.cargo-args }} -- -D warnings
 
   format:
     runs-on: ubuntu-latest

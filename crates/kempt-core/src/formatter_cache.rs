@@ -11,14 +11,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::fs;
+#[cfg(test)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-pub const KTFMT_URL: &str =
-    "https://github.com/kotlin/ktfmt/releases/download/v{v}/ktfmt-{v}-with-dependencies.jar";
-
-pub const KTFMT_NATIVE_URL: &str =
-    "https://github.com/kotlin/ktfmt/releases/download/v{v}/ktfmt-{asset}-{v}.{archive_ext}";
 
 pub const GJF_URL: &str =
     "https://github.com/google/google-java-format/releases/download/v{v}/google-java-format-{v}-all-deps.jar";
@@ -29,54 +24,19 @@ pub const GJF_NATIVE_URL: &str =
 pub const GRADLE_DEPENDENCIES_SORTER_URL: &str =
     "https://repo1.maven.org/maven2/com/squareup/sort-gradle-dependencies-app/{v}/sort-gradle-dependencies-app-{v}-all.jar";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KtfmtArchiveFormat {
-    TarGz,
-    Zip,
-}
+use crate::cache::ktfmt::{self, Platform, RuntimeKind};
+#[cfg(test)]
+use ktfmt::ArchiveFormat as KtfmtArchiveFormat;
+type KtfmtNativeAsset = ktfmt::NativeLayout;
 
-/// ktfmt's published native archive for a particular `(os, arch)` combo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KtfmtNativeAsset {
-    /// The platform segment in the release asset name.
-    pub asset: &'static str,
-    archive_ext: &'static str,
-    executable_name: &'static str,
-    exe_suffix: &'static str,
-    format: KtfmtArchiveFormat,
-}
-
+#[cfg(test)]
 fn ktfmt_native_asset_for(os: &str, arch: &str) -> Option<KtfmtNativeAsset> {
-    match (os, arch) {
-        ("macos", "aarch64") => Some(KtfmtNativeAsset {
-            asset: "macos-aarch64",
-            archive_ext: "tar.gz",
-            executable_name: "ktfmt",
-            exe_suffix: "",
-            format: KtfmtArchiveFormat::TarGz,
-        }),
-        ("linux", "x86_64") => Some(KtfmtNativeAsset {
-            asset: "linux-x86_64",
-            archive_ext: "tar.gz",
-            executable_name: "ktfmt",
-            exe_suffix: "",
-            format: KtfmtArchiveFormat::TarGz,
-        }),
-        ("windows", "x86_64") => Some(KtfmtNativeAsset {
-            asset: "windows-x86_64",
-            archive_ext: "zip",
-            executable_name: "ktfmt.exe",
-            exe_suffix: ".exe",
-            format: KtfmtArchiveFormat::Zip,
-        }),
-        _ => None,
-    }
+    ktfmt::native_layout_for(os, arch)
 }
 
-/// Native ktfmt asset for the current host. ktfmt 0.65 publishes macOS ARM64,
-/// Linux x86-64, and Windows x86-64 archives.
+/// Native ktfmt layout for the CLI's existing host-selection policy.
 pub fn current_ktfmt_native_asset() -> Option<KtfmtNativeAsset> {
-    ktfmt_native_asset_for(std::env::consts::OS, std::env::consts::ARCH)
+    ktfmt::native_layout_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
 /// gjf's published native asset for a particular `(os, arch)` combo.
@@ -114,7 +74,7 @@ pub fn current_native_asset() -> Option<NativeAsset> {
 
 /// Whether ktfmt publishes native assets for `version`.
 pub fn ktfmt_native_supported_for_version(version: &str) -> bool {
-    parse_version(version).is_some_and(|(maj, min, _)| (maj, min) >= (0, 65))
+    ktfmt::native_supported_for_version(version)
 }
 
 /// Whether gjf publishes the given native asset for `version`. Native builds
@@ -202,23 +162,8 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-pub trait Downloader {
-    fn download(&self, url: &str, dest: &Path) -> Result<()>;
-}
-
-pub struct UreqDownloader;
-
-impl Downloader for UreqDownloader {
-    fn download(&self, url: &str, dest: &Path) -> Result<()> {
-        let resp = ureq::get(url)
-            .call()
-            .with_context(|| format!("download failed: {url}"))?;
-        let mut reader = resp.into_body().into_reader();
-        atomic_write(dest, |f| std::io::copy(&mut reader, f).map(|_| ()))
-            .with_context(|| format!("write failed: {}", dest.display()))?;
-        Ok(())
-    }
-}
+use crate::cache::{ensure_artifact, ArtifactFormat, ArtifactRequest};
+pub use crate::cache::{CacheEntry, Downloader};
 
 pub struct Cache {
     root: PathBuf,
@@ -227,15 +172,6 @@ pub struct Cache {
 impl Cache {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
-    }
-
-    /// `$KEMPT_CACHE_DIR` if set, else `~/.kempt/cache`.
-    pub fn default_root() -> Result<PathBuf> {
-        if let Ok(custom) = std::env::var("KEMPT_CACHE_DIR") {
-            return Ok(PathBuf::from(custom));
-        }
-        let home = std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?;
-        Ok(PathBuf::from(home).join(".kempt").join("cache"))
     }
 
     pub fn root(&self) -> &Path {
@@ -272,42 +208,32 @@ impl Cache {
 
     /// Ensure the ktfmt jar for `version` is present, downloading if needed.
     pub fn ensure_ktfmt(&self, version: &str, downloader: &dyn Downloader) -> Result<PathBuf> {
-        let dest = self.ktfmt_path(version);
-        let url = KTFMT_URL.replace("{v}", version);
-        self.ensure(&dest, &url, downloader)
+        let artifact = ktfmt::resolve(version, Platform::current(), RuntimeKind::Jar)?;
+        ktfmt::ensure_for_cli(&artifact, &self.root, downloader)
     }
 
-    /// Ensure the ktfmt native binary for `version` + `asset` is present and executable.
-    /// Release assets are compressed, so only the extracted executable is retained.
+    /// Install through the shared ktfmt lifecycle after the CLI selects native.
     pub fn ensure_ktfmt_native(
         &self,
         version: &str,
         asset: &KtfmtNativeAsset,
         downloader: &dyn Downloader,
     ) -> Result<PathBuf> {
-        let dest = self.ktfmt_native_path(version, asset);
-        if dest.exists() {
-            return Ok(dest);
-        }
-        fs::create_dir_all(&self.root)
-            .with_context(|| format!("create cache dir {}", self.root.display()))?;
-        let temp_dir = tempfile::tempdir_in(&self.root)
-            .with_context(|| format!("create extraction dir in {}", self.root.display()))?;
-        let archive_name = format!("ktfmt-{}-{version}.{}", asset.asset, asset.archive_ext);
-        let archive_path = temp_dir.path().join(&archive_name);
-        let url = KTFMT_NATIVE_URL
-            .replace("{v}", version)
-            .replace("{asset}", asset.asset)
-            .replace("{archive_ext}", asset.archive_ext);
-        downloader.download(&url, &archive_path)?;
-
-        let extracted = temp_dir.path().join(asset.executable_name);
-        extract_ktfmt_executable(&archive_path, asset, &extracted)
-            .with_context(|| format!("extract {archive_name}"))?;
-        ensure_executable(&extracted)?;
-        fs::rename(&extracted, &dest)
-            .with_context(|| format!("rename {} -> {}", extracted.display(), dest.display()))?;
-        Ok(dest)
+        let (os, arch) = match asset.asset {
+            "macos-aarch64" => ("macos", "aarch64"),
+            "linux-x86_64" => ("linux", "x86_64"),
+            "windows-x86_64" => ("windows", "x86_64"),
+            _ => return Err(anyhow!("unsupported ktfmt native asset: {}", asset.asset)),
+        };
+        let artifact = ktfmt::resolve(
+            version,
+            Platform {
+                os: os.into(),
+                arch: arch.into(),
+            },
+            RuntimeKind::Native,
+        )?;
+        ktfmt::ensure_for_cli(&artifact, &self.root, downloader)
     }
 
     /// Ensure the gjf jar for `version` is present.
@@ -342,19 +268,33 @@ impl Cache {
             .replace("{v}", version)
             .replace("{asset}", asset.asset)
             .replace("{ext}", asset.exe_suffix);
-        let path = self.ensure(&dest, &url, downloader)?;
-        ensure_executable(&path)?;
-        Ok(path)
+        self.ensure_request(&dest, &url, ArtifactFormat::Executable, downloader)
     }
 
     fn ensure(&self, dest: &Path, url: &str, downloader: &dyn Downloader) -> Result<PathBuf> {
-        if dest.exists() {
-            return Ok(dest.to_path_buf());
-        }
-        fs::create_dir_all(&self.root)
-            .with_context(|| format!("create cache dir {}", self.root.display()))?;
-        downloader.download(url, dest)?;
-        Ok(dest.to_path_buf())
+        self.ensure_request(dest, url, ArtifactFormat::File, downloader)
+    }
+
+    fn ensure_request(
+        &self,
+        dest: &Path,
+        url: &str,
+        format: ArtifactFormat,
+        downloader: &dyn Downloader,
+    ) -> Result<PathBuf> {
+        let key = dest
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("invalid artifact filename"))?;
+        ensure_artifact(
+            &self.root,
+            &ArtifactRequest {
+                key: key.into(),
+                url: url.into(),
+                format,
+            },
+            downloader,
+        )
     }
 
     /// List kempt-managed files currently in the cache. Returns an empty list
@@ -369,7 +309,7 @@ impl Cache {
         {
             let dirent = dirent?;
             let path = dirent.path();
-            if !path.is_file() {
+            if !dirent.file_type()?.is_file() {
                 continue;
             }
             let name = match path.file_name().and_then(|n| n.to_str()) {
@@ -399,63 +339,38 @@ impl Cache {
         let mut removed = Vec::new();
         for entry in entries {
             if !keep_set.contains(entry.path.as_path()) {
-                fs::remove_file(&entry.path)
-                    .with_context(|| format!("remove {}", entry.path.display()))?;
+                let name = entry
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                if name.starts_with("ktfmt-") {
+                    ktfmt::prune_for_cli(&self.root, name)?;
+                } else {
+                    fs::remove_file(&entry.path)
+                        .with_context(|| format!("remove {}", entry.path.display()))?;
+                }
                 removed.push(entry.path);
+            }
+        }
+        // Remove orphaned canonical installs too, including those whose flat
+        // alias was deleted. Preserve lock files for concurrent waiters.
+        let state_root = self.root.join(".ktfmt-install");
+        if state_root.is_dir() {
+            for entry in fs::read_dir(state_root)? {
+                let entry = entry?;
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with("ktfmt-")
+                        && is_kempt_artifact_name(name)
+                        && !keep_set.contains(self.root.join(name).as_path())
+                    {
+                        ktfmt::prune_for_cli(&self.root, name)?;
+                    }
+                }
             }
         }
         Ok(removed)
     }
-}
-
-fn extract_ktfmt_executable(
-    archive_path: &Path,
-    asset: &KtfmtNativeAsset,
-    dest: &Path,
-) -> Result<()> {
-    match asset.format {
-        KtfmtArchiveFormat::TarGz => {
-            let file = fs::File::open(archive_path)
-                .with_context(|| format!("open {}", archive_path.display()))?;
-            let decoder = flate2::read::GzDecoder::new(file);
-            let mut archive = tar::Archive::new(decoder);
-            for entry in archive.entries().context("read tar entries")? {
-                let mut entry = entry.context("read tar entry")?;
-                let path = entry.path().context("read tar entry path")?;
-                if entry.header().entry_type().is_file()
-                    && path.file_name().and_then(|name| name.to_str())
-                        == Some(asset.executable_name)
-                {
-                    entry
-                        .unpack(dest)
-                        .with_context(|| format!("extract {}", dest.display()))?;
-                    return Ok(());
-                }
-            }
-        }
-        KtfmtArchiveFormat::Zip => {
-            let file = fs::File::open(archive_path)
-                .with_context(|| format!("open {}", archive_path.display()))?;
-            let mut archive = zip::ZipArchive::new(file).context("open zip archive")?;
-            for index in 0..archive.len() {
-                let mut entry = archive.by_index(index).context("read zip entry")?;
-                let is_executable = entry
-                    .enclosed_name()
-                    .and_then(Path::file_name)
-                    .and_then(|name| name.to_str())
-                    == Some(asset.executable_name);
-                if is_executable && !entry.is_dir() {
-                    let mut output = fs::File::create(dest)
-                        .with_context(|| format!("create {}", dest.display()))?;
-                    std::io::copy(&mut entry, &mut output)
-                        .with_context(|| format!("extract {}", dest.display()))?;
-                    output.flush()?;
-                    return Ok(());
-                }
-            }
-        }
-    }
-    Err(anyhow!("archive did not contain {}", asset.executable_name))
 }
 
 fn is_kempt_artifact_name(name: &str) -> bool {
@@ -489,54 +404,6 @@ fn starts_with_digit(s: &str) -> bool {
     s.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CacheEntry {
-    pub path: PathBuf,
-    pub size: u64,
-}
-
-/// chmod +x on unix; no-op on Windows (where executability is by extension).
-#[cfg(unix)]
-fn ensure_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?
-        .permissions();
-    perms.set_mode(perms.mode() | 0o111);
-    fs::set_permissions(path, perms).with_context(|| format!("chmod +x {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_executable(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-/// Write to `dest` atomically by writing to a sibling tempfile and renaming.
-fn atomic_write<F>(dest: &Path, write: F) -> Result<()>
-where
-    F: FnOnce(&mut std::fs::File) -> std::io::Result<()>,
-{
-    let parent = dest
-        .parent()
-        .ok_or_else(|| anyhow!("destination has no parent: {}", dest.display()))?;
-    fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".{}.tmp",
-        dest.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("kempt-download")
-    ));
-    {
-        let mut f = fs::File::create(&tmp)?;
-        write(&mut f).with_context(|| format!("write {}", tmp.display()))?;
-        f.flush()?;
-    }
-    fs::rename(&tmp, dest)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), dest.display()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 pub mod testing {
     use super::*;
@@ -562,7 +429,7 @@ pub mod testing {
             self.calls
                 .borrow_mut()
                 .push((url.to_string(), dest.to_path_buf()));
-            atomic_write(dest, |f| f.write_all(&self.payload))?;
+            fs::write(dest, &self.payload)?;
             Ok(())
         }
     }

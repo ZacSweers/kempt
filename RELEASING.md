@@ -23,14 +23,14 @@ You can also pass a specific stable version:
 The script handles the full process:
 
 1. Resolves the target version from the argument or `CHANGELOG.md` bump flag.
-2. Bumps the version in `Cargo.toml`.
+2. Bumps the shared workspace version and exact `kempt-core` dependency in `Cargo.toml`. Both packages use that version.
 3. Promotes the `[Unreleased]` section in `CHANGELOG.md` to a dated version
    heading.
-4. Builds to refresh `Cargo.lock`.
+4. Builds the workspace to refresh `Cargo.lock`.
 5. Commits and pushes to `main`.
 6. Tags and pushes the version tag, which triggers the release workflow.
 7. Watches the release workflow until it finishes.
-8. Prompts to publish to crates.io.
+8. Prompts to publish `kempt-core` first, then `kempt-fmt`, to crates.io. The CLI package depends on the published library version.
 
 ### Prerequisites
 

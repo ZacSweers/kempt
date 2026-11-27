@@ -147,10 +147,11 @@ _${DATE}_/" CHANGELOG.md
 # --- Bump Cargo.toml ---
 echo "Bumping version to ${VERSION}"
 sed -i '' "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+sed -i '' -E "s/^(kempt-core = \{.*version = \")=[^\"]+(\".*)/\\1=${VERSION}\\2/" Cargo.toml
 
 # --- Refresh Cargo.lock ---
 echo "Building to refresh Cargo.lock"
-cargo build
+cargo build --workspace
 
 # --- Commit + push ---
 echo "Committing version bump"
@@ -198,10 +199,12 @@ echo "Release workflow succeeded"
 read -rp "Publish to crates.io? [Y/n] " reply
 if [[ -z "$reply" || "$reply" =~ ^[Yy] ]]; then
   echo "Publishing to crates.io"
-  cargo publish --allow-dirty
+  cargo publish -p kempt-core --allow-dirty
+  cargo publish -p kempt-fmt --allow-dirty
 fi
 
 echo
 echo "Done. Released ${TAG}"
 echo "  GitHub Release: https://github.com/${REPO}/releases/tag/${TAG}"
-echo "  crates.io:      https://crates.io/crates/kempt-fmt/${VERSION}"
+echo "  crates.io CLI:  https://crates.io/crates/kempt-fmt/${VERSION}"
+echo "  crates.io core: https://crates.io/crates/kempt-core/${VERSION}"
