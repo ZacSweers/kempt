@@ -22,10 +22,17 @@ pub(crate) struct Capture(Arc<Mutex<Vec<ProcessOutput>>>);
 
 impl Capture {
     pub fn record(&self, tool: &str, output: &Output, display_stdout: bool, display_stderr: bool) {
-        self.0.lock().expect("output capture poisoned").push(ProcessOutput {
-            tool: tool.into(), stdout: output.stdout.clone(), stderr: output.stderr.clone(),
-            exit_code: output.status.code(), display_stdout, display_stderr,
-        });
+        self.0
+            .lock()
+            .expect("output capture poisoned")
+            .push(ProcessOutput {
+                tool: tool.into(),
+                stdout: output.stdout.clone(),
+                stderr: output.stderr.clone(),
+                exit_code: output.status.code(),
+                display_stdout,
+                display_stderr,
+            });
     }
 
     pub fn take(&self) -> Vec<ProcessOutput> {

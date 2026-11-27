@@ -162,8 +162,8 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-pub use crate::cache::{CacheEntry, Downloader};
 use crate::cache::{ensure_artifact, ArtifactFormat, ArtifactRequest};
+pub use crate::cache::{CacheEntry, Downloader};
 
 pub struct Cache {
     root: PathBuf,
@@ -213,14 +213,26 @@ impl Cache {
     }
 
     /// Install through the shared ktfmt lifecycle after the CLI selects native.
-    pub fn ensure_ktfmt_native(&self, version: &str, asset: &KtfmtNativeAsset, downloader: &dyn Downloader) -> Result<PathBuf> {
+    pub fn ensure_ktfmt_native(
+        &self,
+        version: &str,
+        asset: &KtfmtNativeAsset,
+        downloader: &dyn Downloader,
+    ) -> Result<PathBuf> {
         let (os, arch) = match asset.asset {
             "macos-aarch64" => ("macos", "aarch64"),
             "linux-x86_64" => ("linux", "x86_64"),
             "windows-x86_64" => ("windows", "x86_64"),
             _ => return Err(anyhow!("unsupported ktfmt native asset: {}", asset.asset)),
         };
-        let artifact = ktfmt::resolve(version, Platform { os: os.into(), arch: arch.into() }, RuntimeKind::Native)?;
+        let artifact = ktfmt::resolve(
+            version,
+            Platform {
+                os: os.into(),
+                arch: arch.into(),
+            },
+            RuntimeKind::Native,
+        )?;
         ktfmt::ensure_for_cli(&artifact, &self.root, downloader)
     }
 
@@ -263,9 +275,26 @@ impl Cache {
         self.ensure_request(dest, url, ArtifactFormat::File, downloader)
     }
 
-    fn ensure_request(&self, dest: &Path, url: &str, format: ArtifactFormat, downloader: &dyn Downloader) -> Result<PathBuf> {
-        let key = dest.file_name().and_then(|name| name.to_str()).ok_or_else(|| anyhow!("invalid artifact filename"))?;
-        ensure_artifact(&self.root, &ArtifactRequest { key: key.into(), url: url.into(), format }, downloader)
+    fn ensure_request(
+        &self,
+        dest: &Path,
+        url: &str,
+        format: ArtifactFormat,
+        downloader: &dyn Downloader,
+    ) -> Result<PathBuf> {
+        let key = dest
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("invalid artifact filename"))?;
+        ensure_artifact(
+            &self.root,
+            &ArtifactRequest {
+                key: key.into(),
+                url: url.into(),
+                format,
+            },
+            downloader,
+        )
     }
 
     /// List kempt-managed files currently in the cache. Returns an empty list
@@ -310,7 +339,11 @@ impl Cache {
         let mut removed = Vec::new();
         for entry in entries {
             if !keep_set.contains(entry.path.as_path()) {
-                let name = entry.path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+                let name = entry
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
                 if name.starts_with("ktfmt-") {
                     ktfmt::prune_for_cli(&self.root, name)?;
                 } else {
@@ -327,8 +360,10 @@ impl Cache {
             for entry in fs::read_dir(state_root)? {
                 let entry = entry?;
                 if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with("ktfmt-") && is_kempt_artifact_name(name)
-                        && !keep_set.contains(self.root.join(name).as_path()) {
+                    if name.starts_with("ktfmt-")
+                        && is_kempt_artifact_name(name)
+                        && !keep_set.contains(self.root.join(name).as_path())
+                    {
                         ktfmt::prune_for_cli(&self.root, name)?;
                     }
                 }

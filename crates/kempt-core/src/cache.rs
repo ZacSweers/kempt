@@ -31,9 +31,12 @@ pub struct UreqDownloader;
 #[cfg(feature = "http")]
 impl Downloader for UreqDownloader {
     fn download(&self, url: &str, dest: &Path) -> Result<()> {
-        let response = ureq::get(url).call().with_context(|| format!("download failed: {url}"))?;
+        let response = ureq::get(url)
+            .call()
+            .with_context(|| format!("download failed: {url}"))?;
         let mut reader = response.into_body().into_reader();
-        let mut file = fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+        let mut file =
+            fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
         std::io::copy(&mut reader, &mut file)?;
         file.flush()?;
         Ok(())
@@ -67,7 +70,9 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn new(root: PathBuf) -> Self { Self { root } }
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
 
     /// `$KEMPT_CACHE_DIR`, otherwise `$HOME/.kempt/cache`.
     pub fn default_root() -> Result<PathBuf> {
@@ -78,7 +83,9 @@ impl Cache {
         Ok(PathBuf::from(home).join(".kempt/cache"))
     }
 
-    pub fn root(&self) -> &Path { &self.root }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 
     /// Select an isolated namespace. Namespace names cannot contain paths.
     pub fn namespace(&self, name: &str) -> Result<CacheNamespace> {
@@ -96,7 +103,9 @@ pub struct CacheNamespace {
 }
 
 impl CacheNamespace {
-    pub fn root(&self) -> &Path { &self.root }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 
     pub fn path(&self, key: &str) -> Result<PathBuf> {
         validate_component(key)?;
@@ -105,7 +114,11 @@ impl CacheNamespace {
     }
 
     /// Download on a miss, retaining only a completed file.
-    pub fn ensure(&self, request: &ArtifactRequest, downloader: &dyn Downloader) -> Result<PathBuf> {
+    pub fn ensure(
+        &self,
+        request: &ArtifactRequest,
+        downloader: &dyn Downloader,
+    ) -> Result<PathBuf> {
         validate_namespace_directory(&self.root)?;
         ensure_artifact(&self.root, request, downloader)
     }
@@ -118,12 +131,15 @@ impl CacheNamespace {
 
     /// Remove entries whose keys are absent from `keep`.
     pub fn prune(&self, keep: &[String]) -> Result<Vec<PathBuf>> {
-        for key in keep { validate_component(key)?; }
+        for key in keep {
+            validate_component(key)?;
+        }
         let mut removed = Vec::new();
         for entry in self.list_entries()? {
             let key = entry.path.file_name().and_then(|name| name.to_str());
             if !keep.iter().any(|name| Some(name.as_str()) == key) {
-                fs::remove_file(&entry.path).with_context(|| format!("remove {}", entry.path.display()))?;
+                fs::remove_file(&entry.path)
+                    .with_context(|| format!("remove {}", entry.path.display()))?;
                 removed.push(entry.path);
             }
         }
@@ -154,35 +170,57 @@ fn validate_component(value: &str) -> Result<()> {
 }
 
 pub(crate) fn list_files(root: &Path) -> Result<Vec<CacheEntry>> {
-    if !root.exists() { return Ok(Vec::new()); }
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
     let mut entries = Vec::new();
     for entry in fs::read_dir(root).with_context(|| format!("read cache dir {}", root.display()))? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() { continue; }
-        if entry.file_name().to_str().is_some_and(|name| !name.starts_with('.')) {
-            entries.push(CacheEntry { path: entry.path(), size: entry.metadata()?.len() });
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| !name.starts_with('.'))
+        {
+            entries.push(CacheEntry {
+                path: entry.path(),
+                size: entry.metadata()?.len(),
+            });
         }
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
 }
 
-pub(crate) fn ensure_artifact(root: &Path, request: &ArtifactRequest, downloader: &dyn Downloader) -> Result<PathBuf> {
+pub(crate) fn ensure_artifact(
+    root: &Path,
+    request: &ArtifactRequest,
+    downloader: &dyn Downloader,
+) -> Result<PathBuf> {
     validate_component(&request.key)?;
     match &request.format {
-        ArtifactFormat::TarGzExecutable { executable } | ArtifactFormat::ZipExecutable { executable } => validate_component(executable)?,
+        ArtifactFormat::TarGzExecutable { executable }
+        | ArtifactFormat::ZipExecutable { executable } => validate_component(executable)?,
         _ => {}
     }
     let dest = root.join(&request.key);
     if regular_file(&dest)? {
-        if request.format != ArtifactFormat::File { ensure_executable(&dest)?; }
+        if request.format != ArtifactFormat::File {
+            ensure_executable(&dest)?;
+        }
         return Ok(dest);
     }
     fs::create_dir_all(root).with_context(|| format!("create cache dir {}", root.display()))?;
-    let staging = tempfile::Builder::new().prefix(".kempt-download-").tempdir_in(root)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".kempt-download-")
+        .tempdir_in(root)?;
     let download = staging.path().join("download");
     downloader.download(&request.url, &download)?;
-    if !regular_file(&download)? { bail!("download did not produce a regular file"); }
+    if !regular_file(&download)? {
+        bail!("download did not produce a regular file");
+    }
     let completed = match &request.format {
         ArtifactFormat::File | ArtifactFormat::Executable => download,
         ArtifactFormat::TarGzExecutable { executable } => {
@@ -196,11 +234,14 @@ pub(crate) fn ensure_artifact(root: &Path, request: &ArtifactRequest, downloader
             extracted
         }
     };
-    if request.format != ArtifactFormat::File { ensure_executable(&completed)?; }
+    if request.format != ArtifactFormat::File {
+        ensure_executable(&completed)?;
+    }
     // A hard link publishes without replacing another caller's completed file.
     match fs::hard_link(&completed, &dest) {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && regular_file(&dest)? => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && regular_file(&dest)? => {
+        }
         Err(error) => return Err(error).with_context(|| format!("publish {}", dest.display())),
     }
     Ok(dest)
@@ -217,7 +258,12 @@ fn regular_file(path: &Path) -> Result<bool> {
 
 fn safe_member(path: &Path, executable: &str) -> bool {
     !path.is_absolute()
-        && path.components().all(|component| matches!(component, std::path::Component::Normal(_) | std::path::Component::CurDir))
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
         && path.file_name().and_then(|name| name.to_str()) == Some(executable)
 }
 
@@ -228,14 +274,18 @@ pub(crate) fn extract_tar(archive: &Path, executable: &str, dest: &Path) -> Resu
     for entry in archive.entries()? {
         let mut entry = entry?;
         if entry.header().entry_type().is_file() && safe_member(&entry.path()?, executable) {
-            if found { bail!("archive contains multiple files named {executable}"); }
+            if found {
+                bail!("archive contains multiple files named {executable}");
+            }
             let mut output = fs::File::create(dest)?;
             std::io::copy(&mut entry, &mut output)?;
             output.flush()?;
             found = true;
         }
     }
-    if !found { bail!("archive did not contain {executable}"); }
+    if !found {
+        bail!("archive did not contain {executable}");
+    }
     Ok(())
 }
 
@@ -244,16 +294,27 @@ pub(crate) fn extract_zip(archive: &Path, executable: &str, dest: &Path) -> Resu
     let mut found = false;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let is_regular = !entry.is_dir() && entry.unix_mode().map_or(true, |mode| mode & 0o170000 == 0 || mode & 0o170000 == 0o100000);
-        if is_regular && entry.enclosed_name().is_some_and(|path| safe_member(path, executable)) {
-            if found { bail!("archive contains multiple files named {executable}"); }
+        let is_regular = !entry.is_dir()
+            && entry.unix_mode().map_or(true, |mode| {
+                mode & 0o170000 == 0 || mode & 0o170000 == 0o100000
+            });
+        if is_regular
+            && entry
+                .enclosed_name()
+                .is_some_and(|path| safe_member(path, executable))
+        {
+            if found {
+                bail!("archive contains multiple files named {executable}");
+            }
             let mut output = fs::File::create(dest)?;
             std::io::copy(&mut entry, &mut output)?;
             output.flush()?;
             found = true;
         }
     }
-    if !found { bail!("archive did not contain {executable}"); }
+    if !found {
+        bail!("archive did not contain {executable}");
+    }
     Ok(())
 }
 
@@ -267,4 +328,6 @@ pub(crate) fn ensure_executable(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn ensure_executable(_path: &Path) -> Result<()> { Ok(()) }
+pub(crate) fn ensure_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}

@@ -213,7 +213,10 @@ pub enum ParseError {
 
 impl ParseError {
     pub fn exit_code(&self) -> i32 {
-        match self { Self::Arguments(error) => error.exit_code(), Self::Request(_) => 1 }
+        match self {
+            Self::Arguments(error) => error.exit_code(),
+            Self::Request(_) => 1,
+        }
     }
 
     /// Explicitly print this error using the CLI's normal error presentation.
@@ -229,135 +232,289 @@ impl ParseError {
 }
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Self::Arguments(error) => write!(f, "{error}"), Self::Request(error) => write!(f, "{error:#}") }
+        match self {
+            Self::Arguments(error) => write!(f, "{error}"),
+            Self::Request(error) => write!(f, "{error:#}"),
+        }
     }
 }
 impl std::error::Error for ParseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self { Self::Arguments(error) => Some(error), Self::Request(error) => Some(error.as_ref()) }
+        match self {
+            Self::Arguments(error) => Some(error),
+            Self::Request(error) => Some(error.as_ref()),
+        }
     }
 }
 
 /// Parse without printing or terminating the process. The first argument is
 /// the program name. Help and version requests return displayable text.
 pub fn parse_from<I, T>(args: I) -> Result<ParseOutcome, ParseError>
-where I: IntoIterator<Item = T>, T: Into<std::ffi::OsString> + Clone {
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
     let parsed = match Cli::try_parse_from(args) {
         Ok(parsed) => parsed,
         Err(error) => {
             let version = error.kind() == clap::error::ErrorKind::DisplayVersion;
             if version || error.kind() == clap::error::ErrorKind::DisplayHelp {
-                return Ok(ParseOutcome::Display { text: error.to_string(), version });
+                return Ok(ParseOutcome::Display {
+                    text: error.to_string(),
+                    version,
+                });
             }
             return Err(ParseError::Arguments(error));
         }
     };
-    to_request(parsed).map(ParseOutcome::Command).map_err(ParseError::Request)
+    to_request(parsed)
+        .map(ParseOutcome::Command)
+        .map_err(ParseError::Request)
 }
 
 fn to_request(parsed: Cli) -> anyhow::Result<crate::commands::CommandRequest> {
     use crate::commands as api;
     let command = match parsed.command {
         Cmd::Format(args) => api::Command::Format(api::FormatOptions {
-            scope: file_scope(args.all, args.staged, args.touched, args.base, args.discovery, args.paths, args.force)?, dry_run: args.dry_run,
+            scope: file_scope(
+                args.all,
+                args.staged,
+                args.touched,
+                args.base,
+                args.discovery,
+                args.paths,
+                args.force,
+            )?,
+            dry_run: args.dry_run,
         }),
         Cmd::Check(args) => api::Command::Check(api::CheckOptions {
-            scope: file_scope(args.all, args.staged, args.touched, args.base, args.discovery, args.paths, args.force)?,
+            scope: file_scope(
+                args.all,
+                args.staged,
+                args.touched,
+                args.base,
+                args.discovery,
+                args.paths,
+                args.force,
+            )?,
         }),
-        Cmd::Init(args) => api::Command::Init(api::InitOptions { license_header: args.license_header }),
-        Cmd::InstallHook(args) => api::Command::InstallHook(api::InstallHookOptions { force: args.force }),
+        Cmd::Init(args) => api::Command::Init(api::InitOptions {
+            license_header: args.license_header,
+        }),
+        Cmd::InstallHook(args) => {
+            api::Command::InstallHook(api::InstallHookOptions { force: args.force })
+        }
         Cmd::Hook => api::Command::Hook,
         Cmd::Update => api::Command::Update,
-        Cmd::Upgrade(args) => api::Command::Upgrade(api::UpgradeOptions { dry_run: args.dry_run }),
-        Cmd::Vendor(args) => api::Command::Vendor(api::VendorOptions { directory: args.dir }),
+        Cmd::Upgrade(args) => api::Command::Upgrade(api::UpgradeOptions {
+            dry_run: args.dry_run,
+        }),
+        Cmd::Vendor(args) => api::Command::Vendor(api::VendorOptions {
+            directory: args.dir,
+        }),
         Cmd::Cache(CacheCmd::List) => api::Command::CacheList,
-        Cmd::Cache(CacheCmd::Prune(args)) => api::Command::CachePrune(api::PruneOptions { all: args.all }),
+        Cmd::Cache(CacheCmd::Prune(args)) => {
+            api::Command::CachePrune(api::PruneOptions { all: args.all })
+        }
     };
-    Ok(api::CommandRequest { command, config: parsed.config })
+    Ok(api::CommandRequest {
+        command,
+        config: parsed.config,
+    })
 }
 
-fn file_scope(all: bool, staged: bool, touched: bool, base: Option<String>, discovery: Discovery, targets: Vec<PathBuf>, force: bool) -> anyhow::Result<crate::commands::FileScope> {
+fn file_scope(
+    all: bool,
+    staged: bool,
+    touched: bool,
+    base: Option<String>,
+    discovery: Discovery,
+    targets: Vec<PathBuf>,
+    force: bool,
+) -> anyhow::Result<crate::commands::FileScope> {
     use crate::commands::FileScope;
     if !targets.is_empty() && (all || staged || touched || discovery == Discovery::Walk) {
-        anyhow::bail!("explicit paths are incompatible with --all, --staged, --touched, and --discovery=walk");
+        anyhow::bail!(
+            "explicit paths are incompatible with --all, --staged, --touched, and --discovery=walk"
+        );
     }
     for (enabled, conflicting, message) in [
         (all, staged, "--all is incompatible with --staged"),
-        (all, discovery == Discovery::Walk, "--all is incompatible with --discovery=walk"),
+        (
+            all,
+            discovery == Discovery::Walk,
+            "--all is incompatible with --discovery=walk",
+        ),
         (all, touched, "--all is incompatible with --touched"),
-        (staged, discovery == Discovery::Walk, "--staged is incompatible with --discovery=walk"),
+        (
+            staged,
+            discovery == Discovery::Walk,
+            "--staged is incompatible with --discovery=walk",
+        ),
         (staged, touched, "--staged is incompatible with --touched"),
-        (touched, discovery == Discovery::Walk, "--touched is incompatible with --discovery=walk"),
-    ] { if enabled && conflicting { anyhow::bail!(message); } }
-    Ok(if !targets.is_empty() { FileScope::Explicit { targets, force } }
-        else if touched { FileScope::Touched { base } }
-        else if discovery == Discovery::Walk { FileScope::Walk }
-        else if staged { FileScope::Staged }
-        else { FileScope::All })
+        (
+            touched,
+            discovery == Discovery::Walk,
+            "--touched is incompatible with --discovery=walk",
+        ),
+    ] {
+        if enabled && conflicting {
+            anyhow::bail!(message);
+        }
+    }
+    Ok(if !targets.is_empty() {
+        FileScope::Explicit { targets, force }
+    } else if touched {
+        FileScope::Touched { base }
+    } else if discovery == Discovery::Walk {
+        FileScope::Walk
+    } else if staged {
+        FileScope::Staged
+    } else {
+        FileScope::All
+    })
 }
 
 /// Render a result to caller-owned writers. Execution itself remains quiet.
-pub fn render(outcome: &crate::commands::CommandOutcome, stdout: &mut dyn std::io::Write, stderr: &mut dyn std::io::Write) -> std::io::Result<()> {
+pub fn render(
+    outcome: &crate::commands::CommandOutcome,
+    stdout: &mut dyn std::io::Write,
+    stderr: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
     use crate::commands::CommandResult;
     render_process_output(&outcome.output, stdout, stderr)?;
     match &outcome.result {
-        CommandResult::Format { report, context, check } => {
-            if *check { render_check(report, context.clone(), stdout, stderr)?; }
-            else if report.changed.is_empty() { writeln!(stdout, "kempt: nothing to do")?; }
-            else {
+        CommandResult::Format {
+            report,
+            context,
+            check,
+        } => {
+            if *check {
+                render_check(report, context.clone(), stdout, stderr)?;
+            } else if report.changed.is_empty() {
+                writeln!(stdout, "kempt: nothing to do")?;
+            } else {
                 writeln!(stdout, "kempt: changed {} file(s)", report.changed.len())?;
-                for path in &report.changed { writeln!(stdout, "  {}", path.display())?; }
+                for path in &report.changed {
+                    writeln!(stdout, "  {}", path.display())?;
+                }
             }
         }
         CommandResult::Hook { report } => {
-            if report.check_failed { render_check(report, crate::commands::CheckContext::Hook, stdout, stderr)?; }
-            else if !report.changed.is_empty() { writeln!(stdout, "kempt: re-staged {} file(s)", report.changed.len())?; }
+            if report.check_failed {
+                render_check(report, crate::commands::CheckContext::Hook, stdout, stderr)?;
+            } else if !report.changed.is_empty() {
+                writeln!(stdout, "kempt: re-staged {} file(s)", report.changed.len())?;
+            }
         }
         CommandResult::Init { created } => {
-            if created.is_empty() { writeln!(stdout, "kempt: nothing to do (config already exists)")?; }
-            else { for path in created { writeln!(stdout, "created {}", path.display())?; } }
+            if created.is_empty() {
+                writeln!(stdout, "kempt: nothing to do (config already exists)")?;
+            } else {
+                for path in created {
+                    writeln!(stdout, "created {}", path.display())?;
+                }
+            }
         }
         CommandResult::InstallHook { path } => writeln!(stdout, "installed {}", path.display())?,
-        CommandResult::Update { cache_root } => writeln!(stdout, "kempt: cache up to date at {}", cache_root.display())?,
-        CommandResult::CacheList { cache_root, entries } => {
-            if entries.is_empty() { writeln!(stdout, "kempt: cache is empty ({})", cache_root.display())?; }
-            else {
+        CommandResult::Update { cache_root } => writeln!(
+            stdout,
+            "kempt: cache up to date at {}",
+            cache_root.display()
+        )?,
+        CommandResult::CacheList {
+            cache_root,
+            entries,
+        } => {
+            if entries.is_empty() {
+                writeln!(stdout, "kempt: cache is empty ({})", cache_root.display())?;
+            } else {
                 writeln!(stdout, "{}:", cache_root.display())?;
                 for entry in entries {
-                    let name = entry.path.file_name().and_then(|name| name.to_str()).unwrap_or("?");
+                    let name = entry
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("?");
                     writeln!(stdout, "  {name:<32} {}", human_bytes(entry.size))?;
                 }
             }
         }
         CommandResult::CachePrune { removed } => {
-            if removed.is_empty() { writeln!(stdout, "kempt: nothing to prune")?; }
-            else {
+            if removed.is_empty() {
+                writeln!(stdout, "kempt: nothing to prune")?;
+            } else {
                 writeln!(stdout, "removed {} file(s):", removed.len())?;
-                for path in removed { writeln!(stdout, "  {}", path.display())?; }
+                for path in removed {
+                    writeln!(stdout, "  {}", path.display())?;
+                }
             }
         }
         CommandResult::Vendor { report } => {
             if report.entries.is_empty() && report.skipped.is_empty() {
-                writeln!(stdout, "kempt: nothing to vendor (no downloadable formatters in config)")?;
+                writeln!(
+                    stdout,
+                    "kempt: nothing to vendor (no downloadable formatters in config)"
+                )?;
             }
-            for skipped in &report.skipped { writeln!(stdout, "kempt: [{skipped}] already uses `path = ...`, skipping")?; }
+            for skipped in &report.skipped {
+                writeln!(
+                    stdout,
+                    "kempt: [{skipped}] already uses `path = ...`, skipping"
+                )?;
+            }
             if !report.entries.is_empty() {
                 writeln!(stdout, "vendored {} artifact(s):", report.entries.len())?;
-                for entry in &report.entries { writeln!(stdout, "  {} {} -> {}", entry.tool, entry.version, entry.dest.display())?; }
-                writeln!(stdout, "\nupdate .kempt.toml to point at the vendored copies:")?;
-                for entry in &report.entries { writeln!(stdout, "\n  [{}]\n  path = \"{}\"", entry.tool, entry.config_value.display())?; }
+                for entry in &report.entries {
+                    writeln!(
+                        stdout,
+                        "  {} {} -> {}",
+                        entry.tool,
+                        entry.version,
+                        entry.dest.display()
+                    )?;
+                }
+                writeln!(
+                    stdout,
+                    "\nupdate .kempt.toml to point at the vendored copies:"
+                )?;
+                for entry in &report.entries {
+                    writeln!(
+                        stdout,
+                        "\n  [{}]\n  path = \"{}\"",
+                        entry.tool,
+                        entry.config_value.display()
+                    )?;
+                }
             }
         }
         CommandResult::Upgrade { report, dry_run } => {
-            for skipped in &report.skipped { writeln!(stdout, "kempt: {skipped}")?; }
-            for tool in &report.already_current { writeln!(stdout, "kempt: [{tool}] already on the latest version")?; }
-            if report.changes.is_empty() { writeln!(stdout, "kempt: nothing to upgrade")?; }
-            else {
+            for skipped in &report.skipped {
+                writeln!(stdout, "kempt: {skipped}")?;
+            }
+            for tool in &report.already_current {
+                writeln!(stdout, "kempt: [{tool}] already on the latest version")?;
+            }
+            if report.changes.is_empty() {
+                writeln!(stdout, "kempt: nothing to upgrade")?;
+            } else {
                 let verb = if *dry_run { "would update" } else { "updated" };
                 writeln!(stdout, "kempt: {verb} {} tool(s):", report.changes.len())?;
-                for change in &report.changes { writeln!(stdout, "  [{}] {} -> {}", change.tool, change.from, change.to)?; }
-                if *dry_run { writeln!(stdout, "\nRe-run without --dry-run to apply.")?; }
-                else { writeln!(stdout, "\nRun `kempt update` to download the new version(s) into the cache.")?; }
+                for change in &report.changes {
+                    writeln!(
+                        stdout,
+                        "  [{}] {} -> {}",
+                        change.tool, change.from, change.to
+                    )?;
+                }
+                if *dry_run {
+                    writeln!(stdout, "\nRe-run without --dry-run to apply.")?;
+                } else {
+                    writeln!(
+                        stdout,
+                        "\nRun `kempt update` to download the new version(s) into the cache."
+                    )?;
+                }
             }
         }
     }
@@ -365,27 +522,52 @@ pub fn render(outcome: &crate::commands::CommandOutcome, stdout: &mut dyn std::i
 }
 
 /// Render an operational failure, including output produced before it failed.
-pub fn render_error(error: &crate::commands::RunError, stdout: &mut dyn std::io::Write, stderr: &mut dyn std::io::Write) -> std::io::Result<()> {
+pub fn render_error(
+    error: &crate::commands::RunError,
+    stdout: &mut dyn std::io::Write,
+    stderr: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
     render_process_output(&error.output, stdout, stderr)?;
-    for diagnostic in &error.diagnostics { write!(stderr, "{diagnostic}")?; }
+    for diagnostic in &error.diagnostics {
+        write!(stderr, "{diagnostic}")?;
+    }
     writeln!(stderr, "kempt: {error}")
 }
 
-fn render_process_output(output: &[crate::commands::ProcessOutput], stdout: &mut dyn std::io::Write, stderr: &mut dyn std::io::Write) -> std::io::Result<()> {
+fn render_process_output(
+    output: &[crate::commands::ProcessOutput],
+    stdout: &mut dyn std::io::Write,
+    stderr: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
     for process in output {
-        if process.display_stdout { stdout.write_all(&process.stdout)?; }
-        if process.display_stderr { stderr.write_all(&process.stderr)?; }
+        if process.display_stdout {
+            stdout.write_all(&process.stdout)?;
+        }
+        if process.display_stderr {
+            stderr.write_all(&process.stderr)?;
+        }
     }
     Ok(())
 }
 
-fn render_check(report: &crate::commands::FormatOutcome, context: crate::commands::CheckContext, stdout: &mut dyn std::io::Write, stderr: &mut dyn std::io::Write) -> std::io::Result<()> {
-    for path in &report.changed { writeln!(stdout, "{}", path.display())?; }
-    if !report.parse_errors.is_empty() { writeln!(stderr, "{}", report.parse_errors)?; }
+fn render_check(
+    report: &crate::commands::FormatOutcome,
+    context: crate::commands::CheckContext,
+    stdout: &mut dyn std::io::Write,
+    stderr: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    for path in &report.changed {
+        writeln!(stdout, "{}", path.display())?;
+    }
+    if !report.parse_errors.is_empty() {
+        writeln!(stderr, "{}", report.parse_errors)?;
+    }
     let summary = crate::operations::render_check_summary(report, context);
     if !summary.is_empty() {
         writeln!(stderr)?;
-        for line in summary { writeln!(stderr, "{line}")?; }
+        for line in summary {
+            writeln!(stderr, "{line}")?;
+        }
     }
     Ok(())
 }
@@ -404,7 +586,6 @@ fn human_bytes(n: u64) -> String {
         format!("{size:.1} {}", UNITS[unit])
     }
 }
-
 
 #[cfg(test)]
 mod rendering_tests {

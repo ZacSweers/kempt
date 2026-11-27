@@ -9,21 +9,18 @@
 
 #[cfg(feature = "cache")]
 pub mod cache;
+#[cfg(feature = "cli")]
+pub mod cli;
 #[cfg(feature = "commands")]
 #[path = "api.rs"]
 pub mod commands;
-#[cfg(feature = "cli")]
-pub mod cli;
 
-#[cfg(feature = "commands")]
-mod formatter_cache;
-#[cfg(feature = "commands")]
-#[path = "commands.rs"]
-mod operations;
 #[cfg(feature = "commands")]
 mod command_args;
 #[cfg(feature = "commands")]
 mod config;
+#[cfg(feature = "commands")]
+mod formatter_cache;
 #[cfg(feature = "commands")]
 mod formatters;
 #[cfg(feature = "commands")]
@@ -35,12 +32,15 @@ mod hook;
 #[cfg(feature = "commands")]
 mod license;
 #[cfg(feature = "commands")]
+#[path = "commands.rs"]
+mod operations;
+#[cfg(feature = "commands")]
 mod paths;
 #[cfg(feature = "commands")]
 mod pipeline;
 #[cfg(feature = "commands")]
+mod process_output;
+#[cfg(feature = "commands")]
 mod upgrade;
 #[cfg(feature = "commands")]
 mod whitespace;
-#[cfg(feature = "commands")]
-mod process_output;

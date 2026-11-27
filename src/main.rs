@@ -19,14 +19,21 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
-    let context = match std::env::current_dir().map_err(anyhow::Error::from).and_then(|cwd| {
-        // These commands do not use the cache and must work without HOME.
-        if matches!(&request.command, commands::Command::Init(_) | commands::Command::InstallHook(_) | commands::Command::Upgrade(_)) {
-            commands::ExecutionContext::new(cwd.clone(), kempt_core::cache::Cache::new(cwd))
-        } else {
-            commands::ExecutionContext::from_env(cwd)
-        }
-    }) {
+    let context = match std::env::current_dir()
+        .map_err(anyhow::Error::from)
+        .and_then(|cwd| {
+            // These commands do not use the cache and must work without HOME.
+            if matches!(
+                &request.command,
+                commands::Command::Init(_)
+                    | commands::Command::InstallHook(_)
+                    | commands::Command::Upgrade(_)
+            ) {
+                commands::ExecutionContext::new(cwd.clone(), kempt_core::cache::Cache::new(cwd))
+            } else {
+                commands::ExecutionContext::from_env(cwd)
+            }
+        }) {
         Ok(context) => context,
         Err(error) => {
             eprintln!("kempt: {error:#}");
@@ -38,7 +45,10 @@ fn main() -> ExitCode {
     match commands::execute(&request, &context) {
         Ok(outcome) => match cli::render(&outcome, &mut stdout, &mut stderr) {
             Ok(()) => ExitCode::from(outcome.exit_code()),
-            Err(error) => { eprintln!("kempt: {error}"); ExitCode::FAILURE }
+            Err(error) => {
+                eprintln!("kempt: {error}");
+                ExitCode::FAILURE
+            }
         },
         Err(error) => {
             let _ = cli::render_error(&error, &mut stdout, &mut stderr);

@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Subcommand implementations. Glue between the lower-level modules.
 
-use crate::formatter_cache::{Cache, Downloader, GjfFlavor, KtfmtFlavor};
-use crate::process_output::Capture;
 use crate::command_args;
 use crate::config::{Config, Gjf, HookMode, Ktfmt, NativeMode, ToolSource};
+use crate::formatter_cache::{Cache, Downloader, GjfFlavor, KtfmtFlavor};
 use crate::formatters;
 use crate::git::GitContext;
 use crate::gradle_dependencies;
@@ -13,6 +12,7 @@ use crate::hook::{self, StagingCheck};
 use crate::license::SourceKind;
 use crate::paths::{self, Scope};
 use crate::pipeline::{self, Headers, PipelineReport};
+use crate::process_output::Capture;
 use anyhow::{anyhow, Context, Result};
 use globset::GlobSet;
 use std::collections::BTreeSet;
@@ -59,12 +59,40 @@ pub(crate) struct Runtime<'a> {
 }
 
 #[cfg(test)]
-pub fn run_format(config: &Config, git: &dyn GitContext, cache: &Cache, downloader: &dyn Downloader, scope: Scope, check: bool, year: u32) -> Result<FormatOutcome> {
+pub fn run_format(
+    config: &Config,
+    git: &dyn GitContext,
+    cache: &Cache,
+    downloader: &dyn Downloader,
+    scope: Scope,
+    check: bool,
+    year: u32,
+) -> Result<FormatOutcome> {
     let capture = Capture::default();
-    run_format_with_runtime(config, git, cache, downloader, scope, check, &Runtime { year, capture: &capture, partial: PartialFormattingOptions::default() })
+    run_format_with_runtime(
+        config,
+        git,
+        cache,
+        downloader,
+        scope,
+        check,
+        &Runtime {
+            year,
+            capture: &capture,
+            partial: PartialFormattingOptions::default(),
+        },
+    )
 }
 
-pub(crate) fn run_format_with_runtime(config: &Config, git: &dyn GitContext, cache: &Cache, downloader: &dyn Downloader, scope: Scope, check: bool, runtime: &Runtime<'_>) -> Result<FormatOutcome> {
+pub(crate) fn run_format_with_runtime(
+    config: &Config,
+    git: &dyn GitContext,
+    cache: &Cache,
+    downloader: &dyn Downloader,
+    scope: Scope,
+    check: bool,
+    runtime: &Runtime<'_>,
+) -> Result<FormatOutcome> {
     let force = matches!(scope, Scope::Explicit { force: true, .. });
     let options = FormatOptions {
         capture: runtime.capture,
@@ -229,12 +257,35 @@ impl PartialFormatter {
 }
 
 #[cfg(test)]
-fn run_hook_inner(config: &Config, git: &dyn GitContext, cache: &Cache, downloader: &dyn Downloader, year: u32, partial_options: PartialFormattingOptions) -> Result<FormatOutcome> {
+fn run_hook_inner(
+    config: &Config,
+    git: &dyn GitContext,
+    cache: &Cache,
+    downloader: &dyn Downloader,
+    year: u32,
+    partial_options: PartialFormattingOptions,
+) -> Result<FormatOutcome> {
     let capture = Capture::default();
-    run_hook_with_runtime(config, git, cache, downloader, &Runtime { year, capture: &capture, partial: partial_options })
+    run_hook_with_runtime(
+        config,
+        git,
+        cache,
+        downloader,
+        &Runtime {
+            year,
+            capture: &capture,
+            partial: partial_options,
+        },
+    )
 }
 
-pub(crate) fn run_hook_with_runtime(config: &Config, git: &dyn GitContext, cache: &Cache, downloader: &dyn Downloader, runtime: &Runtime<'_>) -> Result<FormatOutcome> {
+pub(crate) fn run_hook_with_runtime(
+    config: &Config,
+    git: &dyn GitContext,
+    cache: &Cache,
+    downloader: &dyn Downloader,
+    runtime: &Runtime<'_>,
+) -> Result<FormatOutcome> {
     let year = runtime.year;
     let partial_options = runtime.partial;
     let candidates = collect_candidates(git, &Scope::Staged, config)?;
@@ -264,7 +315,8 @@ pub(crate) fn run_hook_with_runtime(config: &Config, git: &dyn GitContext, cache
                     return Err(crate::commands::HookFailure {
                         detail: hook::format_partial_stage_error(&plan.unhandled),
                         source: partial_formatting_scope_error(partial_options),
-                    }.into());
+                    }
+                    .into());
                 }
             }
         }
@@ -304,7 +356,13 @@ pub(crate) fn run_hook_with_runtime(config: &Config, git: &dyn GitContext, cache
         )?);
         for (formatter, files) in &partial_targets {
             partial_changed.extend(apply_partial_formatter_to_index(
-                config, git, cache, downloader, *formatter, files, runtime.capture,
+                config,
+                git,
+                cache,
+                downloader,
+                *formatter,
+                files,
+                runtime.capture,
             )?);
         }
     }
@@ -1507,8 +1565,8 @@ fn merge_format_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formatter_cache::testing::{fake_ktfmt_archive, FakeDownloader};
     use crate::config::{LicenseHeader, Paths, Whitespace};
+    use crate::formatter_cache::testing::{fake_ktfmt_archive, FakeDownloader};
     use crate::git::{testing::FakeGit, RealGit};
 
     fn write(root: &Path, rel: &str, body: &str) {

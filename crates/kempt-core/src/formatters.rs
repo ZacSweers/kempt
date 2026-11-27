@@ -10,8 +10,8 @@
 //! so callers don't have to branch.
 
 use crate::command_args;
-use crate::process_output::Capture;
 use crate::config::{GjfStyle, KtfmtStyle};
+use crate::process_output::Capture;
 use anyhow::{anyhow, Context, Result};
 use std::ffi::OsString;
 use std::io::Write;
@@ -25,12 +25,20 @@ pub enum Invoker {
     Jar(PathBuf),
     /// Run the binary directly (e.g. a GraalVM native image).
     Native(PathBuf),
-    Context { inner: Box<Invoker>, directory: PathBuf, capture: Capture },
+    Context {
+        inner: Box<Invoker>,
+        directory: PathBuf,
+        capture: Capture,
+    },
 }
 
 impl Invoker {
     pub(crate) fn with_context(self, directory: &std::path::Path, capture: &Capture) -> Self {
-        Self::Context { inner: Box::new(self), directory: directory.into(), capture: capture.clone() }
+        Self::Context {
+            inner: Box::new(self),
+            directory: directory.into(),
+            capture: capture.clone(),
+        }
     }
 
     pub(crate) fn artifact_path(&self) -> &std::path::Path {
@@ -41,7 +49,9 @@ impl Invoker {
     }
 
     fn record(&self, tool: &str, output: &std::process::Output, display_stdout: bool) {
-        if let Self::Context { capture, .. } = self { capture.record(tool, output, display_stdout, false); }
+        if let Self::Context { capture, .. } = self {
+            capture.record(tool, output, display_stdout, false);
+        }
     }
 }
 
@@ -56,7 +66,9 @@ fn build_command(invoker: &Invoker) -> Result<Command> {
             Ok(cmd)
         }
         Invoker::Native(bin) => Ok(Command::new(bin)),
-        Invoker::Context { inner, directory, .. } => {
+        Invoker::Context {
+            inner, directory, ..
+        } => {
             let mut command = build_command(inner)?;
             command.current_dir(directory);
             Ok(command)
@@ -138,9 +150,7 @@ pub fn gjf_args(style: GjfStyle, check: bool) -> Vec<OsString> {
 /// `tool` is the user-facing label ("ktfmt", "gjf") used in error messages.
 pub fn run(tool: &str, invoker: &Invoker, args: Vec<OsString>) -> Result<()> {
     let mut cmd = build_command(invoker)?;
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     let output = cmd
         .spawn()
         .with_context(|| format!("spawn {tool} failed"))?
@@ -192,7 +202,8 @@ pub(crate) fn run_output(
     current_dir: &std::path::Path,
 ) -> Result<std::process::Output> {
     let mut cmd = build_command(invoker)?;
-    let output = cmd.args(args)
+    let output = cmd
+        .args(args)
         .current_dir(current_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
