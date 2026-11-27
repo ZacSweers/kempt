@@ -1567,7 +1567,9 @@ mod tests {
     use super::*;
     use crate::config::{LicenseHeader, Paths, Whitespace};
     use crate::formatter_cache::testing::{fake_ktfmt_archive, FakeDownloader};
-    use crate::git::{testing::FakeGit, RealGit};
+    use crate::git::testing::FakeGit;
+    #[cfg(unix)]
+    use crate::git::RealGit;
 
     fn write(root: &Path, rel: &str, body: &str) {
         let p = root.join(rel);
@@ -1813,6 +1815,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn config_whitespace_only() -> Config {
         Config {
             paths: Paths {
